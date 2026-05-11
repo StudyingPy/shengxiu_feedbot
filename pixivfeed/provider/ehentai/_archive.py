@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import zipfile
 from dataclasses import dataclass
 from html import unescape
@@ -28,8 +29,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from ...utils import logger
+from .. import ProgressHook, StatusUpdater
 from ._modes import BASE_HEADERS, EHMode
-
 
 # 画廊页里的 Archive Download URL。新版页面常见形式只有 gid/token，旧页面可能带 or=。
 _ARCHIVER_URL_RE = re.compile(
@@ -419,32 +420,212 @@ async def download_archive_with_timeout(
     zip_url: str,
     dest_zip: Path,
     timeout_seconds: int,
+    *,
+    on_progress: ProgressHook = None,
+    on_status: StatusUpdater = None,
+    parallel: int = 6,
+    min_parallel_size: int = 16 * 1024 * 1024,
 ) -> None:
-    """流式下载 zip，全程不能超 timeout。失败抛 ArchiveError。"""
-    # 一些 archive 链接需要 ?start=1 才会真正启动 H@H 节点开始传输
+    """流式下载 archive zip，全程不能超 timeout。失败抛 ArchiveError。
+
+    流程：
+    1. GET Range:0-2047 探测 H@H 节点（新链接通常需要 5~30s 才上线，期间返 404/503）。
+       识别 ZIP 头（PK..）确认是真的 zip 而非错误页；命中 "too many different locations"
+       立即抛 ArchiveLockedError。最多 6 次重试。
+    2. 探测拿到 total 和"是否支持 Range"。支持且文件 ≥ min_parallel_size 时走多连接
+       并发下载（H@H 节点单连接通常被限速）；否则单流。
+    3. on_progress(downloaded, total) 在循环里按 ~0.5s 节流推；on_status(text) 用于
+       推阶段文案（"等待 H@H 节点启动 (尝试 3/6)..."）。两个回调都可选。
+
+    on_status 接收的文案带 ⏳ 前缀，方便 channel 层直接展示。
+    """
     sep = "&" if "?" in zip_url else "?"
     fetch_url = f"{zip_url}{sep}start=1" if "start=" not in zip_url else zip_url
+    logger.info(f"archive zip download starting: {fetch_url[:160]}")
 
     dest_zip.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest_zip.with_suffix(dest_zip.suffix + ".part")
 
-    async def _do() -> None:
+    async def _emit_status(text: str) -> None:
+        if on_status is None:
+            return
+        try:
+            await on_status(text)
+        except Exception:
+            logger.exception("archive status hook raised; suppressed")
+
+    async def _emit_progress(done: int, total: int) -> None:
+        if on_progress is None:
+            return
+        try:
+            await on_progress(done, total)
+        except Exception:
+            logger.exception("archive bytes progress hook raised; suppressed")
+
+    async def _probe_zip() -> tuple[int, bool]:
+        """探测节点是否就绪。返回 (total_bytes, supports_range)。"""
+        max_attempts = 6
+        for i in range(max_attempts):
+            try:
+                r = await client.get(
+                    fetch_url,
+                    headers={**BASE_HEADERS, "Range": "bytes=0-2047"},
+                )
+            except Exception as e:
+                logger.warning(f"archive zip probe attempt {i+1}/{max_attempts} errored: {e}")
+                await asyncio.sleep(min(5 + i * 2, 15))
+                continue
+
+            # 先读 body —— eh/ex 在 session 锁定时会用 HTTP 404 + 纯文本 body
+            # 返回 "This archive session has been used from too many different
+            # locations."，必须看 body 才能区分"节点启动中"和"已被锁"。
+            content = r.content
+            try:
+                text_lower = content.decode("utf-8", errors="replace").lower()
+            except Exception:
+                text_lower = ""
+            if "too many different locations" in text_lower:
+                logger.warning(
+                    f"archive zip probe got 'too many different locations' "
+                    f"(HTTP {r.status_code}); session locked"
+                )
+                raise ArchiveLockedError(
+                    "archive session locked (too many different locations)"
+                )
+
+            if r.status_code in (404, 503, 502, 504):
+                wait_s = min(5 + i * 2, 15)
+                logger.info(
+                    f"archive zip probe got HTTP {r.status_code} (attempt {i+1}/{max_attempts}); "
+                    f"H@H node likely starting, wait {wait_s}s"
+                )
+                await _emit_status(
+                    f"⏳ 等待 H@H 节点启动 (尝试 {i+1}/{max_attempts})..."
+                )
+                await asyncio.sleep(wait_s)
+                continue
+
+            if r.status_code not in (200, 206):
+                raise ArchiveError(f"archive zip probe HTTP {r.status_code}")
+
+            # 嗅探 ZIP 头：PK\x03\x04 (本地文件头) 或 PK\x05\x06 (空 zip 中央目录)
+            if content[:2] == b"PK":
+                if r.status_code == 206:
+                    cr = r.headers.get("content-range") or ""
+                    if "/" in cr:
+                        try:
+                            total = int(cr.rsplit("/", 1)[-1])
+                        except ValueError:
+                            total = 0
+                    else:
+                        total = 0
+                    return total, True
+                # 200：服务端忽略了 Range（有些节点这样），不支持并发
+                total = int(r.headers.get("content-length") or 0)
+                return total, False
+
+            # 不是 ZIP —— 当未知错误页报 preview
+            try:
+                text = content.decode("utf-8", errors="replace")
+            except Exception:
+                text = ""
+            preview = text.strip()[:200] if text.strip() else f"<{len(content)}B binary>"
+            raise ArchiveError(
+                f"archive zip probe got non-zip body (HTTP {r.status_code}): {preview!r}"
+            )
+
+        raise ArchiveError(f"archive zip not ready after {max_attempts} probe attempts")
+
+    async def _single_stream() -> None:
         async with client.stream("GET", fetch_url, headers=BASE_HEADERS) as resp:
             if resp.status_code != 200:
                 raise ArchiveError(f"zip GET HTTP {resp.status_code}")
             ct = resp.headers.get("content-type", "")
             if "html" in ct.lower():
-                # 服务端可能返回 HTML 错误页而不是 zip
                 preview = (await resp.aread())[:200].decode("utf-8", errors="replace")
                 raise ArchiveError(f"expected zip but got HTML: {preview!r}")
+            try:
+                total = int(resp.headers.get("content-length") or 0)
+            except ValueError:
+                total = 0
+            downloaded = 0
+            last_emit = time.monotonic()
             with tmp.open("wb") as f:
                 async for chunk in resp.aiter_bytes(64 * 1024):
                     f.write(chunk)
+                    downloaded += len(chunk)
+                    now = time.monotonic()
+                    # 本地节流 ≥0.5s，避免每 64KB 都跨函数 await
+                    if (now - last_emit) >= 0.5:
+                        last_emit = now
+                        await _emit_progress(downloaded, total)
+            await _emit_progress(downloaded, total or downloaded)
         tmp.replace(dest_zip)
+
+    async def _ranged_parallel(total: int) -> None:
+        n = max(1, min(parallel, (total + min_parallel_size - 1) // min_parallel_size))
+        chunk_size = (total + n - 1) // n
+        ranges: list[tuple[int, int, int]] = []
+        for i in range(n):
+            start = i * chunk_size
+            end = min(total - 1, start + chunk_size - 1)
+            if start > end:
+                break
+            ranges.append((i, start, end))
+
+        # 预分配文件
+        with tmp.open("wb") as f:
+            f.truncate(total)
+
+        wrote_total = 0
+        wrote_lock = asyncio.Lock()
+        last_emit = time.monotonic()
+
+        async def _one(idx: int, start: int, end: int) -> None:
+            nonlocal wrote_total, last_emit
+            headers = {**BASE_HEADERS, "Range": f"bytes={start}-{end}"}
+            with tmp.open("r+b") as f:
+                f.seek(start)
+                async with client.stream("GET", fetch_url, headers=headers) as resp:
+                    if resp.status_code not in (200, 206):
+                        raise ArchiveError(f"range GET HTTP {resp.status_code}")
+                    async for chunk in resp.aiter_bytes(64 * 1024):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        async with wrote_lock:
+                            wrote_total += len(chunk)
+                            now = time.monotonic()
+                            if (now - last_emit) >= 0.5:
+                                last_emit = now
+                                # 在 lock 里 await 网络节流回调不会破坏锁语义，
+                                # 但会阻塞其他 task 写计数；权衡后接受——hook 内部
+                                # 是 Progress.update（节流后大概率立即返回）。
+                                await _emit_progress(wrote_total, total)
+
+        await asyncio.gather(*(_one(*r) for r in ranges))
+        await _emit_progress(total, total)
+        tmp.replace(dest_zip)
+
+    async def _do() -> None:
+        await _emit_status("⏳ 探测下载链接...")
+        total, supports_range = await _probe_zip()
+        if supports_range and total >= min_parallel_size:
+            try:
+                await _ranged_parallel(total)
+                return
+            except Exception as e:
+                logger.warning(f"ranged parallel download failed, fallback to single stream: {e}")
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+        await _single_stream()
 
     try:
         await asyncio.wait_for(_do(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         if tmp.exists():
             tmp.unlink()
         raise ArchiveError(f"archive download exceeded {timeout_seconds}s timeout")

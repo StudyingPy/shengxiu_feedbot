@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.3 — 2026-05-11
+
+### 新增 / 变更
+- 所有下载/发布路径补齐实时进度反馈。此前只有 `/archive` archive 模式和 `/zip2tph` 接收阶段能看到字节流进度；其余"贴链接走默认链路"的下载阶段（pixiv illust direct、pixiv illust telegraph、nhentai、eh/ex page_*、eh/ex archive 默认链路）以及 Telegra.ph 多 chunk 发布阶段全部缺失。本次补齐：
+  - pixiv illust 直发 / Telegra.ph 模式：显示 `⏳ 下载图片 N/M · ~ETA剩余`
+  - nhentai：显示 `⏳ nhentai 下载图片 N/M · ~ETA剩余`，缓存命中也计入推进
+  - eh/ex 网页模式（page_sample / page_original）：显示下载图片 N/M
+  - eh/ex 归档模式（archive_resample / archive_original）默认链路：显示字节流 `⏳ 下载 zip 12.3MB/45.6MB (27.0%) · 1.2MB/s · ~28s剩余`
+  - Telegra.ph 多 chunk 发布（>300 图）：显示 `⏳ 发布 Telegra.ph 页面 N/M`
+- 引入统一 progress hook 协议：`ProgressHook = Callable[[int, int], Awaitable[None]] | None`、`StatusUpdater = Callable[[str], Awaitable[None]] | None`，定义在 [pixivfeed/provider/__init__.py](pixivfeed/provider/__init__.py)。Provider 层不感知 telegram，回调内容由 channel 层通过 `make_item_hook` / `make_bytes_hook` 工厂决定（[pixivfeed/channel/telegram/progress.py](pixivfeed/channel/telegram/progress.py)）。
+- 重构合并：`/archive` 命令此前为 archive zip 下载复刻了一份带进度的实现（`_stream_download_with_progress`，含 H@H 节点等待 + Range 多线程下载），与 `download_archive_with_timeout` 默认链路并行存在。本次把丰富逻辑全部搬进 [provider/ehentai/_archive.py:download_archive_with_timeout](pixivfeed/provider/ehentai/_archive.py)，两条路径合一；`/archive` 和默认链路获得完全一致的进度反馈与下载实现。
+- 文档修正：`Progress` 类构造器实际默认 `min_interval=1.0`，docstring 与顶部说明里残留的"3 秒一次"已改正（[pixivfeed/channel/telegram/progress.py](pixivfeed/channel/telegram/progress.py)）。
+- novel 路径不变：现有阶段+计数反馈已足够，未追加 ETA。
+
+### 改动文件
+- `pixivfeed/provider/__init__.py`：新增 `ProgressHook` / `StatusUpdater` 类型别名，`Provider.fetch_and_download` 加 `on_progress` 可选参数
+- `pixivfeed/provider/pixiv/__init__.py`、`pixivfeed/provider/pixiv/downloader.py`：透传 `on_progress`，每张图（含缓存命中）调一次
+- `pixivfeed/provider/nhentai/__init__.py`：透传 `on_progress`，主下载轮 + fallback 轮共用计数器
+- `pixivfeed/provider/ehentai/__init__.py`：`fetch_and_download_with_mode(..., on_progress=)` + `_download_direct(..., on_progress=)` + `_archive_pipeline(..., on_progress=)`
+- `pixivfeed/provider/ehentai/_archive.py`：`download_archive_with_timeout(..., on_progress=, on_status=)`，并入 H@H 节点探测 + Range 并发下载（原 handlers.py 中 `_stream_download_with_progress` 的实现）
+- `pixivfeed/publisher/telegraph.py`：`publish_gallery(..., on_progress=)`，单页/多页都推
+- `pixivfeed/channel/telegram/progress.py`：新增 `make_item_hook` / `make_bytes_hook` 工厂；导入 `ProgressHook`；docstring 节流默认值订正
+- `pixivfeed/channel/telegram/handlers.py`：所有 fetch_and_download / fetch_and_download_with_mode / fetch_and_download_illust / publish_gallery 调用点接入 hook；删除 `_stream_download_with_progress`，`/archive` archive 路径改调 `download_archive_with_timeout`
+
 ## v0.4.2 — 2026-05-07
 
 ### 新增

@@ -22,7 +22,7 @@ from pathlib import Path
 import httpx
 
 from ...utils import logger
-from .. import GalleryImage, GalleryWork, ParsedRef, Provider
+from .. import GalleryImage, GalleryWork, ParsedRef, ProgressHook, Provider
 from .._common import (
     download_to_file,
     make_http_client,
@@ -203,13 +203,21 @@ class _EHFamilyProvider(Provider):
         gid, token = ref.id.split("/", 1)
         return await self._fetch_gallery_meta(gid, token)
 
-    async def fetch_and_download(self, ref: ParsedRef) -> GalleryWork:
-        return await self.fetch_and_download_with_mode(ref, self.default_mode)
+    async def fetch_and_download(
+        self, ref: ParsedRef, *, on_progress: ProgressHook = None
+    ) -> GalleryWork:
+        return await self.fetch_and_download_with_mode(
+            ref, self.default_mode, on_progress=on_progress,
+        )
 
     async def fetch_and_download_with_mode(
-        self, ref: ParsedRef, mode: EHMode
+        self, ref: ParsedRef, mode: EHMode, *, on_progress: ProgressHook = None,
     ) -> GalleryWork:
-        """供按钮交互层调用：明确指定模式。"""
+        """供按钮交互层调用：明确指定模式。
+
+        on_progress 在 PAGE_* 模式下是 item hook（按图片张数），
+        在 ARCHIVE_* 模式下是 bytes hook（按 zip 字节数）。
+        """
         gid, token = ref.id.split("/", 1)
         gallery = await self._fetch_gallery_meta(gid, token)
 
@@ -222,15 +230,19 @@ class _EHFamilyProvider(Provider):
                 image_urls = await self._extract_page_image_urls(
                     client, gallery.image_page_urls, full=False,
                 )
-                local_paths = await self._download_direct(client, image_urls, work_dir)
+                local_paths = await self._download_direct(
+                    client, image_urls, work_dir, on_progress=on_progress,
+                )
             elif mode == EHMode.PAGE_ORIGINAL:
                 image_urls = await self._extract_page_image_urls(
                     client, gallery.image_page_urls, full=True,
                 )
-                local_paths = await self._download_direct(client, image_urls, work_dir)
+                local_paths = await self._download_direct(
+                    client, image_urls, work_dir, on_progress=on_progress,
+                )
             else:  # archive
                 local_paths = await self._archive_pipeline(
-                    client, gallery, mode, work_dir,
+                    client, gallery, mode, work_dir, on_progress=on_progress,
                 )
 
         images = [
@@ -392,9 +404,11 @@ class _EHFamilyProvider(Provider):
         client: httpx.AsyncClient,
         urls: list[str],
         work_dir: Path,
+        *,
+        on_progress: ProgressHook = None,
     ) -> list[Path]:
         """直接下载图片到本地。每张图按 idx 命名。"""
-        from asyncio import Semaphore, gather
+        from asyncio import Lock, Semaphore, gather
         sem = Semaphore(self._shared_cfg.download_concurrency)
 
         dests: list[Path] = []
@@ -402,11 +416,28 @@ class _EHFamilyProvider(Provider):
             ext = safe_ext_from_url(url, default=".jpg")
             dests.append(work_dir / f"p{idx}{ext}")
 
+        total = len(urls)
+        done = 0
+        done_lock = Lock()
+
+        async def _tick() -> None:
+            nonlocal done
+            if on_progress is None:
+                return
+            async with done_lock:
+                done += 1
+                cur = done
+            try:
+                await on_progress(cur, total)
+            except Exception:
+                logger.exception("eh/ex download progress hook raised; suppressed")
+
         async def _one(url: str, dest: Path) -> None:
             async with sem:
                 # PAGE_ORIGINAL 有时会拿到 fullimg.php 那种带 query 的 URL
                 # 服务端 302 到真正的图片，httpx follow_redirects=True 默认开了
                 await download_to_file(client, url, dest, retries=3)
+            await _tick()
 
         await gather(*(_one(u, d) for u, d in zip(urls, dests)))
         return dests
@@ -421,8 +452,10 @@ class _EHFamilyProvider(Provider):
         gallery: EHGallery,
         mode: EHMode,
         work_dir: Path,
+        *,
+        on_progress: ProgressHook = None,
     ) -> list[Path]:
-        """走 archiver.php 拿 zip → 解压。"""
+        """走 archiver.php 拿 zip → 解压。on_progress 是 bytes hook。"""
         album_url = f"https://{self.HOST}/g/{gallery.gallery_id}/{gallery.token}"
         try:
             archiver_token = await fetch_archiver_token(client, album_url)
@@ -439,6 +472,7 @@ class _EHFamilyProvider(Provider):
             zip_path = work_dir / "archive.zip"
             await download_archive_with_timeout(
                 client, zip_url, zip_path, self.archive_timeout,
+                on_progress=on_progress,
             )
 
             extract = extract_archive(zip_path, work_dir)

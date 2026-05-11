@@ -18,7 +18,6 @@ eh/ex 流程（群聊或非交互场景）：
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import shutil
 import tempfile
@@ -41,7 +40,8 @@ from telegram.ext import ContextTypes
 
 from ...config import Config
 from ...provider import ParsedRef, ProviderRegistry
-from ...provider.ehentai import EHError, EHGalleryUnavailable, EHMode, _EHFamilyProvider as EHFamilyBase
+from ...provider.ehentai import EHError, EHGalleryUnavailable, EHMode
+from ...provider.ehentai import _EHFamilyProvider as EHFamilyBase
 from ...provider.ehentai._archive import (
     ArchiveError,
     ArchiveLockedError,
@@ -59,25 +59,30 @@ from ...provider.pixiv import (
 )
 from ...provider.pixiv.novel_publisher import publish_novel
 from ...publisher import TelegraphPublisher
-from ...publisher.telegraph import html_to_nodes_safe
 from ...storage import (
-    AllowList,
     KIND_ARCHIVE_CMD,
     KIND_EH_ARCHIVE,
     KIND_EH_PAGE,
     KIND_NHENTAI,
-    KIND_PIXIV_DIRECT,
     KIND_PIXIV_NOVEL,
     KIND_PIXIV_TELEGRAPH,
     KIND_ZH,
     KIND_ZIP2TPH,
+    AllowList,
     TelegraphCache,
 )
 from ...utils import logger
 from .auth import is_authorized
 from .jobqueue import JobQueueManager
-from .progress import ByteRateTracker, ImageCounter, Progress, fmt_bytes, fmt_duration
-
+from .progress import (
+    ByteRateTracker,
+    ImageCounter,
+    Progress,
+    fmt_bytes,
+    fmt_duration,
+    make_bytes_hook,
+    make_item_hook,
+)
 
 # Telegram 标准 Bot API sendDocument 上限 50MB；
 # 本地 Bot API（telegram.base_url 配置）可放宽到 ~2GB。
@@ -208,11 +213,11 @@ def _is_timeout_exc(e: BaseException) -> bool:
 
 # 全局 cancel token → JobHandle 表，按钮 callback_data 用短 token 索引
 # 任务完成或取消后会被清理；超过 1 小时未清也会被 _gc_pending 顺便清。
-_CANCEL_TOKENS: dict[str, "object"] = {}   # token -> dict(handle, owner_id, ts)
+_CANCEL_TOKENS: dict[str, object] = {}   # token -> dict(handle, owner_id, ts)
 
 # placeholder.message_id -> 当前应该保留的 reply_markup（None 表示已经显式去掉）。
 # Progress 实例化时从这里读，使每次进度更新都能保留按钮。_drop_cancel_button 会清成 None。
-_PLACEHOLDER_MARKUPS: dict[int, "object"] = {}
+_PLACEHOLDER_MARKUPS: dict[int, object] = {}
 
 
 def _cancel_button(token: str) -> InlineKeyboardMarkup:
@@ -697,8 +702,14 @@ async def _eh_run_with_mode(
         except Exception:
             pass
 
+    p = Progress(placeholder, prefix=f"📦 {ref.provider} {ref.id} · {mode.label_zh}")
+    if mode.is_archive:
+        dl_hook = make_bytes_hook(p, "下载 zip")
+    else:
+        dl_hook = make_item_hook(p, f"{ref.provider} 下载图片")
+
     try:
-        gallery = await provider.fetch_and_download_with_mode(ref, mode)
+        gallery = await provider.fetch_and_download_with_mode(ref, mode, on_progress=dl_hook)
     except EHGalleryUnavailable as e:
         # e-hentai 阶段不可用 → fallback 到 exhentai
         if ref.provider == "e-hentai.org":
@@ -715,8 +726,14 @@ async def _eh_run_with_mode(
                 await placeholder.edit_text(f"⏳ {ref.provider} 处理中（{mode.label_zh}）...")
             except Exception:
                 pass
+            # fallback 后重建 hook（prefix 里的 provider 名变了）
+            p = Progress(placeholder, prefix=f"📦 {ref.provider} {ref.id} · {mode.label_zh}")
+            if mode.is_archive:
+                dl_hook = make_bytes_hook(p, "下载 zip")
+            else:
+                dl_hook = make_item_hook(p, f"{ref.provider} 下载图片")
             try:
-                gallery = await provider.fetch_and_download_with_mode(ref, mode)
+                gallery = await provider.fetch_and_download_with_mode(ref, mode, on_progress=dl_hook)
             except EHError as e2:
                 await placeholder.edit_text(f"⚠️ ExHentai（{mode.label_zh}）失败：{e2}")
                 return
@@ -738,12 +755,14 @@ async def _eh_run_with_mode(
     page_title, page_header, page_footer = _resolve_templates(config, ref.provider)
 
     await _drop_cancel_button(placeholder)
+    pub_hook = make_item_hook(p, "发布 Telegra.ph 页面")
     try:
         pub = await publisher.publish_gallery(
             gallery,
             page_title_template=page_title,
             page_header_template=page_header,
             page_footer_template=page_footer,
+            on_progress=pub_hook,
         )
     except Exception as e:
         logger.exception(f"{ref.provider} publish_gallery failed for {ref.id}")
@@ -1024,8 +1043,11 @@ async def _send_via_telegraph_generic(
         await placeholder.edit_text(f"⚠️ Provider {ref.provider!r} 未启用")
         return
 
+    p = Progress(placeholder, prefix=f"📦 {ref.provider} {ref.id}")
+    dl_hook = make_item_hook(p, f"{ref.provider} 下载图片")
+
     try:
-        gallery = await provider.fetch_and_download(ref)
+        gallery = await provider.fetch_and_download(ref, on_progress=dl_hook)
     except Exception as e:
         logger.exception(f"{ref.provider} fetch_and_download failed for {ref.id}")
         await placeholder.edit_text(f"⚠️ 解析/下载失败：{e}")
@@ -1039,12 +1061,14 @@ async def _send_via_telegraph_generic(
     page_title, page_header, page_footer = _resolve_templates(config, ref.provider)
 
     await _drop_cancel_button(placeholder)
+    pub_hook = make_item_hook(p, "发布 Telegra.ph 页面")
     try:
         pub = await publisher.publish_gallery(
             gallery,
             page_title_template=page_title,
             page_header_template=page_header,
             page_footer_template=page_footer,
+            on_progress=pub_hook,
         )
     except Exception as e:
         logger.exception(f"{ref.provider} publish_gallery failed for {ref.id}")
@@ -1103,9 +1127,11 @@ async def _send_pixiv_illust_via_telegraph(
 
     if placeholder is None:
         placeholder = await update.message.reply_text("⏳ 处理中...")
+    p = Progress(placeholder, prefix=f"🖼️ pixiv {pid}")
+    dl_hook = make_item_hook(p, "下载图片")
     try:
         ref = ParsedRef(provider="pixiv", kind="illust", id=pid, raw=pid)
-        gallery = await pixiv.fetch_and_download(ref)
+        gallery = await pixiv.fetch_and_download(ref, on_progress=dl_hook)
     except PixivAPIError as e:
         await placeholder.edit_text(f"⚠️ {e}")
         await _log_usage(
@@ -1124,12 +1150,14 @@ async def _send_pixiv_illust_via_telegraph(
 
     t = config.templates.illust
     await _drop_cancel_button(placeholder)
+    pub_hook = make_item_hook(p, "发布 Telegra.ph 页面")
     try:
         pub = await publisher.publish_gallery(
             gallery,
             page_title_template=t.page_title,
             page_header_template=t.page_header,
             page_footer_template=t.page_footer,
+            on_progress=pub_hook,
         )
     except Exception as e:
         logger.exception(f"publish pixiv illust({pid}) failed")
@@ -1228,8 +1256,10 @@ async def _send_pixiv_illust_direct(
 
     if placeholder is None:
         placeholder = await update.message.reply_text("⏳ 下载图片中...")
+    p = Progress(placeholder, prefix=f"🖼️ pixiv {pid}")
+    dl_hook = make_item_hook(p, "下载图片")
     try:
-        illust = await pixiv.fetch_and_download_illust(pid)
+        illust = await pixiv.fetch_and_download_illust(pid, on_progress=dl_hook)
     except PixivAPIError as e:
         await placeholder.edit_text(f"⚠️ {e}")
         return
@@ -1450,7 +1480,7 @@ async def _process_zip_to_telegraph(
                             await progress.update(tracker.format("下载 zip"))
                         try:
                             await asyncio.wait_for(stop_watch.wait(), timeout=1.0)
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             pass
 
                 watch_task = asyncio.create_task(_watch_size())
@@ -1535,7 +1565,7 @@ async def _process_zip_to_telegraph(
                 await progress.update(f"⏳ 解压中 {done}/{total_imgs}{eta}")
                 try:
                     await asyncio.wait_for(stop_extract.wait(), timeout=1.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
 
         watch_extract_task = asyncio.create_task(_watch_extract())
@@ -1759,12 +1789,14 @@ async def _archive_one_ref_run(
             from ...provider.pixiv import PixivProvider as _Pixiv  # noqa: F401
             pixiv = _pixiv_provider(registry)
             assert pixiv is not None
-            illust = await pixiv.fetch_and_download_illust(ref.id)
+            dl_hook = make_item_hook(progress, "下载图片")
+            illust = await pixiv.fetch_and_download_illust(ref.id, on_progress=dl_hook)
             local_paths = [img.original_path for img in illust.images]
             title = illust.work.title or f"pixiv-{ref.id}"
         else:
             await progress.status("⏳ 拉取作品并下载图片...")
-            gallery = await provider.fetch_and_download(ref)
+            dl_hook = make_item_hook(progress, f"{ref.provider} 下载图片")
+            gallery = await provider.fetch_and_download(ref, on_progress=dl_hook)
             local_paths = [img.local_path for img in gallery.images]
             title = gallery.title or f"{ref.provider}-{ref.id}"
 
@@ -1984,6 +2016,7 @@ async def _eh_archive_with_mode(
                     )
                     last_err: Exception | None = None
                     download_done = False
+                    bytes_hook = make_bytes_hook(progress, "下载 zip")
                     for cand_idx, cand_url in enumerate(candidate_urls):
                         try:
                             if cand_idx > 0:
@@ -2001,8 +2034,10 @@ async def _eh_archive_with_mode(
                                         tmp.unlink()
                                     except OSError:
                                         pass
-                            await _stream_download_with_progress(
-                                client, cand_url, zip_path, dyn_timeout, progress,
+                            await download_archive_with_timeout(
+                                client, cand_url, zip_path, dyn_timeout,
+                                on_progress=bytes_hook,
+                                on_status=progress.update,
                             )
                             download_done = True
                             break
@@ -2035,8 +2070,10 @@ async def _eh_archive_with_mode(
                                         tmp.unlink()
                                     except OSError:
                                         pass
-                                await _stream_download_with_progress(
-                                    client, new_url, zip_path, dyn_timeout, progress,
+                                await download_archive_with_timeout(
+                                    client, new_url, zip_path, dyn_timeout,
+                                    on_progress=bytes_hook,
+                                    on_status=progress.update,
                                 )
                             else:
                                 raise last_err  # type: ignore[misc]
@@ -2059,7 +2096,10 @@ async def _eh_archive_with_mode(
         else:
             # page_* 模式：先把图片下完，再打 zip
             await progress.status("⏳ 下载图片中...")
-            gallery = await provider.fetch_and_download_with_mode(ref, mode)
+            dl_hook = make_item_hook(progress, f"{ref.provider} 下载图片")
+            gallery = await provider.fetch_and_download_with_mode(
+                ref, mode, on_progress=dl_hook,
+            )
             local_paths = [img.local_path for img in gallery.images]
             if not local_paths:
                 await progress.finish("⚠️ 没有可打包的图片")
@@ -2080,12 +2120,13 @@ async def _eh_archive_with_mode(
                 except OSError:
                     pass
             await _emit_usage(status="ok", bin_=total_bytes, bout=total_bytes)
-    except ArchiveLockedError as e:
+    except ArchiveLockedError:
         # session 被锁：尝试调 invalidate_sessions 让用户下次重新提交能拿干净链接。
         # 不自动重试本次任务 —— session 已废，重试同样会失败。
         try:
-            from ...provider.ehentai._archive import invalidate_archive_session
             import httpx as _httpx
+
+            from ...provider.ehentai._archive import invalidate_archive_session
             async with _httpx.AsyncClient(
                 headers=EH_BASE_HEADERS,
                 cookies=provider._cookies_for(mode),
@@ -2096,7 +2137,7 @@ async def _eh_archive_with_mode(
         except Exception as inv_e:
             logger.warning(f"invalidate_archive_session failed: {inv_e}")
         await progress.finish(
-            f"⚠️ archive session 已被锁定（多 IP 滥用风控）。\n"
+            "⚠️ archive session 已被锁定（多 IP 滥用风控）。\n"
             "已自动取消旧的下载链接，请稍后重新提交本画廊以获取新链接。"
         )
         await _emit_usage(status="failed")
@@ -2110,196 +2151,6 @@ async def _eh_archive_with_mode(
         logger.exception(f"/archive eh {ref.id} mode={mode} failed")
         await progress.finish(f"⚠️ 处理失败：{e}")
         await _emit_usage(status="failed")
-
-
-async def _stream_download_with_progress(
-    client, zip_url: str, dest_zip: Path, timeout_seconds: int, progress: Progress,
-    *,
-    parallel: int = 6,
-    min_parallel_size: int = 16 * 1024 * 1024,
-) -> None:
-    """带进度的 zip 下载（替代 download_archive_with_timeout 以便 hook 进度）。
-
-    优先尝试 HTTP Range 多连接并发下载（H@H 节点通常支持 Range，单连接被限速）。
-    失败/不支持 Range 时回退到单流。
-    """
-    import asyncio as _asyncio
-    sep = "&" if "?" in zip_url else "?"
-    fetch_url = f"{zip_url}{sep}start=1" if "start=" not in zip_url else zip_url
-    logger.info(f"archive zip download starting: {fetch_url[:160]}")
-
-    dest_zip.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest_zip.with_suffix(dest_zip.suffix + ".part")
-
-    async def _probe_zip() -> tuple[int, bool]:
-        """用 GET Range:0-0 探测：
-
-        - server 返 206 + ZIP 头（PK..）→ Range 支持，返回 (total, True)
-        - server 返 200 + ZIP 头 → Range 不支持但能下，返回 (total, False)
-        - 返 200 + 文本 / 含 "too many locations" / "ipb_member_id" 登录页等 → 解析后抛错
-        - 返非 2xx → 退避重试，最多 max_attempts 次
-
-        H@H 节点新分配的 zip 链接典型需要 5~30s 才上线，期间会返 404/503。
-        """
-        max_attempts = 6
-        for i in range(max_attempts):
-            try:
-                r = await client.get(
-                    fetch_url,
-                    headers={**EH_BASE_HEADERS, "Range": "bytes=0-2047"},
-                )
-            except Exception as e:
-                logger.warning(f"archive zip probe attempt {i+1}/{max_attempts} errored: {e}")
-                await asyncio.sleep(min(5 + i * 2, 15))
-                continue
-
-            # 先读 body —— eh/ex 在 session 锁定时会用 HTTP 404 + 纯文本 body
-            # 返回 "This archive session has been used from too many different
-            # locations."，必须看 body 才能区分"节点启动中"和"已被锁"。
-            content = r.content
-            try:
-                text_lower = content.decode("utf-8", errors="replace").lower()
-            except Exception:
-                text_lower = ""
-            if "too many different locations" in text_lower:
-                logger.warning(
-                    f"archive zip probe got 'too many different locations' "
-                    f"(HTTP {r.status_code}); session locked"
-                )
-                raise ArchiveLockedError(
-                    "archive session locked (too many different locations)"
-                )
-
-            if r.status_code in (404, 503, 502, 504):
-                wait_s = min(5 + i * 2, 15)
-                logger.info(
-                    f"archive zip probe got HTTP {r.status_code} (attempt {i+1}/{max_attempts}); "
-                    f"H@H node likely starting, wait {wait_s}s"
-                )
-                await progress.update(
-                    f"⏳ 等待 H@H 节点启动 (尝试 {i+1}/{max_attempts})..."
-                )
-                await asyncio.sleep(wait_s)
-                continue
-
-            if r.status_code not in (200, 206):
-                raise ArchiveError(f"archive zip probe HTTP {r.status_code}")
-
-            # 嗅探 ZIP 头：PK\x03\x04 (本地文件头) 或 PK\x05\x06 (空 zip 中央目录)
-            if content[:2] == b"PK":
-                # 拿到 total
-                if r.status_code == 206:
-                    cr = r.headers.get("content-range") or ""
-                    if "/" in cr:
-                        try:
-                            total = int(cr.rsplit("/", 1)[-1])
-                        except ValueError:
-                            total = 0
-                    else:
-                        total = 0
-                    return total, True
-                # 200：服务端忽略了 Range（有些节点这样），不支持并发
-                total = int(r.headers.get("content-length") or 0)
-                return total, False
-
-            # 不是 ZIP —— 当未知错误页报 preview
-            try:
-                text = content.decode("utf-8", errors="replace")
-            except Exception:
-                text = ""
-            preview = text.strip()[:200] if text.strip() else f"<{len(content)}B binary>"
-            raise ArchiveError(
-                f"archive zip probe got non-zip body (HTTP {r.status_code}): {preview!r}"
-            )
-
-        raise ArchiveError(f"archive zip not ready after {max_attempts} probe attempts")
-
-    async def _single_stream() -> None:
-        async with client.stream("GET", fetch_url, headers=EH_BASE_HEADERS) as resp:
-            if resp.status_code != 200:
-                raise ArchiveError(f"zip GET HTTP {resp.status_code}")
-            ct = resp.headers.get("content-type", "")
-            if "html" in ct.lower():
-                preview = (await resp.aread())[:200].decode("utf-8", errors="replace")
-                raise ArchiveError(f"expected zip but got HTML: {preview!r}")
-            total = int(resp.headers.get("content-length") or 0)
-            tracker = ByteRateTracker(total)
-            with tmp.open("wb") as f:
-                async for chunk in resp.aiter_bytes(64 * 1024):
-                    f.write(chunk)
-                    tracker.add(len(chunk))
-                    await progress.update(tracker.format("下载 zip", suffix="[单流]"))
-        tmp.replace(dest_zip)
-
-    async def _ranged_parallel(total: int) -> None:
-        # 切片
-        n = max(1, min(parallel, (total + min_parallel_size - 1) // min_parallel_size))
-        chunk_size = (total + n - 1) // n
-        ranges = []
-        for i in range(n):
-            start = i * chunk_size
-            end = min(total - 1, start + chunk_size - 1)
-            if start > end:
-                break
-            ranges.append((i, start, end))
-
-        # 预分配文件
-        with tmp.open("wb") as f:
-            f.truncate(total)
-
-        wrote_total = 0
-        wrote_lock = _asyncio.Lock()
-        tracker = ByteRateTracker(total)
-
-        async def _one(idx: int, start: int, end: int) -> None:
-            nonlocal wrote_total
-            headers = {**EH_BASE_HEADERS, "Range": f"bytes={start}-{end}"}
-            # 每个 task 自己持有 file handle，seek 到自己的 start 后顺序写
-            with tmp.open("r+b") as f:
-                f.seek(start)
-                async with client.stream("GET", fetch_url, headers=headers) as resp:
-                    if resp.status_code not in (200, 206):
-                        raise ArchiveError(f"range GET HTTP {resp.status_code}")
-                    async for chunk in resp.aiter_bytes(64 * 1024):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        async with wrote_lock:
-                            wrote_total += len(chunk)
-                            tracker.add(len(chunk))
-                            await progress.update(
-                                tracker.format("下载 zip", suffix=f"[{n}线程]")
-                            )
-
-        await _asyncio.gather(*(_one(*r) for r in ranges))
-        tmp.replace(dest_zip)
-
-    async def _do() -> None:
-        await progress.update("⏳ 探测下载链接...")
-        total, supports_range = await _probe_zip()
-        if supports_range and total >= min_parallel_size:
-            try:
-                await _ranged_parallel(total)
-                return
-            except Exception as e:
-                logger.warning(f"ranged parallel download failed, fallback to single stream: {e}")
-                if tmp.exists():
-                    try:
-                        tmp.unlink()
-                    except OSError:
-                        pass
-        await _single_stream()
-
-    try:
-        await _asyncio.wait_for(_do(), timeout=timeout_seconds)
-    except _asyncio.TimeoutError:
-        if tmp.exists():
-            tmp.unlink()
-        raise ArchiveError(f"archive download exceeded {timeout_seconds}s timeout")
-    except Exception:
-        if tmp.exists():
-            tmp.unlink()
-        raise
 
 
 def _safe_zip_name(s: str) -> str:
@@ -2395,7 +2246,7 @@ async def _send_zip_file(
                 try:
                     await asyncio.wait_for(stop_heartbeat.wait(), timeout=5.0)
                     return
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 elapsed = int(time.monotonic() - upload_t0)
                 await progress.update(
@@ -2575,7 +2426,7 @@ def _fmt_window(seconds: int) -> str:
     return f"{seconds}s"
 
 
-def _dir_size(path: "Path") -> int:
+def _dir_size(path: Path) -> int:
     """递归计算目录占用字节。任何 OSError 都跳过。"""
     total = 0
     if not path.exists():
@@ -2589,7 +2440,7 @@ def _dir_size(path: "Path") -> int:
     return total
 
 
-def _disk_usage(path: "Path") -> tuple[int, int, int]:
+def _disk_usage(path: Path) -> tuple[int, int, int]:
     """返回挂载点上的 (total, used, free) 字节。失败返回 (0,0,0)。"""
     try:
         usage = shutil.disk_usage(str(path))

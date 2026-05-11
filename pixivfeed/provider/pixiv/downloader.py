@@ -25,6 +25,7 @@ from pathlib import Path
 from PIL import Image
 
 from ...utils import logger
+from .. import ProgressHook
 from .api import PixivAPI
 
 # TG 服务端当前压缩上限（2026 现状）：长边 ≤ 2560，文件 ≤ 10MB
@@ -105,16 +106,34 @@ class PixivDownloader:
         original_urls: list[str],
         *,
         skip_existing: bool = True,
+        on_progress: ProgressHook = None,
     ) -> list[DownloadedImage]:
         """并发下载一个作品的所有图片。
 
         original_urls 顺序即为页面顺序。返回的 DownloadedImage 保持同样顺序。
+        on_progress(done, total) 在每张图（包括缓存命中）完成时调用。
         """
         work_dir = self.cache_dir / pid
         original_dir = work_dir / "original"
         tgphoto_dir = work_dir / "tgphoto"
         original_dir.mkdir(parents=True, exist_ok=True)
         tgphoto_dir.mkdir(parents=True, exist_ok=True)
+
+        total = len(original_urls)
+        done = 0
+        done_lock = asyncio.Lock()
+
+        async def _tick() -> None:
+            nonlocal done
+            if on_progress is None:
+                return
+            async with done_lock:
+                done += 1
+                cur = done
+            try:
+                await on_progress(cur, total)
+            except Exception:
+                logger.exception("pixiv download progress hook raised; suppressed")
 
         async def _one(idx: int, url: str) -> DownloadedImage:
             ext = _ext_from_url(url)
@@ -124,6 +143,7 @@ class PixivDownloader:
             # 命中缓存
             if skip_existing and original_path.exists() and tgphoto_path.exists():
                 logger.debug(f"[{pid}] p{idx} cache hit")
+                await _tick()
                 return DownloadedImage(idx, original_path, tgphoto_path, url)
 
             async with self._sem:
@@ -138,6 +158,7 @@ class PixivDownloader:
                 f"[{pid}] p{idx} done: original={original_path.stat().st_size}B "
                 f"tgphoto={tgphoto_path.stat().st_size}B"
             )
+            await _tick()
             return DownloadedImage(idx, original_path, tgphoto_path, url)
 
         tasks = [_one(i, url) for i, url in enumerate(original_urls)]

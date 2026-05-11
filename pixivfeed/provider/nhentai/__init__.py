@@ -19,14 +19,13 @@ from pathlib import Path
 import httpx
 
 from ...utils import logger
-from .. import GalleryImage, GalleryWork, ParsedRef, Provider
+from .. import GalleryImage, GalleryWork, ParsedRef, ProgressHook, Provider
 from .._common import (
     download_many,
     make_http_client,
     relative_url,
     safe_ext_from_url,
 )
-
 
 _NHENTAI_RE = re.compile(r"https?://nhentai\.(?:net|to)/g/(\d+)", re.IGNORECASE)
 
@@ -149,7 +148,9 @@ class NHentaiProvider(Provider):
             num_pages=len(pages),
         )
 
-    async def fetch_and_download(self, ref: ParsedRef) -> GalleryWork:
+    async def fetch_and_download(
+        self, ref: ParsedRef, *, on_progress: ProgressHook = None
+    ) -> GalleryWork:
         album = await self._fetch_album(ref.id)
 
         work_dir = self.cache_dir / f"nh_{album.gallery_id}"
@@ -170,7 +171,8 @@ class NHentaiProvider(Provider):
 
         async with make_http_client(timeout=self._shared_cfg.timeout) as client:
             await self._download_with_cdn_fallback(
-                client, main_urls, all_dest, per_page_fallbacks
+                client, main_urls, all_dest, per_page_fallbacks,
+                on_progress=on_progress,
             )
 
         images = [
@@ -205,19 +207,37 @@ class NHentaiProvider(Provider):
         main_urls: list[str],
         dests: list[Path],
         fallbacks: list[list[str]],
+        *,
+        on_progress: ProgressHook = None,
     ) -> None:
         """先按主 URL 并发下，失败的逐一在 fallback CDN 里重试。"""
         # 先尝试一轮主 URL（不带重试：失败的让 fallback 处理）
-        from asyncio import Semaphore, gather
+        from asyncio import Lock, Semaphore, gather
 
         sem = Semaphore(self._shared_cfg.download_concurrency)
 
         failed_indices: list[int] = []
+        total = len(main_urls)
+        done = 0
+        done_lock = Lock()
+
+        async def _tick() -> None:
+            nonlocal done
+            if on_progress is None:
+                return
+            async with done_lock:
+                done += 1
+                cur = done
+            try:
+                await on_progress(cur, total)
+            except Exception:
+                logger.exception("nhentai progress hook raised; suppressed")
 
         async def _try_one(idx: int) -> None:
             url = main_urls[idx]
             dest = dests[idx]
             if dest.exists() and dest.stat().st_size > 0:
+                await _tick()
                 return
             async with sem:
                 try:
@@ -233,6 +253,8 @@ class NHentaiProvider(Provider):
                 except Exception as e:
                     logger.debug(f"nhentai p{idx + 1} primary {url} failed: {e}, will fallback")
                     failed_indices.append(idx)
+                    return
+            await _tick()
 
         await gather(*(_try_one(i) for i in range(len(main_urls))))
 
@@ -259,6 +281,7 @@ class NHentaiProvider(Provider):
                 raise NHentaiError(
                     f"nhentai page {idx + 1}: all CDN candidates failed"
                 )
+            await _tick()
 
 
 __all__ = ["NHentaiProvider", "NHentaiAlbum", "NHentaiError"]

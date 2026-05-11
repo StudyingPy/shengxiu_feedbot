@@ -23,9 +23,33 @@ Provider 契约：
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+ProgressHook = Callable[[int, int], Awaitable[None]] | None
+"""统一进度回调协议：`await hook(done, total)`。
+
+调用方约定单位：
+- item hook：`done` / `total` 是"已完成项数 / 总项数"（图片张数、telegraph 页数等）
+- bytes hook：`done` / `total` 是"已下载字节 / 总字节"
+
+Provider 层不感知这两种语义，只负责按真实进展调 hook；具体的文案/格式
+由 channel 层（通过 make_item_hook / make_bytes_hook 工厂）决定。
+
+设为 `None` 表示禁用进度回调，downloader 应跳过调用而不是传 0。"""
+
+
+StatusUpdater = Callable[[str], Awaitable[None]] | None
+"""阶段性文本更新协议：`await on_status("⏳ 等待 H@H 节点启动 ...")`。
+
+用于较长流程内部需要把"我现在在做什么"告诉用户的场景（H@H 节点等待、
+切换备用链接等）。和 ProgressHook 互补：ProgressHook 推数字进度，
+StatusUpdater 推阶段文案。
+
+Channel 层可以直接把 `Progress.update` 绑定方法当作 StatusUpdater 传入。
+设为 `None` 时被调用方跳过文案推送。"""
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +149,14 @@ class Provider(ABC):
         """
 
     @abstractmethod
-    async def fetch_and_download(self, ref: ParsedRef) -> GalleryWork:
+    async def fetch_and_download(
+        self, ref: ParsedRef, *, on_progress: ProgressHook = None
+    ) -> GalleryWork:
         """完整流程：拉元数据 + 下载图片到 cache_dir，返回 GalleryWork。
+
+        on_progress 是可选的进度回调（见 ProgressHook 文档）。各 Provider
+        按各自的语义调用：eh/ex/nh/pixiv illust 都按"图片张数"调；
+        eh/ex archive 模式按"已下载字节数"调（在 _archive.py 流式循环里）。
 
         eh/ex/nh 直接实现就够。pixiv 对 illust 实现，
         novel 走专属 publish_novel 路径，不经过这里。
@@ -177,6 +207,8 @@ class ProviderRegistry:
 __all__ = [
     "Provider",
     "ProviderRegistry",
+    "ProgressHook",
+    "StatusUpdater",
     "ParsedRef",
     "GalleryImage",
     "GalleryWork",

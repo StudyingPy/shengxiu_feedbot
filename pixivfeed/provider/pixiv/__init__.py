@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ...provider import GalleryImage, GalleryWork, ParsedRef, Provider
+from ...provider import GalleryImage, GalleryWork, ParsedRef, ProgressHook, Provider
 from ...utils import logger
 from .api import PixivAPI, PixivAPIError, PixivAuthError, PixivNotFoundError
 from .downloader import DownloadedImage, PixivDownloader, relative_url
@@ -90,14 +90,16 @@ class PixivProvider(Provider):
             return await self.fetch_novel(ref.id)
         raise ValueError(f"unknown pixiv ref kind: {ref.kind}")
 
-    async def fetch_and_download(self, ref: ParsedRef) -> GalleryWork:
+    async def fetch_and_download(
+        self, ref: ParsedRef, *, on_progress: ProgressHook = None
+    ) -> GalleryWork:
         """完整流程，仅支持 illust。novel 请走 channel 的专属路径。"""
         if ref.kind != "illust":
             raise NotImplementedError(
                 f"PixivProvider.fetch_and_download only handles illust, got {ref.kind!r}; "
                 "use provider.pixiv.novel_publisher.publish_novel for novels"
             )
-        result = await self.fetch_and_download_illust(ref.id)
+        result = await self.fetch_and_download_illust(ref.id, on_progress=on_progress)
         return _illust_result_to_gallery(result)
 
     # ------------------------------------------------------------------
@@ -119,7 +121,9 @@ class PixivProvider(Provider):
             pages = await api.fetch_illust_pages(pid) if need_pages else None
             return parse_illust_meta(meta_body, pages)
 
-    async def fetch_and_download_illust(self, pid: str) -> IllustResult:
+    async def fetch_and_download_illust(
+        self, pid: str, *, on_progress: ProgressHook = None
+    ) -> IllustResult:
         """完整流程：元数据 + 下载所有原图 + 派生 TG 图。"""
         async with PixivAPI(self.phpsessid, self.timeout) as api:
             meta_body = await api.fetch_illust(pid)
@@ -131,7 +135,9 @@ class PixivProvider(Provider):
 
             downloader = PixivDownloader(api, self.cache_dir, self.concurrency)
             original_urls = [img.original for img in work.images]
-            downloaded = await downloader.download_illust(pid, original_urls)
+            downloaded = await downloader.download_illust(
+                pid, original_urls, on_progress=on_progress
+            )
 
         public_orig = [
             relative_url(self.public_base_url, self.cache_dir, d.original_path) for d in downloaded

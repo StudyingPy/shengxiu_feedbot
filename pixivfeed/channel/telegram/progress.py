@@ -1,7 +1,7 @@
 """占位消息进度条工具。
 
 通过周期性 edit_message_text 给用户实时反馈。Telegram 对同一消息的 edit
-有隐性限流（约每秒 1 次，过频会 429），所以这里默认节流 3 秒一次；
+有隐性限流（约每秒 1 次，过频会 429），所以这里默认节流 1 秒一次；
 状态级（status）更新会强制刷新一次。
 """
 
@@ -12,6 +12,7 @@ import time
 
 from telegram.error import BadRequest, TelegramError
 
+from ...provider import ProgressHook
 from ...utils import logger
 
 
@@ -28,7 +29,7 @@ def fmt_bytes(n: int | float) -> str:
 class Progress:
     """节流的占位消息进度更新器。
 
-    update()  : 受节流（默认 3s/次），适合高频回调（per-byte / per-image）
+    update()  : 受节流（默认 1s/次），适合高频回调（per-byte / per-image）
     status()  : 立即写入一次（除非与上次相同），适合阶段切换提示
 
     reply_markup 会被记住并在每次 edit 时带上，否则 Telegram 的 edit_text
@@ -177,4 +178,62 @@ class ByteRateTracker:
         return base
 
 
-__all__ = ["Progress", "ImageCounter", "ByteRateTracker", "fmt_bytes", "fmt_duration"]
+def make_item_hook(progress: Progress | None, label: str) -> ProgressHook:
+    """构造一个 item-style ProgressHook：把 (done, total) 渲染为 "⏳ {label} N/M · ~ETA剩余"。
+
+    done/total 由 downloader 解读为"项数"（图片张数、telegraph 页数等）。
+    `progress` 为 None 时返回 None，downloader 会跳过调用，无开销。
+
+    ETA 在已经过 2 秒之后才开始显示，避免初期速率估计抖动。
+    """
+    if progress is None:
+        return None
+
+    t0 = time.monotonic()
+
+    async def _hook(done: int, total: int) -> None:
+        if total <= 0:
+            return
+        eta_s = ""
+        elapsed = time.monotonic() - t0
+        if done > 0 and total > done and elapsed >= 2.0:
+            rate = done / elapsed
+            if rate > 0:
+                eta_s = f" · ~{fmt_duration((total - done) / rate)}剩余"
+        await progress.update(f"⏳ {label} {done}/{total}{eta_s}")
+
+    return _hook
+
+
+def make_bytes_hook(progress: Progress | None, label: str) -> ProgressHook:
+    """构造一个 bytes-style ProgressHook：把 (downloaded, total_bytes) 渲染为
+    "⏳ {label} 12.3MB/45.6MB (27.0%) · 1.2MB/s · ~28s剩余"。
+
+    `progress` 为 None 时返回 None，downloader 会跳过调用。
+
+    内部复用 `ByteRateTracker` 的 format 逻辑：每次调用把 done/total 推入
+    tracker 后调 format。Tracker 的速率基于其内部 t0（首次构造时），所以
+    rate 是真实的累计速率，不会被节流跳过影响。
+    """
+    if progress is None:
+        return None
+
+    tracker = ByteRateTracker(total=0)
+
+    async def _hook(done: int, total: int) -> None:
+        tracker.total = total
+        tracker.done = done
+        await progress.update(tracker.format(label))
+
+    return _hook
+
+
+__all__ = [
+    "Progress",
+    "ImageCounter",
+    "ByteRateTracker",
+    "fmt_bytes",
+    "fmt_duration",
+    "make_item_hook",
+    "make_bytes_hook",
+]

@@ -22,9 +22,8 @@ from telegraph.aio import Telegraph
 from telegraph.utils import html_to_nodes
 
 from ..config import Config
-from ..provider import GalleryWork
+from ..provider import GalleryWork, ProgressHook
 from ..utils import logger
-
 
 NodeTree = list[Any]
 
@@ -107,12 +106,16 @@ class TelegraphPublisher:
         page_title_template: str = "",
         page_header_template: str = "",
         page_footer_template: str = "",
+        on_progress: ProgressHook = None,
     ) -> PublishResult:
         """发布一个 GalleryWork 到 Telegra.ph。
 
         模板由调用方传进来。Channel 在 bot_data 里持有 Config，
         知道每个 provider 配的是哪一组模板（pixiv 用 templates.illust，
         eh/ex/nh 共用 templates.gallery）。
+
+        on_progress(done_pages, total_pages) 在每发完一页 Telegra.ph 后调用。
+        单页作品只调一次终态；多页作品每页一调。
         """
         await self.ensure_account()
 
@@ -128,6 +131,14 @@ class TelegraphPublisher:
             raise ValueError(f"{work.provider}/{work.work_id}: no images to publish")
         chunks = [urls[i : i + max_per_page] for i in range(0, len(urls), max_per_page)]
 
+        async def _emit(done: int, total: int) -> None:
+            if on_progress is None:
+                return
+            try:
+                await on_progress(done, total)
+            except Exception:
+                logger.exception("telegraph publish progress hook raised; suppressed")
+
         if len(chunks) == 1:
             content = self._build_content(
                 chunks[0], tvars,
@@ -137,31 +148,35 @@ class TelegraphPublisher:
             page = await self._tg.create_page(title=title_str, content=content, return_content=False)
             page_url = page["url"]
             logger.info(f"published {work.provider}[{work.work_id}] -> {page_url}")
+            await _emit(1, 1)
             return PublishResult(urls=[page_url], page_count=1, image_count=len(urls))
 
         # 多页：从最后一页往前发布，每页知道下一页 URL
         page_urls: list[str] = []
         next_url: str | None = None
-        for i in range(len(chunks) - 1, -1, -1):
+        total_chunks = len(chunks)
+        for i in range(total_chunks - 1, -1, -1):
             chunk_urls = chunks[i]
             content = self._build_content(
                 chunk_urls, tvars,
                 page_header_template, page_footer_template,
-                chunk_index=i, total_chunks=len(chunks), next_url=next_url,
+                chunk_index=i, total_chunks=total_chunks, next_url=next_url,
             )
-            page_title_str = title_str if i == 0 else f"{title_str} ({i + 1}/{len(chunks)})"
+            page_title_str = title_str if i == 0 else f"{title_str} ({i + 1}/{total_chunks})"
             if len(page_title_str) > 256:
                 page_title_str = page_title_str[:253] + "..."
             page = await self._tg.create_page(title=page_title_str, content=content, return_content=False)
             page_urls.append(page["url"])
             next_url = page["url"]
+            # done = 倒序里完成了几页 = total_chunks - i
+            await _emit(total_chunks - i, total_chunks)
 
         page_urls.reverse()
         logger.info(
-            f"published {work.provider}[{work.work_id}] across {len(chunks)} pages, "
+            f"published {work.provider}[{work.work_id}] across {total_chunks} pages, "
             f"primary={page_urls[0]}"
         )
-        return PublishResult(urls=page_urls, page_count=len(chunks), image_count=len(urls))
+        return PublishResult(urls=page_urls, page_count=total_chunks, image_count=len(urls))
 
     @staticmethod
     def _build_content(
