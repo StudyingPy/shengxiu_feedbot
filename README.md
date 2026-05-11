@@ -1,6 +1,7 @@
 # Feed Bot
 
 > 小凤的 TG 解析机器人（好像暂时只能用来涩涩）
+> 嗯，虽然说是咱的机器人，除了这两句话好像全都是AI帮忙写的
 
 群友丢个 Pixiv / e-hentai / ExHentai / nhentai 链接进来，bot 自动整理成 Telegra.ph 页面或直接发图回复——省得人人都开梯子点进去看。
 
