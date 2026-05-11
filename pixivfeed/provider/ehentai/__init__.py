@@ -22,7 +22,7 @@ from pathlib import Path
 import httpx
 
 from ...utils import logger
-from .. import GalleryImage, GalleryWork, ParsedRef, ProgressHook, Provider
+from .. import GalleryImage, GalleryWork, ParsedRef, ProgressHook, Provider, StatusUpdater
 from .._common import (
     download_to_file,
     make_http_client,
@@ -32,6 +32,7 @@ from .._common import (
 from ._archive import (
     ArchiveError,
     ArchiveLockedError,
+    compute_archive_timeout,
     download_archive_with_timeout,
     extract_archive,
     fetch_archiver_token,
@@ -211,12 +212,18 @@ class _EHFamilyProvider(Provider):
         )
 
     async def fetch_and_download_with_mode(
-        self, ref: ParsedRef, mode: EHMode, *, on_progress: ProgressHook = None,
+        self,
+        ref: ParsedRef,
+        mode: EHMode,
+        *,
+        on_progress: ProgressHook = None,
+        on_status: StatusUpdater = None,
     ) -> GalleryWork:
         """供按钮交互层调用：明确指定模式。
 
-        on_progress 在 PAGE_* 模式下是 item hook（按图片张数），
-        在 ARCHIVE_* 模式下是 bytes hook（按 zip 字节数）。
+        - PAGE_*：`on_progress` 是 item hook（按图片张数）。
+        - ARCHIVE_*：`on_status` 优先（富文本带 `[N线程]` 后缀、动态超时已自动算），
+          没传时 fallback 到 `on_progress`（bytes hook，无后缀）。
         """
         gid, token = ref.id.split("/", 1)
         gallery = await self._fetch_gallery_meta(gid, token)
@@ -242,7 +249,8 @@ class _EHFamilyProvider(Provider):
                 )
             else:  # archive
                 local_paths = await self._archive_pipeline(
-                    client, gallery, mode, work_dir, on_progress=on_progress,
+                    client, gallery, mode, work_dir,
+                    on_progress=on_progress, on_status=on_status,
                 )
 
         images = [
@@ -454,12 +462,19 @@ class _EHFamilyProvider(Provider):
         work_dir: Path,
         *,
         on_progress: ProgressHook = None,
+        on_status: StatusUpdater = None,
     ) -> list[Path]:
-        """走 archiver.php 拿 zip → 解压。on_progress 是 bytes hook。"""
+        """走 archiver.php 拿 zip → 解压。
+
+        - 用 `request_archive` 返回的预估字节数计算动态超时（5min + 5s/MB，封顶 1h），
+          避免大画廊（>500MB）固定 300s timeout 死循环；config 的 archive_timeout
+          作为下限，用户调高也尊重。
+        - on_status / on_progress 透传给 `download_archive_with_timeout`。
+        """
         album_url = f"https://{self.HOST}/g/{gallery.gallery_id}/{gallery.token}"
         try:
             archiver_token = await fetch_archiver_token(client, album_url)
-            zip_url, _estimated, _gp = await request_archive(
+            zip_url, estimated, _gp = await request_archive(
                 client,
                 self.HOST,
                 gallery.gallery_id,
@@ -467,12 +482,22 @@ class _EHFamilyProvider(Provider):
                 archiver_token,
                 mode,
             )
-            logger.info(f"[{self.HOST}/{gallery.gallery_id}] zip url obtained, downloading...")
+            timeout = compute_archive_timeout(self.archive_timeout, estimated)
+            if estimated > 0:
+                logger.info(
+                    f"[{self.HOST}/{gallery.gallery_id}] zip url obtained "
+                    f"(estimated {estimated} bytes, timeout {timeout}s), downloading..."
+                )
+            else:
+                logger.info(
+                    f"[{self.HOST}/{gallery.gallery_id}] zip url obtained "
+                    f"(estimated size unknown, timeout {timeout}s), downloading..."
+                )
 
             zip_path = work_dir / "archive.zip"
             await download_archive_with_timeout(
-                client, zip_url, zip_path, self.archive_timeout,
-                on_progress=on_progress,
+                client, zip_url, zip_path, timeout,
+                on_progress=on_progress, on_status=on_status,
             )
 
             extract = extract_archive(zip_path, work_dir)

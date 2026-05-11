@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — 2026-05-11
+
+### 修复
+- 取消按钮在 v0.4.3 引入的新进度路径上消失。`Progress.update` 每次 `edit_text` 会清掉 reply_markup；按钮通过 `_PLACEHOLDER_MARKUPS` 共享给 Progress 实例，但 v0.4.3 新构造的 5 个 `Progress(...)` 没调 `_attach_progress_markup` 把按钮装回去。补齐：[handlers.py:_handle_eh_via_telegraph](pixivfeed/channel/telegram/handlers.py) 主路径 + exhentai fallback 重建处、[handlers.py:_send_via_telegraph_generic](pixivfeed/channel/telegram/handlers.py)、[handlers.py:_send_pixiv_illust_via_telegraph](pixivfeed/channel/telegram/handlers.py)、[handlers.py:_send_pixiv_illust_direct](pixivfeed/channel/telegram/handlers.py)。
+- eh/ex 默认链路的 archive 模式用固定 `archive_timeout`（config 默认 300s），大画廊（>500MB）必现 timeout。`/archive` 命令路径 v0.4.1 起就有动态超时（5min + 5s/MB，封顶 1h），但只写在 handlers.py 那一段。本次抽出共享 helper `compute_archive_timeout` 放进 [provider/ehentai/_archive.py](pixivfeed/provider/ehentai/_archive.py)，两条路径都用——默认链路也能跑大画廊；config 的 `archive_timeout` 仍作为下限，用户调高也生效。
+- v0.4.3 重构 archive zip 下载时漏了 `[N线程]` / `[单流]` 后缀。原因是 hook 工厂 `make_bytes_hook` 在 channel 层、字符串模板固定，没法表达 downloader 内部选了哪种策略。改为 `download_archive_with_timeout` 内部用 `ByteRateTracker` 拼好富文本（含 suffix）通过 `on_status` 推；`on_progress`（数值钩子）退为兼容入口，`on_status` 设置时跳过它避免两个回调争抢同一占位消息。
+
+### 变更
+- `ByteRateTracker` / `fmt_bytes` / `fmt_duration` 从 [channel/telegram/progress.py](pixivfeed/channel/telegram/progress.py) 移到 [pixivfeed/utils.py](pixivfeed/utils.py)（与 telegram 解耦，避免 Provider 层用它时构成循环依赖）。`channel/telegram/progress.py` 保留 re-export，handlers.py 现有 import 行无需改。
+- `_EHFamilyProvider.fetch_and_download_with_mode` 新增可选 `on_status: StatusUpdater = None` 参数；archive 模式下走 `on_status` 走富文本，page_* 模式仍走 `on_progress`。
+
+### 改动文件
+- `pixivfeed/utils.py`：搬入 `ByteRateTracker` / `fmt_bytes` / `fmt_duration`
+- `pixivfeed/channel/telegram/progress.py`：删本地定义改为 re-export
+- `pixivfeed/provider/ehentai/_archive.py`：新增 `compute_archive_timeout`；`download_archive_with_timeout` 内部用 `ByteRateTracker` 推富文本，恢复 `[N线程]` / `[单流]` 后缀
+- `pixivfeed/provider/ehentai/__init__.py`：`fetch_and_download_with_mode` 加 `on_status`；`_archive_pipeline` 用 `compute_archive_timeout` 替代固定 `archive_timeout`
+- `pixivfeed/channel/telegram/handlers.py`：5 处新 `Progress(...)` 后补 `_attach_progress_markup`；archive 模式从 `on_progress=make_bytes_hook(...)` 改为 `on_status=progress.update`；`_eh_archive_with_mode` 内联的 dyn_timeout 计算改用 `compute_archive_timeout`
+
 ## v0.4.3 — 2026-05-11
 
 ### 新增 / 变更

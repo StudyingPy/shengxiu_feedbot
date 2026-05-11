@@ -39,12 +39,13 @@ from telegram.error import TimedOut as TGTimedOut
 from telegram.ext import ContextTypes
 
 from ...config import Config
-from ...provider import ParsedRef, ProviderRegistry
+from ...provider import ParsedRef, ProviderRegistry, StatusUpdater
 from ...provider.ehentai import EHError, EHGalleryUnavailable, EHMode
 from ...provider.ehentai import _EHFamilyProvider as EHFamilyBase
 from ...provider.ehentai._archive import (
     ArchiveError,
     ArchiveLockedError,
+    compute_archive_timeout,
     download_archive_with_timeout,
     fetch_archiver_token,
     refresh_download_link,
@@ -80,7 +81,6 @@ from .progress import (
     Progress,
     fmt_bytes,
     fmt_duration,
-    make_bytes_hook,
     make_item_hook,
 )
 
@@ -703,13 +703,20 @@ async def _eh_run_with_mode(
             pass
 
     p = Progress(placeholder, prefix=f"📦 {ref.provider} {ref.id} · {mode.label_zh}")
+    _attach_progress_markup(p, placeholder)
+    # archive 模式走 on_status（富文本带 [N线程] / [单流] 后缀，动态超时也已下沉）；
+    # page_* 模式走 on_progress（item 计数）。
     if mode.is_archive:
-        dl_hook = make_bytes_hook(p, "下载 zip")
+        dl_hook = None
+        dl_status: StatusUpdater = p.update
     else:
         dl_hook = make_item_hook(p, f"{ref.provider} 下载图片")
+        dl_status = None
 
     try:
-        gallery = await provider.fetch_and_download_with_mode(ref, mode, on_progress=dl_hook)
+        gallery = await provider.fetch_and_download_with_mode(
+            ref, mode, on_progress=dl_hook, on_status=dl_status,
+        )
     except EHGalleryUnavailable as e:
         # e-hentai 阶段不可用 → fallback 到 exhentai
         if ref.provider == "e-hentai.org":
@@ -728,12 +735,17 @@ async def _eh_run_with_mode(
                 pass
             # fallback 后重建 hook（prefix 里的 provider 名变了）
             p = Progress(placeholder, prefix=f"📦 {ref.provider} {ref.id} · {mode.label_zh}")
+            _attach_progress_markup(p, placeholder)
             if mode.is_archive:
-                dl_hook = make_bytes_hook(p, "下载 zip")
+                dl_hook = None
+                dl_status = p.update
             else:
                 dl_hook = make_item_hook(p, f"{ref.provider} 下载图片")
+                dl_status = None
             try:
-                gallery = await provider.fetch_and_download_with_mode(ref, mode, on_progress=dl_hook)
+                gallery = await provider.fetch_and_download_with_mode(
+                    ref, mode, on_progress=dl_hook, on_status=dl_status,
+                )
             except EHError as e2:
                 await placeholder.edit_text(f"⚠️ ExHentai（{mode.label_zh}）失败：{e2}")
                 return
@@ -1044,6 +1056,7 @@ async def _send_via_telegraph_generic(
         return
 
     p = Progress(placeholder, prefix=f"📦 {ref.provider} {ref.id}")
+    _attach_progress_markup(p, placeholder)
     dl_hook = make_item_hook(p, f"{ref.provider} 下载图片")
 
     try:
@@ -1128,6 +1141,7 @@ async def _send_pixiv_illust_via_telegraph(
     if placeholder is None:
         placeholder = await update.message.reply_text("⏳ 处理中...")
     p = Progress(placeholder, prefix=f"🖼️ pixiv {pid}")
+    _attach_progress_markup(p, placeholder)
     dl_hook = make_item_hook(p, "下载图片")
     try:
         ref = ParsedRef(provider="pixiv", kind="illust", id=pid, raw=pid)
@@ -1257,6 +1271,7 @@ async def _send_pixiv_illust_direct(
     if placeholder is None:
         placeholder = await update.message.reply_text("⏳ 下载图片中...")
     p = Progress(placeholder, prefix=f"🖼️ pixiv {pid}")
+    _attach_progress_markup(p, placeholder)
     dl_hook = make_item_hook(p, "下载图片")
     try:
         illust = await pixiv.fetch_and_download_illust(pid, on_progress=dl_hook)
@@ -1996,15 +2011,9 @@ async def _eh_archive_with_mode(
                             f"[{ref.provider}/{ref.id}] zip link is hath.network "
                             f"({zip_url[:80]}...), main host fallback: {local_url[:80]}..."
                         )
-                    # 动态超时：基础 5 分钟，再按预估大小每 MB +5s，封顶 1 小时。
-                    # 解析不到 estimated 时退回 provider.archive_timeout。
-                    if estimated_bytes > 0:
-                        dyn_timeout = max(
-                            300,
-                            min(3600, int(300 + estimated_bytes / (1024 * 1024) * 5)),
-                        )
-                    else:
-                        dyn_timeout = provider.archive_timeout
+                    # 动态超时：用 _archive.py 共享 helper（5min + 5s/MB，封顶 1h，
+                    # config 的 archive_timeout 作为下限）。解析不到 estimated 时退回配置值。
+                    dyn_timeout = compute_archive_timeout(provider.archive_timeout, estimated_bytes)
                     if estimated_bytes > 0:
                         logger.info(
                             f"[{ref.provider}/{ref.id}] estimated archive size "
@@ -2016,7 +2025,6 @@ async def _eh_archive_with_mode(
                     )
                     last_err: Exception | None = None
                     download_done = False
-                    bytes_hook = make_bytes_hook(progress, "下载 zip")
                     for cand_idx, cand_url in enumerate(candidate_urls):
                         try:
                             if cand_idx > 0:
@@ -2036,7 +2044,6 @@ async def _eh_archive_with_mode(
                                         pass
                             await download_archive_with_timeout(
                                 client, cand_url, zip_path, dyn_timeout,
-                                on_progress=bytes_hook,
                                 on_status=progress.update,
                             )
                             download_done = True
@@ -2072,7 +2079,6 @@ async def _eh_archive_with_mode(
                                         pass
                                 await download_archive_with_timeout(
                                     client, new_url, zip_path, dyn_timeout,
-                                    on_progress=bytes_hook,
                                     on_status=progress.update,
                                 )
                             else:

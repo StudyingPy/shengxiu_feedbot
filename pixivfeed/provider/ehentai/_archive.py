@@ -28,7 +28,7 @@ from urllib.parse import urljoin
 import httpx
 from bs4 import BeautifulSoup
 
-from ...utils import logger
+from ...utils import ByteRateTracker, logger
 from .. import ProgressHook, StatusUpdater
 from ._modes import BASE_HEADERS, EHMode
 
@@ -107,6 +107,24 @@ def parse_estimated_size_bytes(html: str, mode: EHMode) -> int:
         mult = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}.get(unit, 1)
         return int(n * mult)
     return 0
+
+
+def compute_archive_timeout(
+    base_timeout: int, estimated_bytes: int, *, max_timeout: int = 3600
+) -> int:
+    """根据预估字节数动态算 archive zip 下载超时。
+
+    基础 5 分钟，再按预估每 MB +5s，最终在 `[base_timeout, max_timeout]` 区间内取大。
+    estimated_bytes <= 0 时退回 base_timeout（config 值，默认 300s）。
+
+    估算来自 archiver chooser 页的 "Estimated Size"（见 `parse_estimated_size_bytes`）。
+    这条公式由 /archive 路径（v0.4.1）固化下来——大画廊 1.7GB 原图需要 ~3 分钟下载，
+    300s 必然 timeout，所以动态拉高。
+    """
+    if estimated_bytes <= 0:
+        return base_timeout
+    dyn = int(300 + estimated_bytes / (1024 * 1024) * 5)
+    return max(base_timeout, min(max_timeout, dyn))
 
 
 # 解析 chooser 页里 "Download Cost: <strong>NN GP</strong>" 或 "<strong>Free!</strong>"
@@ -434,10 +452,13 @@ async def download_archive_with_timeout(
        立即抛 ArchiveLockedError。最多 6 次重试。
     2. 探测拿到 total 和"是否支持 Range"。支持且文件 ≥ min_parallel_size 时走多连接
        并发下载（H@H 节点单连接通常被限速）；否则单流。
-    3. on_progress(downloaded, total) 在循环里按 ~0.5s 节流推；on_status(text) 用于
-       推阶段文案（"等待 H@H 节点启动 (尝试 3/6)..."）。两个回调都可选。
 
-    on_status 接收的文案带 ⏳ 前缀，方便 channel 层直接展示。
+    显示通道（两种回调可选）：
+    - `on_status(text)`：函数自己用 `ByteRateTracker` 拼好富文本（含 `[N线程]` /
+      `[单流]` 后缀、百分比、速率、ETA），按 ~0.5s 节流推。也用于阶段文案
+      （"等待 H@H 节点启动 (尝试 3/6)..."）。channel 层一般绑 `Progress.update`。
+    - `on_progress(downloaded, total)`：数值钩子，按 ~0.5s 节流推。当 `on_status`
+      也设置时**会被跳过**，避免两个回调同时往同一占位消息推内容互相覆盖。
     """
     sep = "&" if "?" in zip_url else "?"
     fetch_url = f"{zip_url}{sep}start=1" if "start=" not in zip_url else zip_url
@@ -455,7 +476,8 @@ async def download_archive_with_timeout(
             logger.exception("archive status hook raised; suppressed")
 
     async def _emit_progress(done: int, total: int) -> None:
-        if on_progress is None:
+        # on_status 设置时优先用它（带富文本后缀），跳过数值钩子避免双更新冲突
+        if on_status is not None or on_progress is None:
             return
         try:
             await on_progress(done, total)
@@ -548,18 +570,20 @@ async def download_archive_with_timeout(
                 total = int(resp.headers.get("content-length") or 0)
             except ValueError:
                 total = 0
-            downloaded = 0
+            tracker = ByteRateTracker(total)
             last_emit = time.monotonic()
             with tmp.open("wb") as f:
                 async for chunk in resp.aiter_bytes(64 * 1024):
                     f.write(chunk)
-                    downloaded += len(chunk)
+                    tracker.add(len(chunk))
                     now = time.monotonic()
-                    # 本地节流 ≥0.5s，避免每 64KB 都跨函数 await
                     if (now - last_emit) >= 0.5:
                         last_emit = now
-                        await _emit_progress(downloaded, total)
-            await _emit_progress(downloaded, total or downloaded)
+                        await _emit_status(tracker.format("下载 zip", suffix="[单流]"))
+                        await _emit_progress(tracker.done, total)
+            # 终态
+            await _emit_status(tracker.format("下载 zip", suffix="[单流]"))
+            await _emit_progress(tracker.done, total or tracker.done)
         tmp.replace(dest_zip)
 
     async def _ranged_parallel(total: int) -> None:
@@ -577,12 +601,13 @@ async def download_archive_with_timeout(
         with tmp.open("wb") as f:
             f.truncate(total)
 
-        wrote_total = 0
+        tracker = ByteRateTracker(total)
+        suffix = f"[{n}线程]"
         wrote_lock = asyncio.Lock()
         last_emit = time.monotonic()
 
         async def _one(idx: int, start: int, end: int) -> None:
-            nonlocal wrote_total, last_emit
+            nonlocal last_emit
             headers = {**BASE_HEADERS, "Range": f"bytes={start}-{end}"}
             with tmp.open("r+b") as f:
                 f.seek(start)
@@ -594,16 +619,18 @@ async def download_archive_with_timeout(
                             continue
                         f.write(chunk)
                         async with wrote_lock:
-                            wrote_total += len(chunk)
+                            tracker.add(len(chunk))
                             now = time.monotonic()
                             if (now - last_emit) >= 0.5:
                                 last_emit = now
-                                # 在 lock 里 await 网络节流回调不会破坏锁语义，
-                                # 但会阻塞其他 task 写计数；权衡后接受——hook 内部
-                                # 是 Progress.update（节流后大概率立即返回）。
-                                await _emit_progress(wrote_total, total)
+                                await _emit_status(
+                                    tracker.format("下载 zip", suffix=suffix)
+                                )
+                                await _emit_progress(tracker.done, total)
 
         await asyncio.gather(*(_one(*r) for r in ranges))
+        # 终态
+        await _emit_status(tracker.format("下载 zip", suffix=suffix))
         await _emit_progress(total, total)
         tmp.replace(dest_zip)
 
@@ -625,10 +652,10 @@ async def download_archive_with_timeout(
 
     try:
         await asyncio.wait_for(_do(), timeout=timeout_seconds)
-    except TimeoutError:
+    except TimeoutError as e:
         if tmp.exists():
             tmp.unlink()
-        raise ArchiveError(f"archive download exceeded {timeout_seconds}s timeout")
+        raise ArchiveError(f"archive download exceeded {timeout_seconds}s timeout") from e
     except Exception:
         if tmp.exists():
             tmp.unlink()
@@ -678,4 +705,5 @@ __all__ = [
     "parse_estimated_size_bytes",
     "parse_gp_cost",
     "refresh_download_link",
+    "compute_archive_timeout",
 ]
