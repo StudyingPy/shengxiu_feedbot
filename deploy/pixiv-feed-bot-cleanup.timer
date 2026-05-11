@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily cleanup for Pixiv Feed Bot image cache
+Requires=pixiv-feed-bot-cleanup.service
+
+[Timer]
+# 每天凌晨 4 点跑（避开网络高峰）
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,62 @@
+# ============================================================================
+# Pixiv Feed Bot - Nginx 配置示例
+#
+# 把以下内容粘到 /etc/nginx/conf.d/pixiv-feed-bot.conf
+# 修改：domain 名、cache_dir 路径、SSL 证书路径
+# ============================================================================
+
+server {
+    listen 443 ssl http2;
+    server_name your-domain.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/your-domain.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.example.com/privkey.pem;
+
+    # ----------------------------------------------------------------------
+    # 静态文件服务：直接暴露 cache_dir
+    # 路径与 config.yaml 的 publish.base_url 后缀对齐
+    # ----------------------------------------------------------------------
+    # 如果 publish.base_url = https://your-domain.example.com/p
+    # 那这里 location 是 /p/，root 是 cache_dir 的父目录
+    # 比如 cache_dir = /var/cache/pixiv-feed-bot/images，
+    # 则配置：location /p/ { alias /var/cache/pixiv-feed-bot/images/; ... }
+
+    location /p/ {
+        alias /var/cache/pixiv-feed-bot/images/;
+        # 允许跨域：Telegra.ph 和 TG 抓取时可能需要
+        add_header Access-Control-Allow-Origin "*";
+        # 较长的过期时间：图片是不可变内容，路径含 PID
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        # 默认 try_files 防止目录列表
+        try_files $uri =404;
+        autoindex off;
+    }
+
+    # ----------------------------------------------------------------------
+    # Inline mode 反代：i.pximg.net
+    # 因 inline mode 必须给 TG 服务端 URL（不能给本地文件），
+    # 而 i.pximg.net 有 Referer 校验，所以需要这个反代加 Referer。
+    # 仅 inline 路径用得到，正常 telegra.ph 流程用不到（用 /p/ 静态文件）。
+    # ----------------------------------------------------------------------
+    location /pximg/ {
+        proxy_pass https://i.pximg.net/;
+        proxy_set_header Host i.pximg.net;
+        proxy_set_header Referer "https://www.pixiv.net/";
+        proxy_set_header User-Agent "Mozilla/5.0";
+        proxy_ssl_server_name on;
+        proxy_ssl_name i.pximg.net;
+        # i.pximg.net 自身的缓存策略已经够好，转发即可
+        proxy_buffering on;
+        proxy_cache_valid 200 7d;
+        # 同样 CORS
+        add_header Access-Control-Allow-Origin "*";
+    }
+}
+
+# 顺手开个 80 → 443 的跳转（如果还没配的话）
+server {
+    listen 80;
+    server_name your-domain.example.com;
+    return 301 https://$server_name$request_uri;
+}

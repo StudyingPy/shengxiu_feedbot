@@ -1,0 +1,40 @@
+[Unit]
+Description=Pixiv Feed Bot (Telegram bot for Pixiv → Telegra.ph)
+Documentation=file:///opt/pixiv-feed-bot/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pixivbot
+Group=pixivbot
+
+# 修改成你的实际路径
+WorkingDirectory=/opt/pixiv-feed-bot
+ExecStart=/opt/pixiv-feed-bot/.venv/bin/python -m pixivfeed /etc/pixiv-feed-bot/config.yaml
+
+# 软重启给点时间清理缓存目录、关闭数据库
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=5s
+
+# 安全收紧
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# 写入路径白名单：缓存、数据库、日志
+ReadWritePaths=/var/cache/pixiv-feed-bot /var/lib/pixiv-feed-bot /var/log/pixiv-feed-bot
+
+# 资源限制（图片下载/Pillow 缩放可能短暂吃内存）
+MemoryMax=1G
+TasksMax=200
+
+# 标准输出走 journald，用 journalctl -u pixiv-feed-bot 看日志
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

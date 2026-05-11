@@ -1,0 +1,174 @@
+# ============================================================================
+# Feed Bot - 配置示例
+# 复制本文件为 config.yaml 并按需修改。
+#
+# 配置层级（高优先级覆盖低优先级）：
+#   1. SQLite runtime_settings 表        —— admin 私聊 /setting set 写的
+#   2. 环境变量                          —— PIXIVFEED_TG_TOKEN / PIXIVFEED_PHPSESSID 等
+#   3. 本文件                            —— 主要配置来源
+#   4. 程序内置默认                      —— fallback
+#
+# 大多数字段都可以通过 /setting set <key> <value> 在私聊里改，无需重启。
+# 启动后用 /setting list 查看哪些 key 可改。
+# 不可运行时改的关键字段：
+#   telegram.token, storage.*, publish.base_url, auth.admin_users, publish.telegraph_token
+# 这些字段动了等于换基础设施，必须改 yaml + 重启。
+# ============================================================================
+
+telegram:
+  # Bot Token，从 @BotFather 获取。也可用环境变量 PIXIVFEED_TG_TOKEN 覆盖。
+  token: "PUT_YOUR_BOT_TOKEN_HERE"
+  # 可选：本地 Bot API Server 的 base URL。留空则用官方 https://api.telegram.org
+  # 例如自建 telegram-bot-api 监听 127.0.0.1:8081 时填 "http://127.0.0.1:8081"
+  base_url: ""
+  # 仅本地 Bot API 时需要：文件下载根（默认空 = PTB 用 base_url 猜，多数情况够用）。
+  # 例如 "http://127.0.0.1:8081/file"
+  base_file_url: ""
+  # 仅本地 Bot API 时需要：打开 local_mode 后 PTB 把 getFile 返回的本地路径
+  # 当本地文件直接读，绕过官方 20MB 下载上限（处理大 zip 的 /zip2tph 必需）。
+  local_mode: false
+
+auth:
+  # 管理员用户 ID（TG user_id，正整数）。这些用户自动有所有权限，
+  # 可执行 /allow /deny /listallow /setting 命令。
+  admin_users: [123456789]
+  # 启动时初始放行的用户和群组。运行后可通过命令热更新。
+  initial_allowed_users: []
+  initial_allowed_chats: []
+
+# ============================================================================
+# Pixiv（永远启用）
+# ============================================================================
+pixiv:
+  # PHPSESSID cookie，浏览器登录 pixiv.net 后从开发者工具复制。R-18 必需。
+  # 也可用环境变量 PIXIVFEED_PHPSESSID 覆盖；或私聊 /setting edit pixiv.phpsessid。
+  phpsessid: ""
+  timeout: 30
+  download_concurrency: 4
+
+# ============================================================================
+# 其它图集站点（默认全部禁用，需要的开 enabled）
+# ============================================================================
+collectors:
+  # 与下面三个站点共享的网络参数
+  timeout: 30
+  download_concurrency: 4
+
+  ehentai:
+    enabled: false
+    # 默认下载模式（私聊会弹按钮让用户选；群聊使用此默认值）
+    # 可选：page_sample / page_original / archive_resample / archive_original
+    #   page_sample      网页逐页 显示图  - 不消耗 GP/Credits
+    #   page_original    网页逐页 原图    - 消耗 GP/Credits
+    #   archive_resample 归档 1280x      - 消耗免费 archive 配额
+    #   archive_original 归档 原图        - 消耗免费 archive 配额
+    default_mode: page_sample
+    # archive 模式下载 zip 的总超时（秒）。超过则报错让用户改选其他模式。
+    archive_timeout: 300
+
+  exhentai:
+    enabled: false
+    default_mode: page_sample
+    archive_timeout: 300
+    # ExHentai 必须登录。三个 cookie 都从 https://exhentai.org 登录后从浏览器拷出。
+    # 强烈建议改用 /setting edit collectors.exhentai.{ipb_pass_hash,ipb_member_id,igneous}
+    # 私聊设置，避免 yaml 留 cookie 明文。
+    ipb_pass_hash: ""
+    ipb_member_id: ""
+    igneous: ""
+
+  nhentai:
+    enabled: false
+
+# ============================================================================
+# 存储（基础设施，必须重启才能改）
+# ============================================================================
+storage:
+  # 图片本地缓存目录。Nginx 应该把这个目录暴露为静态文件服务。
+  # 所有 Provider（pixiv/eh/ex/nh）的图片都进这个目录，子路径形如：
+  #   {cache_dir}/{pid}/original/p0.png
+  #   {cache_dir}/eh_{gid}_{token}_{mode}/p0.jpg
+  #   {cache_dir}/nh_{gid}/p1.jpg
+  cache_dir: "/var/cache/pixiv-feed-bot/images"
+  # 图片缓存保留天数，超期由后台任务清理（实现待添加）
+  cache_days: 7
+  # SQLite 数据库文件路径
+  db_path: "/var/lib/pixiv-feed-bot/data.db"
+
+# ============================================================================
+# 发布
+# ============================================================================
+publish:
+  # Nginx 暴露 cache_dir 后对外的 URL 前缀，不要带尾斜杠。
+  # 例如 cache_dir 下有 12345/original/p0.png，则最终图片 URL 为
+  # https://example.com/p/12345/original/p0.png
+  base_url: "https://example.com/p"
+  telegraph_short_name: "feedbot"
+  telegraph_author_name: "Feed Bot"
+  telegraph_author_url: ""
+  # Telegra.ph access_token。留空时启动会自动 createAccount 并写回此处。
+  telegraph_token: ""
+  # pixiv 直发图片模式：单作品图片数 ≤ 此值时直接发图，否则走 Telegra.ph
+  direct_threshold: 5
+  # Telegra.ph 单页最大图片数，超过自动分页（官方约 300 张）
+  max_images_per_page: 300
+
+# ============================================================================
+# 模板：所有用户可见文本都用 str.format 风格的占位符
+# 模板字段都是运行时可改的（/setting edit templates.xxx），yaml 里只放默认。
+#
+# pixiv illust 可用变量：
+#   {pid} {title} {author} {user_id} {tags} {page_count}
+#   {description} {create_date} {bookmark_count} {like_count} {view_count}
+#   {ai_type}（"AI生成" 或空字符串）{x_restrict}（"R-18" / "R-18G" 或空）
+# pixiv novel 可用变量：
+#   {nid} {title} {author} {user_id} {tags} {text_length}
+#   {description} {caption_short} {series_title}
+# 通用 gallery（eh/ex/nh）可用变量：
+#   {title} {provider} {source_url} {page_count}
+#   eh/ex 还有：{gallery_id} {token} {host} {mode}
+#   nh 还有：    {media_id} {gallery_id} {tags}
+# ============================================================================
+templates:
+  illust:
+    page_title: "{title} - {author}"
+    page_header: |
+      <p><b>{title}</b></p>
+      <p>作者：<a href="https://www.pixiv.net/users/{user_id}">{author}</a></p>
+      <p>标签：{tags}</p>
+    page_footer: ""
+    direct_caption: |
+      <b>{title}</b>
+      画师：{author}
+      标签：{tags}
+      <a href="https://www.pixiv.net/artworks/{pid}">在 Pixiv 查看原作</a>
+    inline_single_caption: |
+      <b>{title}</b> - {author}
+      <a href="https://www.pixiv.net/artworks/{pid}">原作品</a>
+    inline_multi_caption: |
+      <b>{title}</b> - {author}
+      共 {page_count} 张，<a href="https://www.pixiv.net/artworks/{pid}">点击查看全部</a>
+
+  novel:
+    page_title: "{title} - {author}"
+    page_header: |
+      <p><b>{title}</b></p>
+      <p>作者：<a href="https://www.pixiv.net/users/{user_id}">{author}</a></p>
+      <p>字数：{text_length} | 标签：{tags}</p>
+      <hr>
+    page_footer: ""
+    inline_article_title: "{title} - {author}"
+    inline_article_description: "{caption_short}"
+
+  # eh / ex / nh 共用
+  gallery:
+    page_title: "{title}"
+    page_header: |
+      <p><b>{title}</b></p>
+      <p>共 {page_count} 张 · 来自 {provider}</p>
+    page_footer: ""
+
+logging:
+  level: "INFO"
+  to_file: false
+  file_path: "/var/log/pixiv-feed-bot/bot.log"

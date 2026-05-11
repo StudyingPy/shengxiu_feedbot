@@ -1,0 +1,18 @@
+[Unit]
+Description=Pixiv Feed Bot cache cleanup
+After=network.target
+
+[Service]
+Type=oneshot
+User=pixivbot
+Group=pixivbot
+WorkingDirectory=/opt/pixiv-feed-bot
+ExecStart=/opt/pixiv-feed-bot/.venv/bin/python -m deploy.cleanup /etc/pixiv-feed-bot/config.yaml
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/cache/pixiv-feed-bot
+
+StandardOutput=journal
+StandardError=journal
