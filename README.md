@@ -22,7 +22,7 @@ Bot 采用 Provider / Registry 架构，各数据源（Pixiv、e-hentai、ExHent
 - **任务队列与并发控制**：按任务类型（archive / zip2tph / 直发图片 / Telegraph 发布）分配独立的 worker pool，避免并发过载。管理员任务优先执行。
 - **下载进度与 ETA**：archive zip 下载、`/zip2tph` 接收等耗时操作显示实时进度条、速率和剩余时间估计。
 - **用量统计**：`/stats` 命令查看使用统计，支持按时间窗口、用户、群组筛选。
-- **Inline 模式**（仅管理员）：在任意对话中通过 `@bot <作品ID>` 快速查询 Pixiv 作品。
+- **维基百科查询**：`/wiki <词条>` 查中文维基百科首条命中；inline 模式（`@bot <关键词>`，仅管理员）返回 top 5 结果列表。
 - **归档下载**：`/archive` 命令将作品打包为 zip 发送。e-hentai / ExHentai 支持四种下载模式（网页显示图 / 网页原图 / 归档 1280x / 归档原图）。
 - **zip 转 Telegra.ph**：`/zip2tph` 命令将上传的图片 zip 包发布为 Telegra.ph 页面。
 
@@ -129,3 +129,4 @@ Nginx 配置、服务器更新流程、本地 Bot API 搭建等详见 [部署指
 致谢：
 - [DojinGo](https://github.com/Olivi-9/DojinGo) — collector 抽象与 nhentai / eh 解析逻辑
 - [telegram-bili-feed-helper](https://github.com/simonsmh/telegram-bili-feed-helper) — Provider / Registry 架构设计
+- [bot-rs](https://github.com/jizizr/bot-rs) — `/wiki` 命令实现参考
