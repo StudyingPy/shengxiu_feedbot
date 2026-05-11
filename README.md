@@ -52,6 +52,45 @@ location /p/ {
 }
 ```
 
+## 更新部署
+
+服务器侧把仓库当 git 工作区，更新就是几条命令的事。
+
+**首次从旧的"手动上传 zip"迁移到 git pull**：
+
+```bash
+systemctl stop pixiv-feed-bot
+cd /opt
+mv pixiv-feed-bot pixiv-feed-bot.bak.$(date +%Y%m%d)
+git clone https://github.com/StudyingPy/shengxiu_feedbot.git pixiv-feed-bot
+cd pixiv-feed-bot
+pip install -e .
+chown -R pixivbot:pixivbot /opt/pixiv-feed-bot
+systemctl start pixiv-feed-bot
+```
+
+`config.yaml` 在 `/etc/pixiv-feed-bot/`，不在仓库里，git 不会动它。
+
+**日常更新**：
+
+```bash
+cd /opt/pixiv-feed-bot
+systemctl stop pixiv-feed-bot
+git pull
+pip install -e . --quiet     # 仅 pyproject.toml 改动时需要
+systemctl start pixiv-feed-bot
+journalctl -u pixiv-feed-bot -n 50 --no-pager
+```
+
+**部署指定版本**（切到某个 tag）：
+
+```bash
+git fetch --tags
+git checkout v0.4.2
+```
+
+**回退**：`git checkout v0.4.1` 或 `git reset --hard <commit>`。
+
 ## 用法详解
 
 ### Pixiv
