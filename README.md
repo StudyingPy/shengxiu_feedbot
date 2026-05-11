@@ -247,5 +247,5 @@ python -m pixivfeed.provider.pixiv.cli url "https://www.pixiv.net/artworks/12345
 [MIT](LICENSE)。
 
 参考实现致谢：
-- [DojinGo](https://github.com/...) —— collector 抽象与 nhentai / eh 解析逻辑
-- [telegram-bili-feed-helper](https://github.com/...) —— Provider / Registry 架构形状
+- [DojinGo](https://github.com/Olivi-9/DojinGo) —— collector 抽象与 nhentai / eh 解析逻辑
+- [telegram-bili-feed-helper](https://github.com/simonsmh/telegram-bili-feed-helper) —— Provider / Registry 架构形状
