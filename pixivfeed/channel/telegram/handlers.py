@@ -457,6 +457,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /pixiv_direct <链接>     强制 pixiv 直发图片\n"
         "  /archive <链接>          直接返回压缩包（eh/ex 仍弹模式按钮）\n"
         "  /zip2tph                 回复一张 zip 图片包，发布为 Telegra.ph\n"
+        "  /wiki <词条>             查中文维基百科\n"
         "  /chatid                  查看当前 chat_id\n"
         "  /setting list            （仅 admin）查看运行时配置\n"
         "  /setting help            （仅 admin）查看 setting 命令帮助\n"

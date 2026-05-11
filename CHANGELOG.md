@@ -1,22 +1,34 @@
 # Changelog
 
-## Unreleased — 2026-05-11
+## v0.5.0 — 2026-05-11
+
+### 新增
+- `/wiki <词条>` 命令：在中文维基百科查词条，回首条命中（标题、链接、概要、总词数）。走白名单鉴权，群组/私聊均可用。逻辑参考 [Reference projects/bot-rs-master/src/funcs/command/wiki.rs](Reference%20projects/bot-rs-master/src/funcs/command/wiki.rs)。
+- Inline 模式从 pixiv 图片解析切换为维基百科搜索（`@bot <关键词>`，返回 top 5 结果列表）。仍仅 admin_users 可用。
+- 新模块 [pixivfeed/wikipedia.py](pixivfeed/wikipedia.py)：纯逻辑层 `search_wikipedia(query, lang, limit)`，与 telegram 解耦，slash command 与 inline 共用同一份。未来扩 en/jp wiki 或换 API 只改一处。
+
+### 变更
+- Pixiv inline 图片解析（v0.4 起的"@bot 12345 直接出图"）暂时禁用——图片代理在某些情况下加载失败。代码连同恢复步骤一并以注释形式保留在 [pixivfeed/channel/telegram/inline.py](pixivfeed/channel/telegram/inline.py) 文末，未来稳定后取消注释 + 在 dispatcher 加一行优先匹配即可恢复。
 
 ### 修复
 - 取消按钮在 v0.4.3 引入的新进度路径上消失。`Progress.update` 每次 `edit_text` 会清掉 reply_markup；按钮通过 `_PLACEHOLDER_MARKUPS` 共享给 Progress 实例，但 v0.4.3 新构造的 5 个 `Progress(...)` 没调 `_attach_progress_markup` 把按钮装回去。补齐：[handlers.py:_handle_eh_via_telegraph](pixivfeed/channel/telegram/handlers.py) 主路径 + exhentai fallback 重建处、[handlers.py:_send_via_telegraph_generic](pixivfeed/channel/telegram/handlers.py)、[handlers.py:_send_pixiv_illust_via_telegraph](pixivfeed/channel/telegram/handlers.py)、[handlers.py:_send_pixiv_illust_direct](pixivfeed/channel/telegram/handlers.py)。
 - eh/ex 默认链路的 archive 模式用固定 `archive_timeout`（config 默认 300s），大画廊（>500MB）必现 timeout。`/archive` 命令路径 v0.4.1 起就有动态超时（5min + 5s/MB，封顶 1h），但只写在 handlers.py 那一段。本次抽出共享 helper `compute_archive_timeout` 放进 [provider/ehentai/_archive.py](pixivfeed/provider/ehentai/_archive.py)，两条路径都用——默认链路也能跑大画廊；config 的 `archive_timeout` 仍作为下限，用户调高也生效。
 - v0.4.3 重构 archive zip 下载时漏了 `[N线程]` / `[单流]` 后缀。原因是 hook 工厂 `make_bytes_hook` 在 channel 层、字符串模板固定，没法表达 downloader 内部选了哪种策略。改为 `download_archive_with_timeout` 内部用 `ByteRateTracker` 拼好富文本（含 suffix）通过 `on_status` 推；`on_progress`（数值钩子）退为兼容入口，`on_status` 设置时跳过它避免两个回调争抢同一占位消息。
 
-### 变更
+### 变更（底层）
 - `ByteRateTracker` / `fmt_bytes` / `fmt_duration` 从 [channel/telegram/progress.py](pixivfeed/channel/telegram/progress.py) 移到 [pixivfeed/utils.py](pixivfeed/utils.py)（与 telegram 解耦，避免 Provider 层用它时构成循环依赖）。`channel/telegram/progress.py` 保留 re-export，handlers.py 现有 import 行无需改。
 - `_EHFamilyProvider.fetch_and_download_with_mode` 新增可选 `on_status: StatusUpdater = None` 参数；archive 模式下走 `on_status` 走富文本，page_* 模式仍走 `on_progress`。
 
 ### 改动文件
+- `pixivfeed/wikipedia.py`：新增，wiki 搜索纯逻辑
+- `pixivfeed/channel/telegram/wiki.py`：新增，`/wiki` 命令处理
+- `pixivfeed/channel/telegram/inline.py`：dispatcher 化，默认走 wiki；pixiv 旧代码以注释保留
+- `pixivfeed/channel/telegram/bot.py`：注册 `cmd_wiki`，`PUBLIC_COMMANDS` 加 `/wiki`
+- `pixivfeed/channel/telegram/handlers.py`：`cmd_start` 帮助文本加 `/wiki`；5 处新 `Progress(...)` 后补 `_attach_progress_markup`；archive 模式从 `on_progress=make_bytes_hook(...)` 改为 `on_status=progress.update`；`_eh_archive_with_mode` 内联的 dyn_timeout 计算改用 `compute_archive_timeout`
 - `pixivfeed/utils.py`：搬入 `ByteRateTracker` / `fmt_bytes` / `fmt_duration`
 - `pixivfeed/channel/telegram/progress.py`：删本地定义改为 re-export
 - `pixivfeed/provider/ehentai/_archive.py`：新增 `compute_archive_timeout`；`download_archive_with_timeout` 内部用 `ByteRateTracker` 推富文本，恢复 `[N线程]` / `[单流]` 后缀
 - `pixivfeed/provider/ehentai/__init__.py`：`fetch_and_download_with_mode` 加 `on_status`；`_archive_pipeline` 用 `compute_archive_timeout` 替代固定 `archive_timeout`
-- `pixivfeed/channel/telegram/handlers.py`：5 处新 `Progress(...)` 后补 `_attach_progress_markup`；archive 模式从 `on_progress=make_bytes_hook(...)` 改为 `on_status=progress.update`；`_eh_archive_with_mode` 内联的 dyn_timeout 计算改用 `compute_archive_timeout`
 
 ## v0.4.3 — 2026-05-11
 

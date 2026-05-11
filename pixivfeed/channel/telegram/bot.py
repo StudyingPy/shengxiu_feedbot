@@ -39,6 +39,7 @@ from .handlers import (
 from .inline import handle_inline
 from .jobqueue import JobQueueManager
 from .setting import cmd_setting
+from .wiki import cmd_wiki
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,7 @@ PUBLIC_COMMANDS: list[BotCommand] = [
     BotCommand("pixiv_direct", "强制直接发图模式处理 pixiv 链接"),
     BotCommand("archive", "对链接产出压缩包（eh/ex 仍弹模式按钮）"),
     BotCommand("zip2tph", "把 zip 图片包发布为 Telegra.ph"),
+    BotCommand("wiki", "在中文维基百科中查词条"),
 ]
 
 ADMIN_COMMANDS: list[BotCommand] = [
@@ -161,6 +163,7 @@ def build_application(
     app.add_handler(CommandHandler("pixiv_direct", cmd_pixiv_direct))
     app.add_handler(CommandHandler("archive", cmd_archive))
     app.add_handler(CommandHandler("zip2tph", cmd_zip2tph))
+    app.add_handler(CommandHandler("wiki", cmd_wiki))
     app.add_handler(CommandHandler("allow", cmd_allow))
     app.add_handler(CommandHandler("deny", cmd_deny))
     app.add_handler(CommandHandler("listallow", cmd_listallow))
