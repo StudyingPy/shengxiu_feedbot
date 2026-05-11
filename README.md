@@ -53,7 +53,6 @@ python -m pixivfeed
   - 直发上限 10 张（`sendMediaGroup` 限制），超过自动降级为 Telegra.ph
   - `/pixiv_telegraph <链接>` 强制走 Telegra.ph；`/pixiv_direct <链接>` 强制直发
 - **Novel**：自动转为 Telegra.ph 页面，支持 `[newpage]`、`[chapter:]`、`[[jumpuri:>]]`、`[pixivimage:]`、`[uploadedimage:]` 等标记
-- **Inline**（仅管理员）：`@bot 12345`、`@bot artworks/12345`、`@bot novel/999`、或完整 URL
 
 ### e-hentai / ExHentai
 
