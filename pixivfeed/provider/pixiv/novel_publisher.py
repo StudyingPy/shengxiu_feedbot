@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,10 +39,15 @@ class _NovelEmbedded:
     url: str
 
 
-# Telegra.ph 官方 API 写的是 content JSON 上限 64 KB。纯文本转成 node tree
-# 后还有标签、链接、图片节点等 JSON 开销，所以这里用偏保守的正文字符软上限，
-# 超过后拆成多篇 Telegra.ph 并在每篇末尾放“下一页”。
-NOVEL_TEXT_SOFT_LIMIT = 18_000
+# Telegra.ph 官方 API 写的是 content JSON 上限 64 KB。纯中文 UTF-8 是 3 字节/字符，
+# 加上每段 <p>...</p> 节点的 JSON 包装开销（"tag"/"children" 字段约 25-50 字节/段），
+# 14000 字符对应 ~51 KB 实际字节，留约 9 KB（15%）给章节切割不均、嵌入图、header/footer
+# 等 overhead。15000+ 会撞 60 KB 上限。
+NOVEL_TEXT_SOFT_LIMIT = 14_000
+
+# 字节预检阈值：粗切后逐 chunk 实测 JSON 字节，超过此值则二分。
+# 留 5 KB 给请求里 title/access_token/return_content 等其它字段。
+TELEGRAPH_CONTENT_BYTE_LIMIT = 60_000
 
 
 async def publish_novel(
@@ -132,6 +138,16 @@ async def publish_novel(
         title = title[:253] + "..."
 
     content_chunks = _split_novel_text(novel.content)
+    # 字节预检 + 二分：粗切按字符数，二次校验按真实 JSON 字节数。
+    # 防御极端段落分布（章节超长、嵌入图密集等）撞 64KB 上限。
+    content_chunks = _ensure_byte_safe_chunks(
+        content_chunks,
+        novel=novel,
+        embedded_public=embedded_public,
+        header_template=templates.page_header,
+        footer_template=templates.page_footer,
+        tvars=tvars,
+    )
 
     # 从最后一页往前发，才能在前一页末尾写入下一页 URL；对外仍只返回第一页。
     page_urls: list[str] = []
@@ -220,6 +236,88 @@ def _split_novel_text(content: str, limit: int = NOVEL_TEXT_SOFT_LIMIT) -> list[
 
     flush_cur()
     return chunks or [content]
+
+
+def _find_split_point(text: str) -> int:
+    """在文本接近中点处找一个"自然"切分位（换行/句号 > 标点 > 空格）。
+
+    返回切分后**右半起点**的索引。在中点 ±1/6 长度的窗口里搜索，找不到就回退到中点。
+    """
+    if len(text) < 2:
+        return len(text) // 2
+    target = len(text) // 2
+    span = max(200, len(text) // 6)
+    lo, hi = max(0, target - span), min(len(text), target + span)
+    for sep in ("\n\n", "[newpage]", "\n", "。", "！", "？", ".", "!", "?", " "):
+        idx = text.rfind(sep, lo, hi)
+        if idx > 0:
+            return idx + len(sep)
+    return target
+
+
+def _ensure_byte_safe_chunks(
+    chunks: list[str],
+    *,
+    novel: NovelWork,
+    embedded_public: dict[str, dict],
+    header_template: str,
+    footer_template: str,
+    tvars: dict[str, Any],
+    byte_limit: int = TELEGRAPH_CONTENT_BYTE_LIMIT,
+) -> list[str]:
+    """对每个 chunk 真实构建 nodes 后测 JSON 字节，超限就二分递归。
+
+    用 chunk_index=0 + 非空 next_url 来构造"最坏 overhead"的测试节点
+    （首页含原作品链接、封面、header、footer，再加下一页链接），
+    确保后续真实发布时不会再超限。
+    """
+    safe: list[str] = []
+    pending: list[str] = list(chunks)
+    # 兜底：每个原始 chunk 最多二分 6 层 = 64 段，足够撑 ~1MB 单段超长文本
+    budget = max(1, len(chunks)) * 64
+
+    while pending and budget > 0:
+        budget -= 1
+        ch = pending.pop(0)
+        if len(ch) < 500:
+            # 文本太短就别再切了，否则会切到字面没意义
+            safe.append(ch)
+            continue
+        test_nodes = _build_novel_page_nodes(
+            novel=novel,
+            embedded_public=embedded_public,
+            header_template=header_template,
+            footer_template=footer_template,
+            tvars=tvars,
+            content_chunk=ch,
+            chunk_index=0,
+            total_chunks=2,
+            next_url="https://telegra.ph/placeholder-for-size-estimate",
+        )
+        size = len(json.dumps(test_nodes, ensure_ascii=False).encode("utf-8"))
+        if size <= byte_limit:
+            safe.append(ch)
+            continue
+        mid = _find_split_point(ch)
+        if mid <= 0 or mid >= len(ch):
+            safe.append(ch)
+            continue
+        left, right = ch[:mid].rstrip(), ch[mid:].lstrip()
+        if not left or not right:
+            safe.append(ch)
+            continue
+        logger.info(
+            f"novel chunk over byte limit ({size} > {byte_limit}); bisecting "
+            f"at char {mid}/{len(ch)}"
+        )
+        pending.insert(0, right)
+        pending.insert(0, left)
+
+    if pending:
+        # budget 用尽（极端单段巨长文本），剩下的直接放过，让 Telegra.ph 自己报错
+        logger.warning(f"_ensure_byte_safe_chunks budget exhausted, {len(pending)} chunk(s) left")
+        safe.extend(pending)
+    return safe
 
 
 def _build_novel_page_nodes(

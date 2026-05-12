@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — 2026-05-12
+
+### 修复
+- Pixiv 长篇小说（约 70k+ 字）发布到 Telegra.ph 抛 `CONTENT_TOO_BIG` / `PAGE_SAVE_FAILED`。根因：`NOVEL_TEXT_SOFT_LIMIT = 18000` 是**字符数**，但 Telegra.ph 64KB 限制是**序列化 JSON 字节数**，纯中文 18000 字 × 3 字节 + JSON 节点开销已撞上限。修复：(1) 字符上限降至 14000（留 15% 余量给章节分布不均与嵌入图）；(2) 在 [novel_publisher.py](pixivfeed/provider/pixiv/novel_publisher.py) 新增 `_ensure_byte_safe_chunks` —— 粗切后对每个 chunk 真实构建 nodes 并测 `json.dumps` 字节数，超 60KB 就在自然分隔符处二分递归，作为最后防线。
+
+### 改动文件
+- `pixivfeed/provider/pixiv/novel_publisher.py`：`NOVEL_TEXT_SOFT_LIMIT` 18000 → 14000；新增 `_find_split_point`、`_ensure_byte_safe_chunks`、`TELEGRAPH_CONTENT_BYTE_LIMIT = 60000`；`publish_novel` 主循环在粗切后接一道字节预检
+
 ## v0.5.0 — 2026-05-11
 
 ### 新增
