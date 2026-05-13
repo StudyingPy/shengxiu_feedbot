@@ -1,11 +1,16 @@
 # Changelog
 
-## Unreleased — 2026-05-12
+## Unreleased — 2026-05-13
+
+### 新增
+- `/setting` 命令为布尔型与少数枚举型字段附带 inline 按钮切换。`/setting get <key>` 在 key 命中 `TOGGLE_OPTIONS` 时返回当前值 + 一组按钮（当前值前缀 `●`），点击直接 `set_runtime` 并刷新消息。`_set_setting` / `handle_setting_edit_followup` 完成后也返回同样的键盘，省去再敲一次 `get` 的步骤。覆盖范围：`collectors.{ehentai,exhentai,nhentai}.enabled`、`collectors.{ehentai,exhentai}.default_mode`、`logging.level`。callback_data 走 `stg:<key>:<value>` 单 prefix，由 [handlers.py:handle_callback](pixivfeed/channel/telegram/handlers.py) 分发到 [setting.py:handle_setting_callback](pixivfeed/channel/telegram/setting.py)；回调内复校 admin 权限。
 
 ### 修复
 - Pixiv 长篇小说（约 70k+ 字）发布到 Telegra.ph 抛 `CONTENT_TOO_BIG` / `PAGE_SAVE_FAILED`。根因：`NOVEL_TEXT_SOFT_LIMIT = 18000` 是**字符数**，但 Telegra.ph 64KB 限制是**序列化 JSON 字节数**，纯中文 18000 字 × 3 字节 + JSON 节点开销已撞上限。修复：(1) 字符上限降至 14000（留 15% 余量给章节分布不均与嵌入图）；(2) 在 [novel_publisher.py](pixivfeed/provider/pixiv/novel_publisher.py) 新增 `_ensure_byte_safe_chunks` —— 粗切后对每个 chunk 真实构建 nodes 并测 `json.dumps` 字节数，超 60KB 就在自然分隔符处二分递归，作为最后防线。
 
 ### 改动文件
+- `pixivfeed/channel/telegram/setting.py`：新增 `TOGGLE_OPTIONS`、`_toggle_keyboard`、`_eq_value`、`_render_setting_value`、`handle_setting_callback`；`_get_setting` / `_set_setting` / `handle_setting_edit_followup` 在回消息时附带键盘
+- `pixivfeed/channel/telegram/handlers.py`：`handle_callback` 增加 `stg:` 前缀分发
 - `pixivfeed/provider/pixiv/novel_publisher.py`：`NOVEL_TEXT_SOFT_LIMIT` 18000 → 14000；新增 `_find_split_point`、`_ensure_byte_safe_chunks`、`TELEGRAPH_CONTENT_BYTE_LIMIT = 60000`；`publish_novel` 主循环在粗切后接一道字节预检
 
 ## v0.5.0 — 2026-05-11

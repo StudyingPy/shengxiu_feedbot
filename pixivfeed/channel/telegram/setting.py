@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from ...config import RUNTIME_KEYS, SENSITIVE_KEYS, Config
@@ -26,6 +26,72 @@ from .auth import is_admin
 # 待编辑的 key（用户调用 /setting edit 后，下一条消息进入这个 key）
 # 用 user_data 存而不是全局，免得多个 admin 串
 _EDIT_PENDING_KEY = "__setting_edit_pending"
+
+# 支持按钮切换的字段：bool 二选一 / enum 少数选项。
+# 每项 (value_str, button_label)；value_str 走 Config._coerce 一样的字符串协议。
+# 注意：callback_data 上限 64 bytes，目前最长 "stg:collectors.exhentai.default_mode:archive_resample" 52B，仍有余量。
+TOGGLE_OPTIONS: dict[str, list[tuple[str, str]]] = {
+    "collectors.ehentai.enabled":  [("true", "✅ 启用"), ("false", "❌ 关闭")],
+    "collectors.exhentai.enabled": [("true", "✅ 启用"), ("false", "❌ 关闭")],
+    "collectors.nhentai.enabled":  [("true", "✅ 启用"), ("false", "❌ 关闭")],
+    "collectors.ehentai.default_mode": [
+        ("page_sample",      "网页 · 显示图"),
+        ("page_original",    "网页 · 原图"),
+        ("archive_resample", "归档 · 1280x"),
+        ("archive_original", "归档 · 原图"),
+    ],
+    "collectors.exhentai.default_mode": [
+        ("page_sample",      "网页 · 显示图"),
+        ("page_original",    "网页 · 原图"),
+        ("archive_resample", "归档 · 1280x"),
+        ("archive_original", "归档 · 原图"),
+    ],
+    "logging.level": [
+        ("DEBUG",   "DEBUG"),
+        ("INFO",    "INFO"),
+        ("WARNING", "WARNING"),
+        ("ERROR",   "ERROR"),
+    ],
+}
+
+
+def _eq_value(value, target_str: str) -> bool:
+    """判定当前 value（dataclass 实际类型）与按钮 value_str 是否等价。"""
+    if isinstance(value, bool):
+        return target_str.lower() in (("true", "1", "yes", "on") if value else ("false", "0", "no", "off"))
+    return str(value) == target_str
+
+
+def _toggle_keyboard(key: str, current_value) -> InlineKeyboardMarkup | None:
+    options = TOGGLE_OPTIONS.get(key)
+    if not options:
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for value_str, label in options:
+        text = f"● {label}" if _eq_value(current_value, value_str) else label
+        row.append(InlineKeyboardButton(text, callback_data=f"stg:{key}:{value_str}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def _render_setting_value(key: str, config: Config, runtime: RuntimeSettings) -> tuple[str, object]:
+    """返回 (展示文本, 当前实际 value)。读取失败时 value=None。"""
+    try:
+        value = config.get_field(key)
+    except Exception as e:
+        return f"⚠️ 读取失败：{e}", None
+    rt_value = runtime.get(key)
+    text = f"{key} = {_mask(key, value)}\n"
+    if rt_value is not None:
+        text += f"（runtime 覆盖中：{_mask(key, rt_value)}）"
+    else:
+        text += "（来自 yaml/默认值）"
+    return text, value
 
 
 def _mask(key: str, value) -> str:
@@ -99,13 +165,13 @@ async def cmd_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def _send_help(update: Update) -> None:
     await update.message.reply_text(
         "/setting list [prefix]    列出可改配置\n"
-        "/setting get <key>        查看单个值\n"
+        "/setting get <key>        查看单个值（布尔/枚举字段会附带切换按钮）\n"
         "/setting set <key> <val>  设置（单行）\n"
         "/setting edit <key>       下一条消息作为新值（多行/敏感字段用这个）\n"
         "/setting unset <key>      删除 runtime 覆盖（重启后回到 yaml 值）\n"
         "/setting help             本帮助\n\n"
         "示例：\n"
-        "  /setting set collectors.exhentai.enabled true\n"
+        "  /setting get collectors.exhentai.enabled   ← 试试这个，下面会出现切换按钮\n"
         "  /setting set publish.direct_threshold 8\n"
         "  /setting edit templates.gallery.page_header"
     )
@@ -162,18 +228,9 @@ async def _get_setting(
     if key not in RUNTIME_KEYS:
         await update.message.reply_text(f"⚠️ {key!r} 不在可改配置列表中（/setting list 查看）")
         return
-    try:
-        value = config.get_field(key)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ 读取失败：{e}")
-        return
-    rt_value = runtime.get(key)
-    msg = f"{key} = {_mask(key, value)}\n"
-    if rt_value is not None:
-        msg += f"（runtime 覆盖中：{_mask(key, rt_value)}）"
-    else:
-        msg += "（来自 yaml/默认值）"
-    await update.message.reply_text(msg)
+    text, value = _render_setting_value(key, config, runtime)
+    keyboard = _toggle_keyboard(key, value) if value is not None else None
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def _set_setting(
@@ -192,9 +249,11 @@ async def _set_setting(
         await update.message.reply_text(f"⚠️ 写入失败：{e}")
         return
     new_value = config.get_field(key)
+    keyboard = _toggle_keyboard(key, new_value)
     await update.message.reply_text(
         f"✓ {key} = {_mask(key, new_value)}\n"
-        "已保存到 SQLite 并即时生效。"
+        "已保存到 SQLite 并即时生效。",
+        reply_markup=keyboard,
     )
 
 
@@ -263,11 +322,81 @@ async def handle_setting_edit_followup(
         return True
 
     new_value = config.get_field(pending_key)
+    keyboard = _toggle_keyboard(pending_key, new_value)
     await update.message.reply_text(
         f"✓ {pending_key} 已更新（{len(text)} chars）\n"
-        f"当前值：{_mask(pending_key, new_value)}"
+        f"当前值：{_mask(pending_key, new_value)}",
+        reply_markup=keyboard,
     )
     return True
 
 
-__all__ = ["cmd_setting", "handle_setting_edit_followup"]
+async def handle_setting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """处理 stg:<key>:<value> 回调。返回 True 表示已消费。
+
+    callback_data 格式：`stg:<key>:<value_str>`，key 内含 `.` 但不含 `:`，
+    value_str 也不含 `:`，因此用 rsplit(":", 1) 切出末尾值。
+    """
+    query = update.callback_query
+    if query is None or not query.data or not query.data.startswith("stg:"):
+        return False
+
+    payload = query.data[4:]
+    if ":" not in payload:
+        await query.answer()
+        return True
+    key, _, value_str = payload.rpartition(":")
+
+    if key not in TOGGLE_OPTIONS or key not in RUNTIME_KEYS:
+        await query.answer("⚠️ 该项不支持按钮切换", show_alert=True)
+        return True
+
+    # 仅 admin 可操作
+    config: Config = context.bot_data["config"]
+    runtime: RuntimeSettings = context.bot_data["runtime_settings"]
+    user = query.from_user
+    if user is None or user.id not in set(config.auth.admin_users):
+        await query.answer("⚠️ 仅 admin 可修改配置", show_alert=True)
+        return True
+
+    try:
+        current = config.get_field(key)
+    except Exception:
+        current = None
+
+    if current is not None and _eq_value(current, value_str):
+        await query.answer("已是该值")
+        # 仍刷新一遍，免得用户感觉无响应
+        try:
+            text, value = _render_setting_value(key, config, runtime)
+            await query.edit_message_text(text, reply_markup=_toggle_keyboard(key, value))
+        except Exception:
+            pass
+        return True
+
+    try:
+        await config.set_runtime(key, value_str, updated_by=user.id)
+    except KeyError as e:
+        await query.answer(f"⚠️ {e}", show_alert=True)
+        return True
+    except ValueError as e:
+        await query.answer(f"⚠️ 值无效：{e}", show_alert=True)
+        return True
+    except Exception as e:
+        logger.exception(f"setting toggle {key}={value_str!r} failed")
+        await query.answer(f"⚠️ 写入失败：{e}", show_alert=True)
+        return True
+
+    text, value = _render_setting_value(key, config, runtime)
+    await query.answer(f"✓ 已切换为 {value_str}")
+    try:
+        await query.edit_message_text(
+            f"✓ 已保存\n{text}",
+            reply_markup=_toggle_keyboard(key, value),
+        )
+    except Exception:
+        pass
+    return True
+
+
+__all__ = ["cmd_setting", "handle_setting_edit_followup", "handle_setting_callback"]
