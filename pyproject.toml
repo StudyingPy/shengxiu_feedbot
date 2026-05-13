@@ -17,7 +17,6 @@ dependencies = [
     "aiosqlite>=0.20",
     "loguru>=0.7",
     "PyYAML>=6.0",
-    "orjson>=3.10",
 ]
 
 [dependency-groups]
