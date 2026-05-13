@@ -120,9 +120,9 @@ cp deploy/feed-bot-deploy.sh /usr/local/bin/feed-bot-deploy.sh
 chmod 0755 /usr/local/bin/feed-bot-deploy.sh
 ```
 
-### 5. 配置环境（含 TG 通知）
+### 5. 让 deploy 用户能读 bot 配置（默认凭据来源）
 
-部署脚本默认从 `/etc/pixiv-feed-bot/config.yaml` 自动读 `telegram.token`、`auth.admin_users[0]`、`telegram.base_url`——通知用的 bot 和接收 admin 与 feed-bot 本身保持一致。所以**默认情况下你什么都不用配**，只需要让 `deploy` 用户能读 config.yaml：
+部署脚本默认从 `/etc/pixiv-feed-bot/config.yaml` 自动读 `telegram.token`、`auth.admin_users[0]`、`telegram.base_url`——通知用的 bot 和接收 admin 与 feed-bot 本身保持一致。所以**默认情况下你什么都不用单独配**，只需要让 `deploy` 用户能读 config.yaml：
 
 ```bash
 chgrp pixivbot /etc/pixiv-feed-bot/config.yaml
@@ -132,15 +132,23 @@ usermod -aG pixivbot deploy
 systemctl restart feed-bot-webhook 2>/dev/null || true
 ```
 
-如果你想用**另一个 bot / 另一个 admin** 推送部署通知（比如不想让 feed-bot 把 deploy 噪音混进自己的对话），写一个 override env：
+完成这三行就可以**直接跳到第 6 步**。
+
+#### 可选：自定义通知凭据（override）
+
+只有在以下场景才需要单独写 `/etc/feed-bot-webhook/env`：
+
+- 想让 deploy 通知走**另一个 bot**（不和 feed-bot 正常对话混在一起）
+- 推给**别的 admin**，或 `admin_users` 列表里的第 2、3 个
+- 走本地 Bot API 推送（默认会读 `config.yaml` 里的 `base_url`，已经够用——除非你想为 deploy 单独指定一个 base_url）
 
 ```bash
 mkdir -p /etc/feed-bot-webhook
 cat > /etc/feed-bot-webhook/env <<'EOF'
-# 留空 = 用 config.yaml 里的默认值
+# 留空 = 用 config.yaml 里的默认值；填了就盖默认
 TG_BOT_TOKEN=
 TG_ADMIN_ID=
-# 可选：本地 Bot API。留空 = 走官方
+# 可选：本地 Bot API。留空 = 走 config.yaml 的 base_url，再没有就走官方
 # TG_BOT_API_BASE=http://127.0.0.1:8081/bot
 EOF
 chown deploy:deploy /etc/feed-bot-webhook/env
