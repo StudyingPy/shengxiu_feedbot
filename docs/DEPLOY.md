@@ -176,6 +176,18 @@ location = /deploy {
 
 `nginx -t && systemctl reload nginx`。
 
+**宝塔面板用户**：**不要**直接编辑 `/www/server/panel/vhost/nginx/<域名>.conf` 主文件——面板"保存网站设置"会覆盖。宝塔的主配置里已经预留了一行 `include /www/server/panel/vhost/nginx/extension/<域名>/*.conf;`，把片段做成独立文件丢进去就行：
+
+```bash
+mkdir -p /www/server/panel/vhost/nginx/extension/feed.fengshengxiu.club
+cp deploy/feed-bot-webhook.nginx.conf.example \
+   /www/server/panel/vhost/nginx/extension/feed.fengshengxiu.club/feed-bot-webhook.conf
+# 重载：宝塔面板 → 软件商店 → Nginx → 重载；或命令行
+nginx -t && nginx -s reload
+```
+
+如果开启了宝塔的「Nginx 防火墙」/「网站防火墙」插件，去把 `/deploy` 加白名单，否则 GitHub 的 POST 可能被 CC 防御误拦。
+
 ### 9. 配置 GitHub webhook
 
 仓库 → Settings → Webhooks → Add webhook：

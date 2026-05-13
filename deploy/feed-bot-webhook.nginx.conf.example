@@ -1,0 +1,24 @@
+# Nginx 片段：GitHub webhook → 本地 adnanh/webhook
+#
+# 部署方式（任选其一）：
+#
+# A. 宝塔面板：复制本文件到
+#    /www/server/panel/vhost/nginx/extension/feed.fengshengxiu.club/feed-bot-webhook.conf
+#    这个目录已被主配置 include，宝塔"保存网站设置"也不会覆盖。
+#    然后宝塔面板 → 软件商店 → Nginx → 重载（或命令行 nginx -s reload）。
+#
+# B. 普通 nginx：把下面这个 location 块直接贴进 server { ... } 内，
+#    nginx -t && systemctl reload nginx 即可。
+
+location = /deploy {
+    if ($request_method != POST) { return 405; }
+
+    proxy_pass http://127.0.0.1:9000/hooks/feed-bot;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 120s;
+
+    # 部署日志单独切一个文件，便于排查
+    access_log /www/wwwlogs/feed.fengshengxiu.club-deploy.log;
+}
