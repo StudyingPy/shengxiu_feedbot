@@ -3,6 +3,7 @@
 ## Unreleased — 2026-05-13
 
 ### 新增
+- GitHub webhook 自动部署。`main` push 后服务器 1–2 秒内 `git pull` + 按需 `pip install` + `systemctl restart pixiv-feed-bot`，结果通过 TG 推给 admin（成功/失败都推）。链路 `GitHub → Nginx /deploy → adnanh/webhook (127.0.0.1:9000) → feed-bot-deploy.sh → sudo systemctl restart`，webhook 跑在专用 deploy 用户下，sudoers 仅放行 `restart pixiv-feed-bot`。hooks.json 三重过滤（HMAC-SHA256 / 仅 main / 仅 push event），减少误触发面。配置/安装见 [docs/DEPLOY.md](docs/DEPLOY.md) 新增的「GitHub webhook 自动部署」段。
 - `/stats` 总览补「按群组排行（前 10）」段；管理员在群里直接 `/stats` 默认查本群（私聊仍是全局总览）。`/stats chat <id>` 现在同时接受 `-1001838275879` / `1838275879`（短 id 自动补 `-100` 前缀）/ `@username` 三种形式；新增 `/stats chats [窗口]` 列群组活跃排行。展示用 [_friendly_chat_id](pixivfeed/channel/telegram/handlers.py) 把 `-100…` 转成 `c/…`，让管理员不用再面对原始 bot API id。
 - 新增 `chats` 表与 [upsert_chat](pixivfeed/storage/usage.py) / [get_chat_display](pixivfeed/storage/usage.py) / [per_chat_summary](pixivfeed/storage/usage.py)：`_track_user`（早就在跑）现在顺手把 effective_chat 的标题/类型/用户名 upsert 进来，给 chat 维度统计提供可读名字。
 - 取消按钮（`jc:` 任务取消、`eh:` 模式选择取消、`eha:` /archive 模式取消）触发后 5s 自动删用户原始触发消息 + bot 回复。仅限群组且 bot 是 admin + 持 `can_delete_messages` 才动；私聊和无权限群一律不删，避免"半截"消息。删除范围严格限定本对消息（用 placeholder.reply_to_message 推出来），不会误伤其他历史。逻辑在 [_schedule_delete_after_cancel](pixivfeed/channel/telegram/handlers.py)。
@@ -12,6 +13,11 @@
 - Pixiv 长篇小说（约 70k+ 字）发布到 Telegra.ph 抛 `CONTENT_TOO_BIG` / `PAGE_SAVE_FAILED`。根因：`NOVEL_TEXT_SOFT_LIMIT = 18000` 是**字符数**，但 Telegra.ph 64KB 限制是**序列化 JSON 字节数**，纯中文 18000 字 × 3 字节 + JSON 节点开销已撞上限。修复：(1) 字符上限降至 14000（留 15% 余量给章节分布不均与嵌入图）；(2) 在 [novel_publisher.py](pixivfeed/provider/pixiv/novel_publisher.py) 新增 `_ensure_byte_safe_chunks` —— 粗切后对每个 chunk 真实构建 nodes 并测 `json.dumps` 字节数，超 60KB 就在自然分隔符处二分递归，作为最后防线。
 
 ### 改动文件
+- `deploy/feed-bot-deploy.sh`：新增，部署执行脚本（fetch → 比对 → reset → 可选 pip install → restart → TG 通知）
+- `deploy/feed-bot-webhook.service`：新增，adnanh/webhook 的 systemd unit
+- `deploy/feed-bot-webhook-hooks.json.example`：新增，hooks 配置模板（HMAC + main + push 三重 trigger-rule）
+- `deploy/feed-bot-deploy.sudoers`：新增，sudoers 片段
+- `docs/DEPLOY.md`：新增「GitHub webhook 自动部署」段，含 9 步安装、Nginx 接入、排错表
 - `pixivfeed/storage/db.py`：新增 `chats` 表
 - `pixivfeed/storage/usage.py`：新增 `ChatSummary` / `upsert_chat` / `get_chat_by_username` / `get_chat_display` / `per_chat_summary`
 - `pixivfeed/storage/__init__.py`：导出 `ChatSummary`

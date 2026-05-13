@@ -1,0 +1,35 @@
+[Unit]
+Description=GitHub webhook listener for feed-bot auto-deploy
+Documentation=https://github.com/adnanh/webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+
+# 仅监听 127.0.0.1，外部访问由 Nginx 反代 https://feed.fengshengxiu.club/deploy 进入
+ExecStart=/usr/bin/webhook \
+    -hooks /etc/feed-bot-webhook/hooks.json \
+    -ip 127.0.0.1 \
+    -port 9000 \
+    -verbose
+
+Restart=on-failure
+RestartSec=5s
+
+# 安全收紧
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# deploy 用户需要写仓库目录；其余路径无需写
+ReadWritePaths=/opt/pixiv-feed-bot
+
+# 日志走 journald；journalctl -u feed-bot-webhook 可看
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+# 放到 /etc/sudoers.d/feed-bot-deploy（权限 0440）
+# 仅放行重启 pixiv-feed-bot 服务；deploy 用户被打穿也无法接管系统。
+#
+# 安装：
+#   sudo cp deploy/feed-bot-deploy.sudoers /etc/sudoers.d/feed-bot-deploy
+#   sudo chmod 0440 /etc/sudoers.d/feed-bot-deploy
+#   sudo visudo -cf /etc/sudoers.d/feed-bot-deploy   # 语法校验，必跑
+
+deploy ALL=(root) NOPASSWD: /bin/systemctl restart pixiv-feed-bot

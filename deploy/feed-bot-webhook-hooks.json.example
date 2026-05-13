@@ -1,0 +1,43 @@
+[
+  {
+    "id": "feed-bot",
+    "execute-command": "/usr/local/bin/feed-bot-deploy.sh",
+    "command-working-directory": "/opt/pixiv-feed-bot",
+    "response-message": "ok",
+    "include-command-output-in-response": false,
+    "trigger-rule": {
+      "and": [
+        {
+          "match": {
+            "type": "payload-hmac-sha256",
+            "secret": "REPLACE_WITH_LONG_RANDOM_SECRET",
+            "parameter": {
+              "source": "header",
+              "name": "X-Hub-Signature-256"
+            }
+          }
+        },
+        {
+          "match": {
+            "type": "value",
+            "value": "refs/heads/main",
+            "parameter": {
+              "source": "payload",
+              "name": "ref"
+            }
+          }
+        },
+        {
+          "match": {
+            "type": "value",
+            "value": "push",
+            "parameter": {
+              "source": "header",
+              "name": "X-GitHub-Event"
+            }
+          }
+        }
+      ]
+    }
+  }
+]

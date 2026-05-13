@@ -64,6 +64,163 @@ git checkout v0.4.1
 git reset --hard <commit>
 ```
 
+## GitHub webhook 自动部署
+
+`main` 分支 push 后服务器在 1–2 秒内自动 `git pull` + `pip install`（仅当 `pyproject.toml` 变更）+ `systemctl restart pixiv-feed-bot`，结果通过 Telegram 推送给 admin。
+
+架构：
+
+```
+GitHub push → HTTPS POST → Nginx (feed.fengshengxiu.club/deploy)
+                              ↓
+                        adnanh/webhook (127.0.0.1:9000)
+                              ↓ HMAC 验签 + 仅 main + 仅 push
+                       feed-bot-deploy.sh （以 deploy 用户身份）
+                              ↓ sudo（受 sudoers 限制）
+                        systemctl restart pixiv-feed-bot
+                              ↓
+                        curl Telegram bot API → admin
+```
+
+### 1. 安装 adnanh/webhook
+
+Debian/Ubuntu：
+
+```bash
+apt install webhook
+```
+
+其它发行版直接下 [GitHub release](https://github.com/adnanh/webhook/releases) 的二进制，放到 `/usr/bin/webhook`。
+
+### 2. 创建 deploy 用户并接管仓库
+
+```bash
+useradd --system --shell /bin/bash --home-dir /var/lib/feed-bot-deploy --create-home deploy
+chown -R deploy:deploy /opt/pixiv-feed-bot
+# venv 也要给 deploy 写权限（pip install 时要动）
+chown -R deploy:deploy /opt/pixiv-feed-bot/.venv
+```
+
+deploy 用户**只**用来跑部署脚本——bot 仍以 `pixivbot` 运行，二者解耦。
+
+### 3. 安装 sudoers 片段
+
+```bash
+cp deploy/feed-bot-deploy.sudoers /etc/sudoers.d/feed-bot-deploy
+chmod 0440 /etc/sudoers.d/feed-bot-deploy
+visudo -cf /etc/sudoers.d/feed-bot-deploy
+```
+
+只放行 `systemctl restart pixiv-feed-bot`；deploy 用户被打穿也接管不了系统。
+
+### 4. 安装部署脚本
+
+```bash
+cp deploy/feed-bot-deploy.sh /usr/local/bin/feed-bot-deploy.sh
+chmod 0755 /usr/local/bin/feed-bot-deploy.sh
+```
+
+### 5. 配置环境（含 TG 通知）
+
+```bash
+mkdir -p /etc/feed-bot-webhook
+cat > /etc/feed-bot-webhook/env <<'EOF'
+# 给 admin 推送 deploy 结果用的 bot token（可与 feed-bot 自己的 token 同/不同）
+TG_BOT_TOKEN=123456:abcdef...
+# 接收通知的 admin 数字 user_id
+TG_ADMIN_ID=5439265612
+EOF
+chown deploy:deploy /etc/feed-bot-webhook/env
+chmod 0600 /etc/feed-bot-webhook/env
+```
+
+### 6. 配置 webhook hooks
+
+```bash
+SECRET=$(openssl rand -hex 32)   # 记住这个值，GitHub 端要用
+cp deploy/feed-bot-webhook-hooks.json.example /etc/feed-bot-webhook/hooks.json
+sed -i "s|REPLACE_WITH_LONG_RANDOM_SECRET|${SECRET}|" /etc/feed-bot-webhook/hooks.json
+chown -R deploy:deploy /etc/feed-bot-webhook
+chmod 0600 /etc/feed-bot-webhook/hooks.json
+echo "GitHub webhook secret = ${SECRET}"
+```
+
+hooks.json 内部已限定：HMAC-SHA256 验签 + `ref == refs/heads/main` + `X-GitHub-Event == push`，任一不满足直接 403。
+
+### 7. 启用 webhook 服务
+
+```bash
+cp deploy/feed-bot-webhook.service /etc/systemd/system/feed-bot-webhook.service
+systemctl daemon-reload
+systemctl enable --now feed-bot-webhook
+journalctl -u feed-bot-webhook -n 20 --no-pager
+```
+
+### 8. Nginx 接入
+
+把下面这段加到 `feed.fengshengxiu.club` server block 内（任意位置，建议挨着 `/p/` 那段）：
+
+```nginx
+# GitHub webhook → 本地 adnanh/webhook → feed-bot-deploy.sh
+location = /deploy {
+    if ($request_method != POST) { return 405; }
+    proxy_pass http://127.0.0.1:9000/hooks/feed-bot;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 120s;
+    # 部署日志单独切一个文件，便于排查
+    access_log /www/wwwlogs/feed.fengshengxiu.club-deploy.log;
+}
+```
+
+`nginx -t && systemctl reload nginx`。
+
+### 9. 配置 GitHub webhook
+
+仓库 → Settings → Webhooks → Add webhook：
+
+- **Payload URL**: `https://feed.fengshengxiu.club/deploy`
+- **Content type**: `application/json`
+- **Secret**: 第 6 步生成的 `${SECRET}`
+- **SSL verification**: Enable
+- **Events**: Just the push event
+- **Active**: ✓
+
+加完会立刻发一个 `ping` 事件——hooks.json 里限定了 `X-GitHub-Event=push`，ping 会被 403 拒掉是正常的。push 一次 main 才会真的触发。
+
+### 测试
+
+本地推个无害 commit（比如改 README 空格）：
+
+```bash
+git commit --allow-empty -m "chore: webhook smoke test"
+git push
+```
+
+预期：
+
+- 几秒内 admin 私聊收到 `✅ feed-bot deploy ok` 或 `❌ feed-bot deploy: <step>`
+- `journalctl -u feed-bot-webhook -n 30 --no-pager` 看到 hook 触发
+- `journalctl -u pixiv-feed-bot -n 30 --no-pager` 看到 bot 重启
+
+### 排错
+
+| 现象 | 排查 |
+| --- | --- |
+| GitHub Recent Deliveries 显示 401/403 | hooks.json 里的 secret 与 GitHub 端不一致；或 X-Hub-Signature-256 没传过来（Nginx 抹掉了 header） |
+| Nginx 返回 405 | GitHub 发了 GET（手动点 redeliver 也可能）；这是正常拒绝，push 事件是 POST |
+| Recent Deliveries 200 但 admin 没消息 | `/etc/feed-bot-webhook/env` 里 TG_BOT_TOKEN/TG_ADMIN_ID 没填；或 deploy 用户没法读 |
+| 通知报 `systemctl restart` 失败 | sudoers 没装好；`sudo -u deploy sudo -n /bin/systemctl restart pixiv-feed-bot` 手工跑一次看错误 |
+| 通知报 `service not active after restart` | bot 自己起不来（config 错、依赖版本不匹配）；按通知里的 journal tail 排 |
+
+要临时禁用自动部署（比如准备做破坏性测试）：
+
+```bash
+systemctl stop feed-bot-webhook
+# 或在 GitHub webhook 配置页把 Active 关掉
+```
+
 ## systemd 服务
 
 服务文件示例见 [deploy/pixiv-feed-bot.service](../deploy/pixiv-feed-bot.service)。另有定时清理服务 [deploy/pixiv-feed-bot-cleanup.service](../deploy/pixiv-feed-bot-cleanup.service) 和 [deploy/pixiv-feed-bot-cleanup.timer](../deploy/pixiv-feed-bot-cleanup.timer)。
