@@ -56,6 +56,19 @@ class UserSummary:
     bytes_out: int
 
 
+@dataclass
+class ChatSummary:
+    chat_id: int
+    type: str                # "private" / "group" / "supergroup" / "channel"，未知时空
+    display: str             # title 或 username 兜底；private 时回落到 user_<id>
+    title: str | None
+    username: str | None
+    tasks: int
+    gp_cost: int
+    bytes_in: int
+    bytes_out: int
+
+
 class UsageStore:
     """对 usage_log + users 表的薄封装。所有写入静默失败。"""
 
@@ -92,6 +105,34 @@ class UsageStore:
         except Exception as e:
             from ..utils import logger
             logger.warning(f"usage.upsert_user failed (non-fatal): {e}")
+
+    async def upsert_chat(
+        self,
+        chat_id: int,
+        chat_type: str,
+        title: str | None,
+        username: str | None,
+    ) -> None:
+        """每次接到授权用户消息时调一次，方便 /stats 按 chat_id 分组时回填标题。
+        chat_type 取 Telegram 'private' / 'group' / 'supergroup' / 'channel'。"""
+        try:
+            async with self.db.write_lock:
+                await self.db.conn.execute(
+                    """
+                    INSERT INTO chats (chat_id, type, title, username, last_seen)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        type      = excluded.type,
+                        title     = excluded.title,
+                        username  = excluded.username,
+                        last_seen = excluded.last_seen
+                    """,
+                    (chat_id, chat_type, title, username, int(time.time())),
+                )
+                await self.db.conn.commit()
+        except Exception as e:
+            from ..utils import logger
+            logger.warning(f"usage.upsert_chat failed (non-fatal): {e}")
 
     async def log(
         self,
@@ -153,6 +194,40 @@ class UsageStore:
         first, last, uname = row
         name = " ".join(p for p in (first, last) if p) or uname or f"user_{user_id}"
         return name, uname
+
+    async def get_chat_by_username(self, username: str) -> int | None:
+        """按 @username 找 chat_id。不区分大小写。"""
+        username = username.lstrip("@").strip()
+        if not username:
+            return None
+        async with self.db.conn.execute(
+            "SELECT chat_id FROM chats WHERE LOWER(username) = LOWER(?)",
+            (username,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else None
+
+    async def get_chat_display(self, chat_id: int) -> tuple[str, str, str | None]:
+        """返回 (display, chat_type, username)。
+        display：title 优先，否则 @username，否则按类型给出占位。
+        私聊会自动回落到 users 表里的 display name。"""
+        async with self.db.conn.execute(
+            "SELECT type, title, username FROM chats WHERE chat_id = ?",
+            (chat_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return f"chat_{chat_id}", "", None
+        ctype, title, uname = row
+        if ctype == "private":
+            # 私聊 chat_id == user_id，借 users 表拿真名
+            try:
+                disp, uuname = await self.get_user_display(chat_id)
+                return f"私聊 · {disp}", ctype, uuname or uname
+            except Exception:
+                return f"私聊 · user_{chat_id}", ctype, uname
+        disp = title or (f"@{uname}" if uname else f"chat_{chat_id}")
+        return disp, ctype, uname
 
     async def total_summary(
         self, since_ts: int, chat_id: int | None = None,
@@ -230,6 +305,62 @@ class UsageStore:
             ))
         return out
 
+    async def per_chat_summary(
+        self,
+        since_ts: int,
+        *,
+        limit: int = 10,
+        exclude_private: bool = False,
+    ) -> list[ChatSummary]:
+        """按 chat 聚合，按任务数倒序。chat_id 为 NULL（理论上不该有）的行被跳过。
+        exclude_private=True 时过滤掉私聊行（chats.type='private'）—— 用在 /stats
+        默认总览的"按群组排行"里，让群组维度更醒目。"""
+        params: list = [since_ts]
+        where = "u_log.ts >= ? AND u_log.chat_id IS NOT NULL"
+        if exclude_private:
+            # COALESCE 让没 upsert 过的 chat（type=NULL）默认按非私聊算，避免数据丢失
+            where += " AND COALESCE(c.type, 'group') != 'private'"
+        params.append(limit)
+        async with self.db.conn.execute(
+            f"""
+            SELECT
+                u_log.chat_id,
+                COALESCE(c.type, ''),
+                c.title,
+                c.username,
+                COUNT(*),
+                COALESCE(SUM(u_log.gp_cost), 0),
+                COALESCE(SUM(u_log.bytes_in), 0),
+                COALESCE(SUM(u_log.bytes_out), 0)
+            FROM usage_log u_log
+            LEFT JOIN chats c ON c.chat_id = u_log.chat_id
+            WHERE {where}
+            GROUP BY u_log.chat_id
+            ORDER BY COUNT(*) DESC
+            LIMIT ?
+            """,
+            params,
+        ) as cur:
+            rows = await cur.fetchall()
+        out: list[ChatSummary] = []
+        for cid, ctype, title, uname, tasks, gp, bin_, bout in rows:
+            if ctype == "private":
+                # 私聊用 users 表回填昵称，比纯 user_<id> 友好
+                try:
+                    user_disp, user_uname = await self.get_user_display(cid)
+                    display = f"私聊 · {user_disp}"
+                    uname = uname or user_uname
+                except Exception:
+                    display = f"私聊 · user_{cid}"
+            else:
+                display = title or (f"@{uname}" if uname else f"chat_{cid}")
+            out.append(ChatSummary(
+                chat_id=cid, type=ctype or "", display=display,
+                title=title, username=uname,
+                tasks=tasks, gp_cost=gp, bytes_in=bin_, bytes_out=bout,
+            ))
+        return out
+
     async def user_summary(
         self, user_id: int, since_ts: int,
     ) -> dict:
@@ -291,6 +422,7 @@ class UsageStore:
 __all__ = [
     "UsageStore",
     "UserSummary",
+    "ChatSummary",
     "KIND_PIXIV_TELEGRAPH",
     "KIND_PIXIV_DIRECT",
     "KIND_PIXIV_NOVEL",

@@ -112,22 +112,33 @@ def _usage_store(context: ContextTypes.DEFAULT_TYPE):
 
 async def _track_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """每次接到授权用户消息时静默 upsert，更新 last_seen 和昵称。
+    顺带 upsert effective_chat 的标题（群组/频道）—— /stats 按群组分组时要用。
     任何失败都吞掉，不影响主流程。"""
     store = _usage_store(context)
     if store is None:
         return
     u = update.effective_user
-    if u is None:
-        return
-    try:
-        await store.upsert_user(
-            user_id=u.id,
-            first_name=u.first_name,
-            last_name=u.last_name,
-            username=u.username,
-        )
-    except Exception:
-        pass
+    if u is not None:
+        try:
+            await store.upsert_user(
+                user_id=u.id,
+                first_name=u.first_name,
+                last_name=u.last_name,
+                username=u.username,
+            )
+        except Exception:
+            pass
+    chat = update.effective_chat
+    if chat is not None:
+        try:
+            await store.upsert_chat(
+                chat_id=chat.id,
+                chat_type=chat.type or "",
+                title=chat.title,
+                username=chat.username,
+            )
+        except Exception:
+            pass
 
 
 async def _log_usage(
@@ -868,6 +879,87 @@ async def _handle_job_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     except Exception:
         pass
+    _schedule_delete_after_cancel(context, query.message)
+
+
+# ---------------------------------------------------------------------------
+# 取消按钮 → 延迟清理触发消息 + bot 回复
+# ---------------------------------------------------------------------------
+#
+# 只有"用户主动点取消按钮"才走这条删除路径，避免误删其它历史消息。
+# 私聊里 bot 没权限删用户消息 → 一律不删（避免只剩半截的"孤儿"提示）。
+# 群组里 bot 必须是 admin 且持 can_delete_messages，否则也跳过。
+# 删 bot 自己的消息没权限要求，但配合"全有或全无"的策略，一致跳过。
+#
+# 删除延迟默认 5s（让用户看到"已取消"反馈）。
+
+_CANCEL_DELETE_DELAY_S = 5.0
+
+
+def _schedule_delete_after_cancel(
+    context: ContextTypes.DEFAULT_TYPE, bot_message,
+) -> None:
+    """点取消按钮后调一次。bot_message 是带取消按钮的 placeholder。
+
+    会从 bot_message.reply_to_message 推出用户原始触发消息（所有 placeholder
+    都是 reply_text 创建的，保证 reply_to_message 是原消息），之后异步等待
+    _CANCEL_DELETE_DELAY_S 秒再尝试删除两条。任何权限/状态不足都静默退出。
+    """
+    if bot_message is None:
+        return
+    chat = getattr(bot_message, "chat", None)
+    if chat is None:
+        return
+    user_msg = getattr(bot_message, "reply_to_message", None)
+    user_msg_id = getattr(user_msg, "message_id", None) if user_msg is not None else None
+    if user_msg_id is None:
+        return  # 没有原始触发消息可以一起删，按"全有或全无"放弃
+    asyncio.create_task(_delete_pair_after_cancel(
+        context,
+        chat_id=chat.id,
+        chat_type=getattr(chat, "type", "") or "",
+        bot_msg_id=bot_message.message_id,
+        user_msg_id=user_msg_id,
+    ))
+
+
+async def _delete_pair_after_cancel(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    chat_type: str,
+    bot_msg_id: int,
+    user_msg_id: int,
+) -> None:
+    """执行"等 N 秒 → 校验权限 → 删两条"。任何步骤失败都静默退出。"""
+    # 私聊：bot 永远删不掉用户消息（TG API 限制）→ 直接跳过。
+    if chat_type not in ("group", "supergroup"):
+        return
+    # 群组：要 bot 是 admin 且 can_delete_messages
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+    except Exception as e:
+        logger.debug(f"cancel-delete: get_chat_member failed for chat={chat_id}: {e}")
+        return
+    status = getattr(me, "status", "")
+    if status not in ("administrator", "creator"):
+        return
+    if status == "administrator" and not getattr(me, "can_delete_messages", False):
+        return
+
+    try:
+        await asyncio.sleep(_CANCEL_DELETE_DELAY_S)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return
+
+    # 走到这里：两条都要尝试删；其中之一失败也继续删另一条
+    for mid in (user_msg_id, bot_msg_id):
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except Exception as e:
+            logger.debug(f"cancel-delete: delete_message({chat_id}, {mid}) failed: {e}")
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -918,6 +1010,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text("已取消")
         except Exception:
             pass
+        _schedule_delete_after_cancel(context, query.message)
         return
 
     try:
@@ -2366,6 +2459,7 @@ async def handle_callback_archive(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text("已取消")
         except Exception:
             pass
+        _schedule_delete_after_cancel(context, query.message)
         return
     try:
         mode = EHMode(mode_str)
@@ -2462,6 +2556,34 @@ def _disk_usage(path: Path) -> tuple[int, int, int]:
         return 0, 0, 0
 
 
+async def _resolve_chat_arg(store, ident: str) -> tuple[int | None, str | None]:
+    """把用户传给 /stats chat <ident> 的字符串解析成 chat_id。
+
+    接受形式：
+      - 负数 `-1001838275879` / `-12345`：原样
+      - 正数 `1838275879`：当 supergroup 短 id，自动补 `-100`
+        （Telegram 内部 chat_id 不会是正数，正数等价于"短形式"）
+      - `@username`：在 chats 表里查
+    返回 (chat_id, 错误信息)。chat_id 为 None 时 err 给出原因。
+    """
+    ident = ident.strip()
+    if not ident:
+        return None, "chat 参数为空"
+    if ident.startswith("@"):
+        cid = await store.get_chat_by_username(ident)
+        if cid is None:
+            return None, f"找不到 @{ident.lstrip('@')}（仅能查曾经触发过 bot 的群/频道）"
+        return cid, None
+    # 数字
+    if ident.lstrip("-").isdigit():
+        n = int(ident)
+        if n >= 0:
+            # 短形式，按 supergroup/channel 处理：补 -100 前缀
+            return int(f"-100{n}"), None
+        return n, None
+    return None, f"无法识别 {ident!r}：用 -1001838275879 / 1838275879 / @username 任一形式"
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """admin only。用法见上面注释。"""
     config: Config = context.bot_data["config"]
@@ -2494,6 +2616,35 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(text)
         return
 
+    # /stats chats [window]：列群组活跃排行
+    if args and args[0].lower() == "chats":
+        window_s = 24 * 3600
+        if len(args) >= 2:
+            w = _parse_window(args[1])
+            if w is None:
+                await update.message.reply_text(f"⚠️ 无法识别时间窗口 {args[1]!r}")
+                return
+            window_s = w
+        since_ts = int(time.time()) - window_s
+        win_label = _fmt_window(window_s)
+        rows = await store.per_chat_summary(since_ts, limit=20, exclude_private=False)
+        if not rows:
+            await update.message.reply_text(f"近 {win_label} 没有 chat 维度数据")
+            return
+        lines = [f"群组/私聊活跃排行（最近 {win_label}，前 {len(rows)}）", "─" * 24]
+        for i, c in enumerate(rows, 1):
+            uname_part = f"@{c.username}" if c.username else ""
+            id_show = _friendly_chat_id(c.chat_id, c.type)
+            head = f"{i}. {c.display}"
+            tail = f" / {id_show}" + (f" / {uname_part}" if uname_part else "")
+            lines.append(head + tail)
+            lines.append(
+                f"   {c.tasks} 任务 · {c.gp_cost} GP · "
+                f"↓{fmt_bytes(c.bytes_in)} / ↑{fmt_bytes(c.bytes_out)}"
+            )
+        await update.message.reply_text("\n".join(lines))
+        return
+
     # 默认窗口 24h
     window_s = 24 * 3600
     target_user_id: int | None = None
@@ -2504,7 +2655,12 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if args and args[0].lower() in ("user", "chat"):
         kind = args[0].lower()
         if len(args) < 2:
-            await update.message.reply_text("用法：/stats user <@username|user_id> [窗口]")
+            usage_hint = (
+                "用法：/stats user <@username|user_id> [窗口]"
+                if kind == "user"
+                else "用法：/stats chat <chat_id|@username> [窗口]"
+            )
+            await update.message.reply_text(usage_hint)
             return
         ident = args[1]
         if kind == "user":
@@ -2518,11 +2674,11 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                     return
         else:
-            try:
-                target_chat_id = int(ident)
-            except ValueError:
-                await update.message.reply_text("⚠️ chat_id 必须是整数")
+            cid, err = await _resolve_chat_arg(store, ident)
+            if cid is None:
+                await update.message.reply_text(f"⚠️ {err}")
                 return
+            target_chat_id = cid
         if len(args) >= 3:
             w = _parse_window(args[2])
             if w is None:
@@ -2535,14 +2691,21 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if w is None:
             await update.message.reply_text(
                 "用法：\n"
-                "  /stats [窗口]                  总览\n"
+                "  /stats [窗口]                  总览（群里调默认查本群）\n"
+                "  /stats chats [窗口]            按群组/私聊活跃度排行\n"
                 "  /stats user <@u|id> [窗口]     单用户\n"
-                "  /stats chat <chat_id> [窗口]   单群组\n"
+                "  /stats chat <id|@u> [窗口]     单群组（接受 -100… / 短 id / @username）\n"
                 "  /stats system                  缓存与磁盘\n"
                 "窗口示例：1h / 24h / 7d / 30d（默认 24h）"
             )
             return
         window_s = w
+
+    # 在群里裸 /stats，默认 = 本群范围
+    if target_user_id is None and target_chat_id is None:
+        chat = update.effective_chat
+        if chat is not None and chat.type in ("group", "supergroup"):
+            target_chat_id = chat.id
 
     since_ts = int(time.time()) - window_s
     win_label = _fmt_window(window_s)
@@ -2578,7 +2741,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     title = "用量总览"
     if target_chat_id is not None:
-        title += f" · chat {target_chat_id}"
+        chat_disp, chat_type, chat_uname = await store.get_chat_display(target_chat_id)
+        id_show = _friendly_chat_id(target_chat_id, chat_type)
+        title += f" · {chat_disp}（{id_show}）"
     lines = [
         f"{title}（最近 {win_label}）",
         "─" * 24,
@@ -2603,7 +2768,33 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"   {u.tasks} 任务 · {u.gp_cost} GP · ↓{fmt_bytes(u.bytes_in)} / ↑{fmt_bytes(u.bytes_out)}"
             )
 
+    # 全局总览（未限定 chat）再补一段"按群组排行"
+    if target_chat_id is None:
+        per_chat = await store.per_chat_summary(since_ts, limit=10, exclude_private=True)
+        if per_chat:
+            lines.append("")
+            lines.append("按群组排行（前 10）：")
+            for i, c in enumerate(per_chat, 1):
+                id_show = _friendly_chat_id(c.chat_id, c.type)
+                uname_part = f" / @{c.username}" if c.username else ""
+                lines.append(
+                    f"{i}. {c.display}  {id_show}{uname_part}\n"
+                    f"   {c.tasks} 任务 · {c.gp_cost} GP · ↓{fmt_bytes(c.bytes_in)} / ↑{fmt_bytes(c.bytes_out)}"
+                )
+
     await update.message.reply_text("\n".join(lines))
+
+
+def _friendly_chat_id(chat_id: int, chat_type: str = "") -> str:
+    """把 bot api 形式的 chat_id 转成对用户友好的展示：
+    - supergroup/channel（-100… 开头）剥掉前缀，前面带 `c/`，对应 t.me/c/<id> 链接里的形式
+    - 普通群（负数，无 -100）原样
+    - 私聊（正数）原样
+    """
+    s = str(chat_id)
+    if s.startswith("-100"):
+        return f"c/{s[4:]}"
+    return s
 
 
 __all__ = [

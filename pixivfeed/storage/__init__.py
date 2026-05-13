@@ -10,6 +10,7 @@ from .usage import (
     KIND_PIXIV_TELEGRAPH,
     KIND_ZH,
     KIND_ZIP2TPH,
+    ChatSummary,
     UsageStore,
     UserSummary,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "RuntimeSettings",
     "UsageStore",
     "UserSummary",
+    "ChatSummary",
     "KIND_PIXIV_TELEGRAPH",
     "KIND_PIXIV_DIRECT",
     "KIND_PIXIV_NOVEL",

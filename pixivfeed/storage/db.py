@@ -68,6 +68,17 @@ CREATE TABLE IF NOT EXISTS users (
     last_seen   INTEGER NOT NULL
 );
 
+-- 群组/私聊信息缓存：作用同 users，给 /stats 按群组分组时显示标题。
+-- type 为 telegram chat type 字符串（private / group / supergroup / channel）。
+-- 私聊 chat_id == user_id；title 在私聊里可能是空，展示时回落到用户名。
+CREATE TABLE IF NOT EXISTS chats (
+    chat_id     INTEGER PRIMARY KEY,
+    type        TEXT NOT NULL,
+    title       TEXT,
+    username    TEXT,
+    last_seen   INTEGER NOT NULL
+);
+
 -- 用量记录：每次任务（成功/失败/取消）都写一行，供 /stats 分析。
 -- kind 见 storage/usage.py 的 KIND_* 常量。
 -- gp_cost：归档下载时从 archiver 页面解析得到，其他场景为 0。
