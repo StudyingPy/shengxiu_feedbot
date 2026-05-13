@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 2026-05-13
+## v0.6.0 — 2026-05-13
 
 ### 新增
 - GitHub webhook 自动部署。`main` push 后服务器 1–2 秒内 `git pull` + 按需 `pip install` + `systemctl restart pixiv-feed-bot`，结果通过 TG 推给 admin（成功/失败都推）。链路 `GitHub → Nginx /deploy → adnanh/webhook (127.0.0.1:9000) → feed-bot-deploy.sh → sudo systemctl restart`，webhook 跑在专用 deploy 用户下，sudoers 仅放行 `restart pixiv-feed-bot`。hooks.json 三重过滤（HMAC-SHA256 / 仅 main / 仅 push event），减少误触发面。配置/安装见 [docs/DEPLOY.md](docs/DEPLOY.md) 新增的「GitHub webhook 自动部署」段。
