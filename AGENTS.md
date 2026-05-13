@@ -100,6 +100,38 @@ journalctl -u pixiv-feed-bot -n 50 --no-pager
 
 旧条目原样保留，**不要删旧版本号**。
 
+## Commit 文本规范
+
+每条 commit message 第一行是 `<type>[(<scope>)]: <subject>`（conventional commits 简化版）。
+
+类型（type）：
+
+| type | 何时用 |
+| --- | --- |
+| `feat` | 新功能 / 用户可感知的能力 |
+| `fix` | bug 修复 |
+| `docs` | README / CHANGELOG / AGENTS 等纯文档 |
+| `refactor` | 仅代码重排，行为不变 |
+| `chore` | 版本号 bump、.gitignore、依赖收紧、杂项维护 |
+| `release` | 发版 commit；subject 必须形如 `vX.Y.Z <topic-slug>` |
+
+scope（可选）：标 affected area，如 `fix(novel):` / `feat(setting):` / `fix(archive):`。改动横跨多块时省略 scope。
+
+subject：
+
+- **英文 imperative**，全小写，无句号、无 emoji。"add"/"fix"/"rewrite"，不是 "added"/"fixes"。
+- ≤ 70 字符。超出的细节丢 commit body，**别**塞进第一行。
+- 不要把改动文件列表写进 message —— `git diff --stat` 就是源数据，详细列表写在 CHANGELOG.md。
+- 不要写 `Co-Authored-By: Claude` 之类的痕迹。
+
+正文 body（可选，超过单行才需要）：
+
+- 用空行与 subject 隔开。
+- 解释 **why**（动机、约束、坑），不是 **what**（diff 自己会说）。
+- **统一用中文**。项目里 README / AGENTS / CHANGELOG 都是中文，body 也跟着用中文，整段不混英文（专有名词、函数名、文件路径例外）。历史上 v0.4.3、v0.5.0 等 release 留下的英文 body 不动；新 commit 一律中文。
+
+主要参照已有 commit：`fix(novel): prevent CONTENT_TOO_BIG by tightening char limit + byte-aware bisect`、`feat(setting): ...`、`docs: mention /wiki feature and credit bot-rs`、`release: v0.5.0 wiki-search-inline`。历史里有些 bare 风格（`Remove pixiv inline commands section from README`）—— 那是早期遗留，新 commit 一律按上面格式。
+
 ## 提交前自检（避免重复回归）
 
 加新 try/except 或 fallback 路径时，**先 grep 一下涉及的异常类型**，看：
