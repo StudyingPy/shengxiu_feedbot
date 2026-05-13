@@ -122,22 +122,38 @@ chmod 0755 /usr/local/bin/feed-bot-deploy.sh
 
 ### 5. 配置环境（含 TG 通知）
 
+部署脚本默认从 `/etc/pixiv-feed-bot/config.yaml` 自动读 `telegram.token`、`auth.admin_users[0]`、`telegram.base_url`——通知用的 bot 和接收 admin 与 feed-bot 本身保持一致。所以**默认情况下你什么都不用配**，只需要让 `deploy` 用户能读 config.yaml：
+
+```bash
+chgrp pixivbot /etc/pixiv-feed-bot/config.yaml
+chmod 0640 /etc/pixiv-feed-bot/config.yaml
+usermod -aG pixivbot deploy
+# 让组成员身份生效；deploy 用户没真正登录过的话也得清缓存
+systemctl restart feed-bot-webhook 2>/dev/null || true
+```
+
+如果你想用**另一个 bot / 另一个 admin** 推送部署通知（比如不想让 feed-bot 把 deploy 噪音混进自己的对话），写一个 override env：
+
 ```bash
 mkdir -p /etc/feed-bot-webhook
 cat > /etc/feed-bot-webhook/env <<'EOF'
-# 给 admin 推送 deploy 结果用的 bot token（可与 feed-bot 自己的 token 同/不同）
-TG_BOT_TOKEN=123456:abcdef...
-# 接收通知的 admin 数字 user_id
-TG_ADMIN_ID=5439265612
+# 留空 = 用 config.yaml 里的默认值
+TG_BOT_TOKEN=
+TG_ADMIN_ID=
+# 可选：本地 Bot API。留空 = 走官方
+# TG_BOT_API_BASE=http://127.0.0.1:8081/bot
 EOF
 chown deploy:deploy /etc/feed-bot-webhook/env
 chmod 0600 /etc/feed-bot-webhook/env
 ```
 
+> deploy 完全没法读 config.yaml 也没设 env？脚本仍然能跑完部署，只是不发 TG 通知（journal 还有）。
+
 ### 6. 配置 webhook hooks
 
 ```bash
 SECRET=$(openssl rand -hex 32)   # 记住这个值，GitHub 端要用
+mkdir -p /etc/feed-bot-webhook
 cp deploy/feed-bot-webhook-hooks.json.example /etc/feed-bot-webhook/hooks.json
 sed -i "s|REPLACE_WITH_LONG_RANDOM_SECRET|${SECRET}|" /etc/feed-bot-webhook/hooks.json
 chown -R deploy:deploy /etc/feed-bot-webhook
@@ -216,13 +232,38 @@ git push
 - `journalctl -u feed-bot-webhook -n 30 --no-pager` 看到 hook 触发
 - `journalctl -u pixiv-feed-bot -n 30 --no-pager` 看到 bot 重启
 
+成功通知样例：
+
+```
+✅ feed-bot deploy ok
+
+版本：0.6.0 → 0.6.1
+HEAD：6ac0612a → c2495c0c
+Tags：v0.6.1
+
+提交（3）：
+  c2495c0 docs(deploy): aaPanel-friendly nginx snippet for webhook
+  dbf47a2 release: v0.6.1 patch
+  6ac0612 fix: small fixup
+
+变更：3 files changed, 12 insertions(+), 2 deletions(-)
+  CHANGELOG.md
+  docs/DEPLOY.md
+  pixivfeed/...
+
+最近日志：
+<journalctl -u pixiv-feed-bot 末 10 行>
+```
+
+失败通知同样会带版本与 commit 列表，最后补"错误尾部日志"段；可以直接判断是 git fetch、pip install 还是 systemctl restart 哪一步出问题。
+
 ### 排错
 
 | 现象 | 排查 |
 | --- | --- |
 | GitHub Recent Deliveries 显示 401/403 | hooks.json 里的 secret 与 GitHub 端不一致；或 X-Hub-Signature-256 没传过来（Nginx 抹掉了 header） |
 | Nginx 返回 405 | GitHub 发了 GET（手动点 redeliver 也可能）；这是正常拒绝，push 事件是 POST |
-| Recent Deliveries 200 但 admin 没消息 | `/etc/feed-bot-webhook/env` 里 TG_BOT_TOKEN/TG_ADMIN_ID 没填；或 deploy 用户没法读 |
+| Recent Deliveries 200 但 admin 没消息 | deploy 用户读不了 `/etc/pixiv-feed-bot/config.yaml`（看第 5 步的 chgrp/chmod）；或 `/etc/feed-bot-webhook/env` 里 override 凭据格式不对。`journalctl -u feed-bot-webhook` 看 `skip notify` 行确认 |
 | 通知报 `systemctl restart` 失败 | sudoers 没装好；`sudo -u deploy sudo -n /bin/systemctl restart pixiv-feed-bot` 手工跑一次看错误 |
 | 通知报 `service not active after restart` | bot 自己起不来（config 错、依赖版本不匹配）；按通知里的 journal tail 排 |
 

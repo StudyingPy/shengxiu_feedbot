@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — 2026-05-13
+
+### 变更
+- 部署 webhook 通知现在默认从 `/etc/pixiv-feed-bot/config.yaml` 读 `telegram.token` / `auth.admin_users[0]` / `telegram.base_url`，省去再单写一份 `/etc/feed-bot-webhook/env`。env 文件保留作为 override（写另一个 bot/admin 接 deploy 噪音时用）。要求 deploy 用户能读 config.yaml（chgrp pixivbot + chmod 0640 + usermod -aG）。
+- 通知正文加：版本号变化（`0.6.0 → 0.6.1`）、HEAD 短哈希、`git tag --points-at` 命中的 tag、commit 列表（最多 15 条）、`git diff --shortstat` + 文件列表（最多 12 个）。失败通知额外保留尾部错误日志段。从此打开 admin 私聊就能直接看到这版部署到底发生了什么，不必再 ssh 登服务器看 journal。
+
+### 改动文件
+- `deploy/feed-bot-deploy.sh`：新增 config.yaml 默认凭据读取（venv python + PyYAML），新增 `build_summary` helper；`notify` 支持 base_url
+- `docs/DEPLOY.md`：第 5 步重写为「默认值 + override」结构；测试段加成功/失败通知样例；排错表更新
+
 ## v0.6.0 — 2026-05-13
 
 ### 新增
