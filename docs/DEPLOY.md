@@ -120,7 +120,15 @@ cp deploy/feed-bot-deploy.sh /usr/local/bin/feed-bot-deploy.sh
 chmod 0755 /usr/local/bin/feed-bot-deploy.sh
 ```
 
-### 5. 让 deploy 用户能读 bot 配置（默认凭据来源）
+### 5. 准备 webhook 配置目录 + 让 deploy 读 bot 配置
+
+webhook 自己的配置目录（hooks.json、可选的 env）和 bot 自己的配置目录是分开的，先把前者建好：
+
+```bash
+mkdir -p /etc/feed-bot-webhook
+chown deploy:deploy /etc/feed-bot-webhook
+chmod 0750 /etc/feed-bot-webhook
+```
 
 部署脚本默认从 `/etc/pixiv-feed-bot/config.yaml` 自动读 `telegram.token`、`auth.admin_users[0]`、`telegram.base_url`——通知用的 bot 和接收 admin 与 feed-bot 本身保持一致。所以**默认情况下你什么都不用单独配**，只需要让 `deploy` 用户能读 config.yaml：
 
@@ -132,7 +140,7 @@ usermod -aG pixivbot deploy
 systemctl restart feed-bot-webhook 2>/dev/null || true
 ```
 
-完成这三行就可以**直接跳到第 6 步**。
+完成上面两块就可以**直接跳到第 6 步**。
 
 #### 可选：自定义通知凭据（override）
 
@@ -143,7 +151,6 @@ systemctl restart feed-bot-webhook 2>/dev/null || true
 - 走本地 Bot API 推送（默认会读 `config.yaml` 里的 `base_url`，已经够用——除非你想为 deploy 单独指定一个 base_url）
 
 ```bash
-mkdir -p /etc/feed-bot-webhook
 cat > /etc/feed-bot-webhook/env <<'EOF'
 # 留空 = 用 config.yaml 里的默认值；填了就盖默认
 TG_BOT_TOKEN=
@@ -161,7 +168,6 @@ chmod 0600 /etc/feed-bot-webhook/env
 
 ```bash
 SECRET=$(openssl rand -hex 32)   # 记住这个值，GitHub 端要用
-mkdir -p /etc/feed-bot-webhook
 cp deploy/feed-bot-webhook-hooks.json.example /etc/feed-bot-webhook/hooks.json
 sed -i "s|REPLACE_WITH_LONG_RANDOM_SECRET|${SECRET}|" /etc/feed-bot-webhook/hooks.json
 chown -R deploy:deploy /etc/feed-bot-webhook
