@@ -293,6 +293,27 @@ systemctl stop feed-bot-webhook
 
 服务文件示例见 [deploy/pixiv-feed-bot.service](../deploy/pixiv-feed-bot.service)。另有定时清理服务 [deploy/pixiv-feed-bot-cleanup.service](../deploy/pixiv-feed-bot-cleanup.service) 和 [deploy/pixiv-feed-bot-cleanup.timer](../deploy/pixiv-feed-bot-cleanup.timer)。
 
+### 启用缓存清理 timer
+
+`storage.cache_days` 配置项依赖一个 systemd timer 定时删超期图片，**timer 没启用的话 `cache_days` 不生效**，缓存会一直堆积。一次性启用：
+
+```bash
+cp deploy/pixiv-feed-bot-cleanup.service /etc/systemd/system/
+cp deploy/pixiv-feed-bot-cleanup.timer   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now pixiv-feed-bot-cleanup.timer
+
+# 验证下次触发时间
+systemctl list-timers pixiv-feed-bot-cleanup.timer
+
+# 手动跑一次（不等到凌晨 4 点）确认清理逻辑可用
+systemctl start pixiv-feed-bot-cleanup.service
+journalctl -u pixiv-feed-bot-cleanup.service -n 20 --no-pager
+# 期望最后一行类似：cleanup done: removed N files (X.X MB), M empty dirs
+```
+
+默认每天 04:00 触发（带 30min 抖动），跑 `deploy/cleanup.py` 删 `storage.cache_dir` 下 mtime 超过 `cache_days` 天的文件。telegra.ph_cache 表里的永久映射不动，免得旧链接失效。
+
 ## 本地 Bot API
 
 Telegram 官方 Bot API 限制 `getFile` 20MB、`sendDocument` 50MB。使用 `/zip2tph`（接收用户上传 zip）或 `/archive`（打包图集回发）时，文件大小几乎一定超过此限制。需要自建 [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) 服务绕开。

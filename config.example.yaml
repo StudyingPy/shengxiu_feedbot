@@ -90,7 +90,8 @@ storage:
   #   {cache_dir}/eh_{gid}_{token}_{mode}/p0.jpg
   #   {cache_dir}/nh_{gid}/p1.jpg
   cache_dir: "/var/cache/pixiv-feed-bot/images"
-  # 图片缓存保留天数，超期由后台任务清理（实现待添加）
+  # 图片缓存保留天数，由 systemd timer `pixiv-feed-bot-cleanup.timer`
+  # 每天凌晨触发 deploy/cleanup.py 删超期文件（启用步骤见 docs/DEPLOY.md）。
   cache_days: 7
   # SQLite 数据库文件路径
   db_path: "/var/lib/pixiv-feed-bot/data.db"
