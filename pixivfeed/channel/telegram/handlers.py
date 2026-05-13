@@ -74,6 +74,13 @@ from ...storage import (
 )
 from ...utils import logger
 from .auth import is_authorized
+from .constants import (
+    CANCEL_TOKEN_TTL,
+    LOCAL_BOT_API_DOCUMENT_LIMIT,
+    PENDING_TTL,
+    TG_DOCUMENT_LIMIT,
+    TG_UPLOAD_TIMEOUT,
+)
 from .jobqueue import JobQueueManager
 from .progress import (
     ByteRateTracker,
@@ -83,11 +90,6 @@ from .progress import (
     fmt_duration,
     make_item_hook,
 )
-
-# Telegram 标准 Bot API sendDocument 上限 50MB；
-# 本地 Bot API（telegram.base_url 配置）可放宽到 ~2GB。
-TG_DOCUMENT_LIMIT = 50 * 1024 * 1024
-LOCAL_BOT_API_DOCUMENT_LIMIT = 2 * 1024 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -362,18 +364,17 @@ class _Pending:
 
 
 _PENDING: dict[str, _Pending] = {}
-_PENDING_TTL = 600  # 10 分钟没人点就清
 
 
 def _gc_pending() -> None:
     now = time.time()
-    expired = [k for k, v in _PENDING.items() if now - v.created_at > _PENDING_TTL]
+    expired = [k for k, v in _PENDING.items() if now - v.created_at > PENDING_TTL]
     for k in expired:
         _PENDING.pop(k, None)
     # 顺便清过期 cancel token
     cancel_expired = [
         k for k, v in _CANCEL_TOKENS.items()
-        if now - v.get("ts", 0) > 3600  # type: ignore[union-attr]
+        if now - v.get("ts", 0) > CANCEL_TOKEN_TTL  # type: ignore[union-attr]
     ]
     for k in cancel_expired:
         _CANCEL_TOKENS.pop(k, None)
@@ -1574,7 +1575,7 @@ async def _process_zip_to_telegraph(
             try:
                 tg_file = await context.bot.get_file(
                     document.file_id,
-                    read_timeout=3600, write_timeout=3600,
+                    read_timeout=TG_UPLOAD_TIMEOUT, write_timeout=TG_UPLOAD_TIMEOUT,
                     connect_timeout=60, pool_timeout=60,
                 )
                 await progress.status("⏳ 下载 zip 中...")
@@ -1602,7 +1603,7 @@ async def _process_zip_to_telegraph(
                 try:
                     await tg_file.download_to_drive(
                         custom_path=str(zip_path),
-                        read_timeout=3600, write_timeout=3600,
+                        read_timeout=TG_UPLOAD_TIMEOUT, write_timeout=TG_UPLOAD_TIMEOUT,
                         connect_timeout=60, pool_timeout=60,
                     )
                 finally:
@@ -2370,8 +2371,8 @@ async def _send_zip_file(
                     reply_to_message_id=reply_to,
                     # 大文件：HTTP 层不应该在传输中超时（数据本身在本机走 local_mode）。
                     # 用极大 read_timeout 让 telegram-bot-api 自然完成传输到 TG 主网。
-                    read_timeout=3600,
-                    write_timeout=3600,
+                    read_timeout=TG_UPLOAD_TIMEOUT,
+                    write_timeout=TG_UPLOAD_TIMEOUT,
                     connect_timeout=60,
                     pool_timeout=60,
                 )
