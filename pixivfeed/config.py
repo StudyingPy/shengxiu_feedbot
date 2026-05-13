@@ -151,6 +151,15 @@ class LoggingConfig:
     file_path: str = "/var/log/pixiv-feed-bot/bot.log"
 
 
+@dataclass
+class JobQueueConfig:
+    """各类任务 worker 池的并发上限。重活留少、轻活给多——按机器内存/带宽调。"""
+    archive_zip: int = 1
+    zip2tph: int = 1
+    direct_image: int = 2
+    telegraph_publish: int = 3
+
+
 # ---------------------------------------------------------------------------
 # 顶层
 # ---------------------------------------------------------------------------
@@ -166,6 +175,7 @@ class Config:
     publish: PublishConfig = field(default_factory=PublishConfig)
     templates: TemplatesConfig = field(default_factory=TemplatesConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    job_queue: JobQueueConfig = field(default_factory=JobQueueConfig)
 
     _source_path: Path | None = field(default=None, repr=False)
     _runtime: Any | None = field(default=None, repr=False)  # RuntimeSettings 实例（可空）
@@ -214,6 +224,7 @@ class Config:
             publish=PublishConfig(**(data.get("publish") or {})),
             templates=templates,
             logging=LoggingConfig(**(data.get("logging") or {})),
+            job_queue=JobQueueConfig(**(data.get("job_queue") or {})),
         )
 
     def _apply_env_overrides(self) -> None:
@@ -244,6 +255,15 @@ class Config:
             errors.append(f"collectors.ehentai.default_mode must be one of {valid_modes}")
         if self.collectors.exhentai.default_mode not in valid_modes:
             errors.append(f"collectors.exhentai.default_mode must be one of {valid_modes}")
+
+        for name, val in (
+            ("archive_zip", self.job_queue.archive_zip),
+            ("zip2tph", self.job_queue.zip2tph),
+            ("direct_image", self.job_queue.direct_image),
+            ("telegraph_publish", self.job_queue.telegraph_publish),
+        ):
+            if val < 1:
+                errors.append(f"job_queue.{name} must be >= 1 (got {val})")
 
         if errors:
             raise ValueError("Invalid config:\n  - " + "\n  - ".join(errors))

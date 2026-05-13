@@ -137,14 +137,13 @@ def build_application(
     telegraph_cache = TelegraphCache(db)
     usage_store = UsageStore(db)
     job_queue = JobQueueManager(admin_users=set(config.auth.admin_users))
-    # 类别并发度按"重活"分级，admin 永远优先：
-    #   archive_zip / zip2tph: 1 并发，最重（GB 级 zip 上传/下载）
-    #   direct_image:          2 并发，pixiv 直发图片
-    #   telegraph_publish:     3 并发，多页 telegraph 发布
-    job_queue.register("archive_zip", concurrency=1, max_per_user_pending=2)
-    job_queue.register("zip2tph", concurrency=1, max_per_user_pending=2)
-    job_queue.register("direct_image", concurrency=2, max_per_user_pending=3)
-    job_queue.register("telegraph_publish", concurrency=3, max_per_user_pending=3)
+    # 类别并发度按"重活"分级，admin 永远优先。默认值（archive_zip=1 / zip2tph=1
+    # / direct_image=2 / telegraph_publish=3）见 JobQueueConfig，可在 yaml 调。
+    jq = config.job_queue
+    job_queue.register("archive_zip", concurrency=jq.archive_zip, max_per_user_pending=2)
+    job_queue.register("zip2tph", concurrency=jq.zip2tph, max_per_user_pending=2)
+    job_queue.register("direct_image", concurrency=jq.direct_image, max_per_user_pending=3)
+    job_queue.register("telegraph_publish", concurrency=jq.telegraph_publish, max_per_user_pending=3)
 
     app.bot_data["config"] = config
     app.bot_data["registry"] = registry

@@ -172,3 +172,18 @@ logging:
   level: "INFO"
   to_file: false
   file_path: "/var/log/pixiv-feed-bot/bot.log"
+
+# ============================================================================
+# 任务队列（各类 worker 并发数）
+# ============================================================================
+# bot 内部把"重活"按类型分到独立 worker 池，避免群里同时触发把内存/网络打爆。
+# 改大 = 并行更多但内存压力更高；改小 = 排队更长。机器小（<2GB 内存）建议都设 1。
+# 不可运行时改（worker 启动后并发数固定），改完必须重启 bot 生效。
+job_queue:
+  # eh/ex 归档 zip 下载 + 用户 /zip2tph（GB 级 zip 上传/下载，最重）
+  archive_zip: 1
+  zip2tph: 1
+  # pixiv 直发图片
+  direct_image: 2
+  # 多页 telegraph 发布
+  telegraph_publish: 3
