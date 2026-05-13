@@ -1,18 +1,32 @@
 # Changelog
 
-## Unreleased — 2026-05-13
+## v0.6.1 — 2026-05-14
+
+### 新增
+- 部署文档新增「启用缓存清理 timer」一段：`storage.cache_days` 一直只是配置项摆设，因为 `deploy/pixiv-feed-bot-cleanup.{service,timer}` 没有 enable 步骤——timer 不启用，cleanup.py 永远不会跑，缓存目录会一直堆。`docs/DEPLOY.md`「systemd 服务」一节补完整 `cp → daemon-reload → enable --now → list-timers → 手动 start 验证`流程；`config.example.yaml` 同步把"实现待添加"的旧注释改成指向 timer。
+- 新增 `pixivfeed/channel/telegram/constants.py`，把 [handlers.py](pixivfeed/channel/telegram/handlers.py) 顶部的 `TG_DOCUMENT_LIMIT` / `LOCAL_BOT_API_DOCUMENT_LIMIT`、[handlers.py:_PENDING_TTL](pixivfeed/channel/telegram/handlers.py)、[handlers.py:_gc_pending](pixivfeed/channel/telegram/handlers.py) 里 hardcoded 的 cancel-token TTL（`3600`），以及 4 处 `read_timeout=3600 / write_timeout=3600` 上传超时统一成 `TG_UPLOAD_TIMEOUT`。改这类阈值不再需要 grep 全仓库。
+- `job_queue` 段新增到 `Config` / `config.example.yaml`。原本 [bot.py](pixivfeed/channel/telegram/bot.py) 里硬编码的 `archive_zip=1 / zip2tph=1 / direct_image=2 / telegraph_publish=3` 现在从 yaml 读，小内存机器（<2GB）可以全调成 1，大机器可以放开。`_validate` 拒绝 `< 1`。该字段是基础设施级，不进 `RUNTIME_KEYS`——worker 启动后并发数固定，改完得重启 bot。
+
+### 变更
+- 移除未使用依赖 `orjson>=3.10`（pyproject.toml）——仓库里没有任何模块 import 它，从 v0.4 起一直空挂在那里。
 
 ### 修复
 - `deploy/feed-bot-webhook.service` 里的 `NoNewPrivileges=yes` 和脚本里的 `sudo systemctl restart pixiv-feed-bot` 天然冲突——sudo 是 setuid 二进制，这条 hardening 直接让它拒绝提权，所有 webhook 触发的部署都卡在 restart 那一步报「sudo: The "no new privileges" flag is set」。删除该行；其它 hardening（ProtectSystem / ProtectHome / PrivateTmp / ReadWritePaths）保留。注释里写明这条不能加。
 - DEPLOY.md 排错表补一条对应症状的修法。
 
-### 变更
+### 变更（部署）
 - 部署 webhook 通知现在默认从 `/etc/pixiv-feed-bot/config.yaml` 读 `telegram.token` / `auth.admin_users[0]` / `telegram.base_url`，省去再单写一份 `/etc/feed-bot-webhook/env`。env 文件保留作为 override（写另一个 bot/admin 接 deploy 噪音时用）。要求 deploy 用户能读 config.yaml（chgrp pixivbot + chmod 0640 + usermod -aG）。
 - 通知正文加：版本号变化（`0.6.0 → 0.6.1`）、HEAD 短哈希、`git tag --points-at` 命中的 tag、commit 列表（最多 15 条）、`git diff --shortstat` + 文件列表（最多 12 个）。失败通知额外保留尾部错误日志段。从此打开 admin 私聊就能直接看到这版部署到底发生了什么，不必再 ssh 登服务器看 journal。
 
 ### 改动文件
+- `pyproject.toml`：`version` 0.6.0 → 0.6.1；移除 `orjson` 依赖
+- `pixivfeed/channel/telegram/constants.py`：新增
+- `pixivfeed/channel/telegram/handlers.py`：删本地 `TG_DOCUMENT_LIMIT` / `LOCAL_BOT_API_DOCUMENT_LIMIT` / `_PENDING_TTL` 定义，改从 constants import；4 处 `read_timeout=3600 / write_timeout=3600` 改成 `TG_UPLOAD_TIMEOUT`；`_gc_pending` 里 cancel-token 过期阈值改 `CANCEL_TOKEN_TTL`
+- `pixivfeed/channel/telegram/bot.py`：`job_queue.register(...)` 的并发数从 `config.job_queue` 读
+- `pixivfeed/config.py`：新增 `JobQueueConfig` dataclass；`Config.job_queue` 字段；`_from_dict` 读 yaml；`_validate` 拒绝并发 < 1
+- `config.example.yaml`：新增 `job_queue` 段；`cache_days` 注释改成指向 cleanup timer
+- `docs/DEPLOY.md`：新增「启用缓存清理 timer」步骤
 - `deploy/feed-bot-deploy.sh`：新增 config.yaml 默认凭据读取（venv python + PyYAML），新增 `build_summary` helper；`notify` 支持 base_url
-- `docs/DEPLOY.md`：第 5 步重写为「默认值 + override」结构；测试段加成功/失败通知样例；排错表更新
 
 ## v0.6.0 — 2026-05-13
 
