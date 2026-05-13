@@ -279,6 +279,7 @@ Tags：v0.6.1
 | Nginx 返回 405 | GitHub 发了 GET（手动点 redeliver 也可能）；这是正常拒绝，push 事件是 POST |
 | Recent Deliveries 200 但 admin 没消息 | deploy 用户读不了 `/etc/pixiv-feed-bot/config.yaml`（看第 5 步的 chgrp/chmod）；或 `/etc/feed-bot-webhook/env` 里 override 凭据格式不对。`journalctl -u feed-bot-webhook` 看 `skip notify` 行确认 |
 | 通知报 `systemctl restart` 失败 | sudoers 没装好；`sudo -u deploy sudo -n /bin/systemctl restart pixiv-feed-bot` 手工跑一次看错误 |
+| 通知里看到 `sudo: The "no new privileges" flag is set` | webhook 的 systemd unit 加了 `NoNewPrivileges=yes`——和 sudo 提权冲突。最新 `deploy/feed-bot-webhook.service` 已删，本地 cp 覆盖 + `systemctl daemon-reload` + `systemctl restart feed-bot-webhook` 即可 |
 | 通知报 `service not active after restart` | bot 自己起不来（config 错、依赖版本不匹配）；按通知里的 journal tail 排 |
 
 要临时禁用自动部署（比如准备做破坏性测试）：

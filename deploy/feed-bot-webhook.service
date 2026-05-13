@@ -20,7 +20,10 @@ Restart=on-failure
 RestartSec=5s
 
 # 安全收紧
-NoNewPrivileges=yes
+# 注意：不能加 NoNewPrivileges=yes —— 这条会让 sudo（setuid 二进制）
+# 拒绝提权，导致 feed-bot-deploy.sh 里 `sudo systemctl restart pixiv-feed-bot`
+# 失败并报「sudo: The "no new privileges" flag is set, which prevents sudo
+# from running as root」。bot 自己的 service 不调 sudo，那里可以加。
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes

@@ -2,6 +2,10 @@
 
 ## Unreleased — 2026-05-13
 
+### 修复
+- `deploy/feed-bot-webhook.service` 里的 `NoNewPrivileges=yes` 和脚本里的 `sudo systemctl restart pixiv-feed-bot` 天然冲突——sudo 是 setuid 二进制，这条 hardening 直接让它拒绝提权，所有 webhook 触发的部署都卡在 restart 那一步报「sudo: The "no new privileges" flag is set」。删除该行；其它 hardening（ProtectSystem / ProtectHome / PrivateTmp / ReadWritePaths）保留。注释里写明这条不能加。
+- DEPLOY.md 排错表补一条对应症状的修法。
+
 ### 变更
 - 部署 webhook 通知现在默认从 `/etc/pixiv-feed-bot/config.yaml` 读 `telegram.token` / `auth.admin_users[0]` / `telegram.base_url`，省去再单写一份 `/etc/feed-bot-webhook/env`。env 文件保留作为 override（写另一个 bot/admin 接 deploy 噪音时用）。要求 deploy 用户能读 config.yaml（chgrp pixivbot + chmod 0640 + usermod -aG）。
 - 通知正文加：版本号变化（`0.6.0 → 0.6.1`）、HEAD 短哈希、`git tag --points-at` 命中的 tag、commit 列表（最多 15 条）、`git diff --shortstat` + 文件列表（最多 12 个）。失败通知额外保留尾部错误日志段。从此打开 admin 私聊就能直接看到这版部署到底发生了什么，不必再 ssh 登服务器看 journal。
