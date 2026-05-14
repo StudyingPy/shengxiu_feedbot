@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 from telegram import (
     BotCommand,
     BotCommandScopeChat,
@@ -20,6 +23,7 @@ from telegram.ext import (
 
 from ...config import Config
 from ...provider import ProviderRegistry
+from ...provider.ehentai import EHTagDB
 from ...publisher import TelegraphPublisher
 from ...storage import AllowList, Database, RuntimeSettings, TelegraphCache, UsageStore
 from ...utils import logger
@@ -156,6 +160,12 @@ def build_application(
     app.bot_data["usage_store"] = usage_store
     app.bot_data["job_queue"] = job_queue
 
+    # EhTagTranslation 数据库：放 SQLite db 同目录，重启间持久化。
+    # 加载是 fire-and-forget（init_bot_async 里启动 task），未加载完时所有
+    # translate() 都返回原文 → 完全 safe fallback。
+    tagdb_path = Path(config.storage.db_path).parent / "ehtagdb.json"
+    app.bot_data["ehtagdb"] = EHTagDB(tagdb_path)
+
     # 命令
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -205,6 +215,12 @@ async def init_bot_async(
 
     job_queue: JobQueueManager = app.bot_data["job_queue"]
     await job_queue.start_all()
+
+    # EhTagTranslation 数据库异步加载——不 await，不阻塞 bot 上线。本地有缓存
+    # 几十毫秒就解析完；首次拉远端可能要几秒。加载完成前 translate() 安全降级
+    # 返回原文。失败也只 log，不影响 bot 运行。
+    tagdb: EHTagDB = app.bot_data["ehtagdb"]
+    asyncio.create_task(tagdb.load())
 
     return app
 
