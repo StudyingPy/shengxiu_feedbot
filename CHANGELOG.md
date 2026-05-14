@@ -1,20 +1,39 @@
 # Changelog
 
-## Unreleased
+## v0.7.1 — 2026-05-15
 
-`/ehsearch` UX 反馈迭代：v0.7.0 落地后被指三个问题——点 [打开] 新建消息打断对话流、列表缺少上一页、tag 排序混乱——这版全部修。下一次发版（v0.7.1 或合并进更大的版本）一起带上。
+`/ehsearch` 后续 UX 反馈迭代 + eh/ex 详情卡统一 + tag 中文翻译。
 
 ### 变更（UX）
-- **L2 详情卡改为同消息 edit**。点搜索结果里的 [打开 #N] 不再 reply 新消息触发模式跑，而是把搜索消息**就地** edit 成「作品详情卡 + 6 按钮」：4 个发布模式（网页·显示图 / 网页·原图 / 归档·1280x / 归档·原图，走现有 `eh:` 流程 → Telegra.ph）+ [📦 归档下载（zip）]（进 L3）+ [⬅ 返回搜索结果]（回 L1）。整个三层 UX 始终在同一条消息上 edit。
+
+#### v0.7.0 落地反馈三件套
+- **L2 详情卡改为同消息 edit**。点搜索结果里的 [打开 #N] 不再 reply 新消息，搜索消息**就地** edit 成「作品详情卡 + 6 按钮」：4 个发布模式（网页·显示图 / 网页·原图 / 归档·1280x / 归档·原图，走现有 `eh:` 流程 → Telegra.ph）+ [📦 归档下载（zip）]（进 L3）+ [⬅ 返回搜索结果]（回 L1）。整个三层 UX 始终在同一条消息上 edit。
 - **新增 L3 zip 选单**。详情卡上点 [归档下载] → 同消息 edit 成 4 模式选 zip 的菜单（走现有 `eha:` 流程），加 [⬅ 返回详情] 可退回 L2。点了模式按钮跑完时直接发 zip document + 把消息 edit 成完成通知，行为对齐 `/archive`。
-- **搜索结果列表加 [◀ 上一页]**。`SearchResultPage.prev_url` 在 v0.7.0 已经解析但没渲染按钮；本版同时挂在末行（首页时该按钮自然不显示，因为 prev_url 为 None）。`_handle_ehs_next` / `_handle_ehs_prev` 共享 `_ehs_navigate(direction=...)` helper，逻辑对称。
-- **tag 顺序重排**。原先把页数排第一、tag 随意排列；本版每条结果改成 `类型: <category> · 语言: <lang> · <N> 页 · <优选 tag>`。语言从 `language:*` tag 抽取，但 `translated/rewrite/speechless` 这些是修饰符（无关原始语言），会跳过；都没匹到的画廊默认 `japanese`（eh 站点本质就是日同人）。tag 区在显示时去掉 `language:` 项，避免重复。
+- **搜索结果列表加 [◀ 上一页]**。`SearchResultPage.prev_url` 在 v0.7.0 已经解析但没渲染按钮；本版同时挂在末行（首页时该按钮自然不显示）。`_handle_ehs_next` / `_handle_ehs_prev` 共享 `_ehs_navigate(direction=...)` helper。
+- **tag 顺序重排**。每条搜索结果改为 `类型 · 语言 · N 页 · 优选 tag`。语言从 `language:*` tag 抽取，`translated/rewrite/speechless` 修饰符跳过；都没匹到的画廊默认 `japanese`。tag 区去掉 `language:` 项避免重复。
+
+#### 链接流与搜索流详情卡 UX 统一
+- **`EHGallery` 扩展 `category` + `tags` 字段**。`_fetch_gallery_meta` 用 bs4 解析详情页 `#gdc .cs`（分类）+ `#taglist table tr`（按 namespace 分组的全部 tags）。解析失败兜底为空，不影响下载流程。
+- **共享 `_render_eh_detail_card`**。链接流（`_eh_offer_modes` / `_eh_offer_modes_for_archive`）+ 搜索 L2 + 搜索 L3 现在都调用同一个渲染函数：标题 + 「类型 · 语言 · N 页」meta 行 + 「全部 tag 按 eh 顺序分组」的 TG `<blockquote expandable>` 折叠区。粘 eh 链接的体验 == 从 /ehsearch 点进去的体验。
+- **搜索 L1 列表 tag 翻译**。`_select_display_tags` 拆出 `_pick_display_tag_pairs` 保留 namespace，渲染时按 (ns, value) 走翻译。
+
+#### tag 中文翻译数据库集成
+- **新增 `pixivfeed/provider/ehentai/_tagdb.py`**：`EHTagDB` 类下载 [EhTagTranslation/Database](https://github.com/EhTagTranslation/Database) 的 `db.text.json`（GitHub Release，~1MB），缓存到 `{db_path.parent}/ehtagdb.json`，<30 天有效。
+- **启动时异步加载**：`init_bot_async` 里 `asyncio.create_task(tagdb.load())` fire-and-forget，**不阻塞 bot 上线**。加载完成前所有 `translate*()` 调用 safe fallback 返回原文。GitHub 拉不到（网络问题）只 log warning，bot 照常运行。
+- **手动预放缓存**（可选）：服务器拉不到 GH 时可以本机下载后 `scp` 到 `/var/lib/pixiv-feed-bot/ehtagdb.json`，bot 启动直接读本地。
+- **翻译范围**：详情卡的完整 tag 折叠区（namespace 中文名 + value 中文名）+ 搜索 L1 列表的精简 tag。category 用硬编码字典（10 项）翻译，不走数据库（更稳）。
 
 ### 内部
-- 新增 `_render_detail_card` / `_render_archive_menu` / `_make_pending_for_item` 三个内部函数；每次进 L2 或返回 L2 时生成新 `_PENDING` token（旧 token 由现有 `_gc_pending` 清理）。
-- 新增 4 个 callback handler：`_handle_ehs_arch_menu` / `_handle_ehs_back2list` / `_handle_ehs_back2det` / `_handle_ehs_prev`。`handle_callback` dispatch 加 4 个新前缀分支。
+- 新增 `_render_detail_card` / `_render_archive_menu` / `_make_pending_for_item`。每次进 L2 或返回 L2 时生成新 `_PENDING` token（旧 token 由现有 `_gc_pending` 清理）。
+- 新增 callback handler：`_handle_ehs_arch_menu` / `_handle_ehs_back2list` / `_handle_ehs_back2det` / `_handle_ehs_prev`。`handle_callback` dispatch 加 4 个新前缀分支。
 - 旧的 `_handle_ehs_arch` 保留，仅给 v0.7.0 部署期间生成的"Telegra.ph 完成消息底部 [归档下载]"按钮做 backward compat（按钮自身 TTL ≤ 10 分钟自然过期）。
 - `_ehsearch_dispatch` 新增 `prev_param` 参数。
+- 共享渲染常量：`_EH_NAMESPACE_ORDER` / `_EH_NAMESPACE_ZH_FALLBACK` / `_EH_CATEGORY_ZH` / `_EH_NS_MAX_VALUES_IN_BLOCKQUOTE`。
+
+### 已知限制
+- 仍不支持 `f_cats=` / `advsearch=1` / `f_sname` 等高级搜索 filter
+- inline mode 搜索保留给 wikipedia
+- ehtagdb 不带版本通知机制——cache 30 天后自动重拉，期间数据库新增条目暂时拿不到翻译
 
 
 ## v0.7.0 — 2026-05-15
