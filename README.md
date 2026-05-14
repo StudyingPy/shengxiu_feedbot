@@ -24,6 +24,7 @@ Bot 采用 Provider / Registry 架构，各数据源（Pixiv、e-hentai、ExHent
 - **用量统计**：`/stats` 命令查看使用统计，支持按时间窗口、用户、群组筛选。
 - **维基百科查询**：`/wiki <词条>` 查中文维基百科首条命中；inline 模式（`@bot <关键词>`，仅管理员）返回 top 5 结果列表。
 - **归档下载**：`/archive` 命令将作品打包为 zip 发送。e-hentai / ExHentai 支持四种下载模式（网页显示图 / 网页原图 / 归档 1280x / 归档原图）。
+- **eh 关键词搜索**：`/ehsearch <关键词>` 搜索 e-hentai/ExHentai 画廊（自动优先用 ex cookie，失效回退 eh），结果以按钮形式列出，点 [打开] 直接发 Telegra.ph，再点 [归档下载] 可选择产出 zip。
 - **zip 转 Telegra.ph**：`/zip2tph` 命令将上传的图片 zip 包发布为 Telegra.ph 页面。
 
 ## 快速开始

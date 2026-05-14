@@ -42,6 +42,13 @@ from ...config import Config
 from ...provider import ParsedRef, ProviderRegistry, StatusUpdater
 from ...provider.ehentai import EHError, EHGalleryUnavailable, EHMode
 from ...provider.ehentai import _EHFamilyProvider as EHFamilyBase
+from ...provider.ehentai import (
+    EHSearchAuthError,
+    EHSearchBlockedError,
+    EHSearchError,
+    SearchResultPage,
+    search_eh,
+)
 from ...provider.ehentai._archive import (
     ArchiveError,
     ArchiveLockedError,
@@ -64,6 +71,7 @@ from ...storage import (
     KIND_ARCHIVE_CMD,
     KIND_EH_ARCHIVE,
     KIND_EH_PAGE,
+    KIND_EH_SEARCH,
     KIND_NHENTAI,
     KIND_PIXIV_NOVEL,
     KIND_PIXIV_TELEGRAPH,
@@ -366,11 +374,36 @@ class _Pending:
 _PENDING: dict[str, _Pending] = {}
 
 
+@dataclass
+class _SearchState:
+    """/ehsearch 一次搜索的会话状态。
+
+    key 为 10-char hex seid（callback_data 里出现），TTL 与 _PENDING 共用 PENDING_TTL。
+    """
+    host: str                        # "e-hentai.org" / "exhentai.org"
+    keyword: str
+    page: SearchResultPage
+    chat_id: int
+    msg_id: int
+    user_id: int                     # 仅这个 user 可点（与 _PENDING 一致）
+    expanded: bool                   # False=10 条，True=全部 25 条
+    created_at: float
+
+
+_SEARCH_STATES: dict[str, _SearchState] = {}
+
+
 def _gc_pending() -> None:
     now = time.time()
     expired = [k for k, v in _PENDING.items() if now - v.created_at > PENDING_TTL]
     for k in expired:
         _PENDING.pop(k, None)
+    # search 状态走同一 TTL
+    search_expired = [
+        k for k, v in _SEARCH_STATES.items() if now - v.created_at > PENDING_TTL
+    ]
+    for k in search_expired:
+        _SEARCH_STATES.pop(k, None)
     # 顺便清过期 cancel token
     cancel_expired = [
         k for k, v in _CANCEL_TOKENS.items()
@@ -468,6 +501,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /pixiv_telegraph <链接>  强制 pixiv Telegra.ph 模式\n"
         "  /pixiv_direct <链接>     强制 pixiv 直发图片\n"
         "  /archive <链接>          直接返回压缩包（eh/ex 仍弹模式按钮）\n"
+        "  /ehsearch <关键词>       搜索 eh/ex 画廊（点结果即开）\n"
         "  /zip2tph                 回复一张 zip 图片包，发布为 Telegra.ph\n"
         "  /wiki <词条>             查中文维基百科\n"
         "  /chatid                  查看当前 chat_id\n"
@@ -678,6 +712,7 @@ async def _eh_run_with_mode(
     *,
     mode: EHMode | None,
     placeholder=None,
+    extra_buttons: list[InlineKeyboardButton] | None = None,
 ) -> None:
     """实际执行 eh/ex 抓取与发布。
 
@@ -686,6 +721,10 @@ async def _eh_run_with_mode(
     没有 placeholder 时（群聊新建一条），自动 reply 一条。
 
     e-hentai 抓取过程中如果遇到 unavailable，会自动 fallback 到 exhentai。
+
+    extra_buttons：可选，发布完成后挂在 Telegra.ph 链接消息底部的按钮（一行）。
+    供 /ehsearch 流程在 telegraph 完成消息上补一个 [归档下载] 入口。
+    缓存命中也走这条挂按钮，行为一致。
     """
     config, registry, publisher, tg_cache, _ = _ctx(context)
     provider = _eh_provider(registry, ref.provider)
@@ -695,15 +734,21 @@ async def _eh_run_with_mode(
     if mode is None:
         mode = provider.default_mode
 
+    extras_markup = (
+        InlineKeyboardMarkup([extra_buttons]) if extra_buttons else None
+    )
+
     cache_kind = f"{ref.provider}/gallery/{mode.value}"
     cached = await tg_cache.get(cache_kind, ref.id)
     if cached:
         if placeholder:
-            await placeholder.edit_text(cached, disable_web_page_preview=False)
+            await placeholder.edit_text(
+                cached, disable_web_page_preview=False, reply_markup=extras_markup,
+            )
         else:
             msg = update_or_query.effective_message if hasattr(update_or_query, "effective_message") else None
             if msg:
-                await msg.reply_text(cached)
+                await msg.reply_text(cached, reply_markup=extras_markup)
         return
 
     if placeholder is None:
@@ -740,7 +785,9 @@ async def _eh_run_with_mode(
             cache_kind = f"{ref.provider}/gallery/{mode.value}"
             cached = await tg_cache.get(cache_kind, ref.id)
             if cached:
-                await placeholder.edit_text(cached, disable_web_page_preview=False)
+                await placeholder.edit_text(
+                    cached, disable_web_page_preview=False, reply_markup=extras_markup,
+                )
                 return
             try:
                 await placeholder.edit_text(f"⏳ {ref.provider} 处理中（{mode.label_zh}）...")
@@ -800,7 +847,11 @@ async def _eh_run_with_mode(
         return
 
     await tg_cache.put(cache_kind, ref.id, pub.primary_url, pub.page_count)
-    await placeholder.edit_text(pub.primary_url, disable_web_page_preview=False)
+    await placeholder.edit_text(
+        pub.primary_url,
+        disable_web_page_preview=False,
+        reply_markup=extras_markup,
+    )
     # 用量：消息流走 telegraph 发布。bytes_in 估为图片合计，bytes_out 为 0（没回发文件）。
     total_bytes = 0
     for img in gallery.images:
@@ -978,6 +1029,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data.startswith("stg:"):
         from .setting import handle_setting_callback
         await handle_setting_callback(update, context)
+        return
+
+    # ehs_* 前缀（/ehsearch 流程）：按钮数据形态多样，单独分发
+    if query.data.startswith("ehs_open:"):
+        await _handle_ehs_open(update, context)
+        return
+    if query.data.startswith("ehs_more:"):
+        await _handle_ehs_more(update, context)
+        return
+    if query.data.startswith("ehs_next:"):
+        await _handle_ehs_next(update, context)
+        return
+    if query.data.startswith("ehs_arch:"):
+        await _handle_ehs_arch(update, context)
         return
 
     parts = query.data.split(":", 2)
@@ -1950,12 +2015,28 @@ async def _eh_offer_modes_for_archive(
     update: Update, context: ContextTypes.DEFAULT_TYPE, ref: ParsedRef
 ) -> None:
     """eh/ex /archive：弹四模式按钮，回调走 archive 分支。"""
+    placeholder = await update.message.reply_text("📖 解析中...")
+    await _eh_offer_archive_modes_on_placeholder(
+        context, ref, placeholder=placeholder, user_id=update.effective_user.id,
+    )
+
+
+async def _eh_offer_archive_modes_on_placeholder(
+    context: ContextTypes.DEFAULT_TYPE,
+    ref: ParsedRef,
+    *,
+    placeholder,
+    user_id: int,
+) -> None:
+    """复用版本：接现成 placeholder，供 /ehsearch [归档下载] callback 调用。
+
+    与 _eh_offer_modes_for_archive 行为等价，仅入口不同（callback 没有 update.message）。
+    """
     config, registry, *_ = _ctx(context)
     provider = _eh_provider(registry, ref.provider)
     if provider is None:
         return
 
-    placeholder = await update.message.reply_text("📖 解析中...")
     try:
         gallery = await provider.fetch_work(ref)
     except EHGalleryUnavailable as e:
@@ -1981,7 +2062,7 @@ async def _eh_offer_modes_for_archive(
         ref=ref,
         chat_id=placeholder.chat.id,
         msg_id=placeholder.message_id,
-        user_id=update.effective_user.id,
+        user_id=user_id,
         created_at=time.time(),
     )
 
@@ -2585,6 +2666,376 @@ async def _resolve_chat_arg(store, ident: str) -> tuple[int | None, str | None]:
     return None, f"无法识别 {ident!r}：用 -1001838275879 / 1838275879 / @username 任一形式"
 
 
+# ---------------------------------------------------------------------------
+# /ehsearch —— e-hentai / exhentai 关键词搜索
+# ---------------------------------------------------------------------------
+#
+# UX 三层：
+#   1. /ehsearch <keyword> → 默认 10 条结果 + [展开] / [下一页]
+#   2. 点 [打开] → 走 PAGE_SAMPLE 模式发 Telegra.ph，完成消息挂 [归档下载]
+#   3. 点 [归档下载] → 复用 /archive 的 4 模式按钮
+#
+# 站点选择：ex 优先（账号 cookie 可用时），EHSearchAuthError 时回退到 e-hentai。
+# 状态通过 _SEARCH_STATES dict 维护（TTL 与 _PENDING 共用 PENDING_TTL）。
+
+
+_EHSEARCH_DEFAULT_VISIBLE = 10            # 默认展示前 10 条
+_EHSEARCH_MAX_VISIBLE = 25                # eh 一页就 25 条；展开时全显
+_EHSEARCH_TITLE_BTN_MAX = 30              # [打开] 按钮里标题截断长度
+_EHSEARCH_TAG_PRIORITY = ("parody:", "artist:", "character:")
+_EHSEARCH_MAX_TAGS_PER_ITEM = 3           # 每条结果消息文本里展示的 tag 数上限
+
+
+def _eh_search_providers(registry: ProviderRegistry) -> tuple[EHFamilyBase | None, EHFamilyBase | None]:
+    """返回 (ex_provider, eh_provider)；任一不存在时给 None。"""
+    ex = registry.find_by_name("exhentai.org")
+    eh = registry.find_by_name("e-hentai.org")
+    return (
+        ex if isinstance(ex, EHFamilyBase) else None,
+        eh if isinstance(eh, EHFamilyBase) else None,
+    )
+
+
+async def _ehsearch_dispatch(
+    registry: ProviderRegistry, keyword: str, *, next_param: int | None = None,
+    force_host: str | None = None,
+) -> SearchResultPage:
+    """ex 优先 + 退 eh。force_host 指定时跳过 fallback（翻页时用，保证同站连续）。"""
+    ex, eh = _eh_search_providers(registry)
+    if force_host == "e-hentai.org" and eh:
+        return await search_eh(eh, keyword, next_param=next_param)
+    if force_host == "exhentai.org" and ex:
+        return await search_eh(ex, keyword, next_param=next_param)
+    # 默认：先 ex，cookie 失效回退 eh
+    if ex is not None:
+        try:
+            return await search_eh(ex, keyword, next_param=next_param)
+        except EHSearchAuthError as e:
+            logger.info(f"ehsearch ex auth failed, falling back to eh: {e}")
+    if eh is None:
+        raise EHSearchError("eh/ex provider 未注册")
+    return await search_eh(eh, keyword, next_param=next_param)
+
+
+def _eh_short_host(host: str) -> str:
+    return "x" if host == "exhentai.org" else "e"
+
+
+def _eh_host_from_short(short: str) -> str:
+    return "exhentai.org" if short == "x" else "e-hentai.org"
+
+
+def _select_display_tags(tags: list[str]) -> list[str]:
+    """从一堆 tags 里挑展示用的少量代表 tag。
+
+    优先 parody / artist / character；不足 _EHSEARCH_MAX_TAGS_PER_ITEM 个时用顺序补。
+    输出去掉 namespace 前缀，纯 value。
+    """
+    chosen: list[str] = []
+    for prefix in _EHSEARCH_TAG_PRIORITY:
+        for t in tags:
+            if t.startswith(prefix) and t not in chosen:
+                chosen.append(t)
+                if len(chosen) >= _EHSEARCH_MAX_TAGS_PER_ITEM:
+                    break
+        if len(chosen) >= _EHSEARCH_MAX_TAGS_PER_ITEM:
+            break
+    if len(chosen) < _EHSEARCH_MAX_TAGS_PER_ITEM:
+        for t in tags:
+            if t not in chosen:
+                chosen.append(t)
+                if len(chosen) >= _EHSEARCH_MAX_TAGS_PER_ITEM:
+                    break
+    return [t.split(":", 1)[-1] for t in chosen]
+
+
+def _html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _ellipsize(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _render_search_message(seid: str, state: _SearchState) -> tuple[str, InlineKeyboardMarkup]:
+    """渲染搜索结果消息文本 + 按钮键盘。
+
+    返回 (HTML 文本, 键盘)。文本控制在 TG 4096 字符内（25 条 × ~150 字 ≤ 4000）。
+    """
+    visible = (
+        _EHSEARCH_MAX_VISIBLE if state.expanded else _EHSEARCH_DEFAULT_VISIBLE
+    )
+    items = state.page.items[:visible]
+    host_label = state.host
+
+    head = (
+        f"🔍 <b>{_html_escape(state.keyword)}</b> · {host_label}\n"
+        f"共 {state.page.total_count:,} 条，本页显示 {len(items)} / {len(state.page.items)}\n"
+    )
+    lines = [head]
+    for i, it in enumerate(items, 1):
+        title_safe = _html_escape(_ellipsize(it.title, 90))
+        tags_disp = " · ".join(_select_display_tags(it.tags))
+        meta_bits = [f"{it.pages} 页"]
+        if it.category:
+            meta_bits.append(it.category)
+        if tags_disp:
+            meta_bits.append(_html_escape(tags_disp))
+        lines.append(f"\n<b>{i}.</b> {title_safe}\n   <i>{' · '.join(meta_bits)}</i>")
+    text = "".join(lines)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, it in enumerate(items):
+        label = f"打开 #{idx + 1} · {_ellipsize(it.title, _EHSEARCH_TITLE_BTN_MAX)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"ehs_open:{seid}:{idx}")])
+
+    nav: list[InlineKeyboardButton] = []
+    if not state.expanded and len(state.page.items) > _EHSEARCH_DEFAULT_VISIBLE:
+        nav.append(InlineKeyboardButton("展开全部", callback_data=f"ehs_more:{seid}"))
+    if state.page.next_url:
+        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f"ehs_next:{seid}"))
+    if nav:
+        rows.append(nav)
+
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def cmd_ehsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """关键词搜索 eh/ex 画廊。"""
+    config, registry, _, _, allowlist = _ctx(context)
+    if not await is_authorized(update, allowlist):
+        return
+    await _track_user(update, context)
+
+    keyword = " ".join(context.args).strip() if context.args else ""
+    if not keyword:
+        await update.message.reply_text(
+            "用法：/ehsearch <关键词>\n"
+            "示例：/ehsearch language:chinese translated"
+        )
+        return
+
+    placeholder = await update.message.reply_text(f"🔍 搜索 “{keyword}” ...")
+
+    try:
+        page = await _ehsearch_dispatch(registry, keyword)
+    except EHSearchAuthError as e:
+        await placeholder.edit_text(f"⚠️ 搜索失败（认证）：{e}")
+        return
+    except EHSearchBlockedError as e:
+        await placeholder.edit_text(f"⚠️ {e}\n稍后再试。")
+        return
+    except EHSearchError as e:
+        await placeholder.edit_text(f"⚠️ 搜索失败：{e}")
+        return
+    except Exception as e:
+        logger.exception(f"/ehsearch {keyword!r} unexpected error")
+        await placeholder.edit_text(f"⚠️ 搜索失败：{e}")
+        return
+
+    if not page.items:
+        await placeholder.edit_text(f"🔍 “{keyword}” 未找到结果")
+        return
+
+    _gc_pending()
+    seid = uuid.uuid4().hex[:10]
+    state = _SearchState(
+        host=page.host,
+        keyword=keyword,
+        page=page,
+        chat_id=placeholder.chat.id,
+        msg_id=placeholder.message_id,
+        user_id=update.effective_user.id,
+        expanded=False,
+        created_at=time.time(),
+    )
+    _SEARCH_STATES[seid] = state
+
+    text, kb = _render_search_message(seid, state)
+    await placeholder.edit_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
+
+    # 计入 stats（/stats 会自动出现一行 "eh/ex 搜索"）
+    await _log_usage(
+        context, update, kind=KIND_EH_SEARCH,
+        provider=page.host, ref_id=keyword[:64],
+    )
+
+
+def _ehs_get_state(seid: str) -> _SearchState | None:
+    """快速查 state；调用方负责 user_id 校验与已过期提示。"""
+    return _SEARCH_STATES.get(seid)
+
+
+async def _handle_ehs_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        await query.answer()
+        return
+    seid, idx_str = parts[1], parts[2]
+    state = _SEARCH_STATES.get(seid)
+    if state is None:
+        await query.answer("⚠️ 搜索已过期，请重新 /ehsearch", show_alert=True)
+        return
+    if query.from_user.id != state.user_id:
+        await query.answer("⚠️ 这个搜索来自其他用户", show_alert=True)
+        return
+    try:
+        idx = int(idx_str)
+        it = state.page.items[idx]
+    except (ValueError, IndexError):
+        await query.answer("⚠️ 无效条目", show_alert=True)
+        return
+
+    await query.answer(f"打开 #{idx + 1}")
+
+    # 单独新建一条 placeholder（保留原搜索结果消息，用户可继续点其他条目）
+    placeholder = await query.message.reply_text(
+        f"⏳ 处理中（网页·显示图）...\n{_ellipsize(it.title, 60)}"
+    )
+
+    ref = ParsedRef(
+        provider=state.host,
+        kind="gallery",
+        id=f"{it.gid}/{it.token}",
+        raw=it.url,
+    )
+    archive_btn = InlineKeyboardButton(
+        "📦 归档下载",
+        callback_data=f"ehs_arch:{it.gid}:{it.token}:{_eh_short_host(state.host)}",
+    )
+
+    async def _do() -> None:
+        await _eh_run_with_mode(
+            update, context, ref,
+            mode=EHMode.PAGE_SAMPLE,
+            placeholder=placeholder,
+            extra_buttons=[archive_btn],
+        )
+
+    await _enqueue(
+        context,
+        category="telegraph_publish",
+        user_id=state.user_id,
+        placeholder=placeholder,
+        work_label=f"{state.host} 处理中（网页·显示图）...",
+        coro_factory=_do,
+    )
+
+
+async def _handle_ehs_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    parts = query.data.split(":")
+    if len(parts) != 2:
+        await query.answer()
+        return
+    seid = parts[1]
+    state = _SEARCH_STATES.get(seid)
+    if state is None:
+        await query.answer("⚠️ 搜索已过期，请重新 /ehsearch", show_alert=True)
+        return
+    if query.from_user.id != state.user_id:
+        await query.answer("⚠️ 这个搜索来自其他用户", show_alert=True)
+        return
+    state.expanded = True
+    await query.answer("展开全部")
+    text, kb = _render_search_message(seid, state)
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.warning(f"ehs_more edit failed: {e}")
+
+
+async def _handle_ehs_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    parts = query.data.split(":")
+    if len(parts) != 2:
+        await query.answer()
+        return
+    seid = parts[1]
+    state = _SEARCH_STATES.get(seid)
+    if state is None:
+        await query.answer("⚠️ 搜索已过期，请重新 /ehsearch", show_alert=True)
+        return
+    if query.from_user.id != state.user_id:
+        await query.answer("⚠️ 这个搜索来自其他用户", show_alert=True)
+        return
+    if not state.page.next_url:
+        await query.answer("已经是最后一页")
+        return
+
+    # 从 next_url 抠 ?next=<gid>
+    nm = re.search(r"[?&]next=(\d+)", state.page.next_url)
+    if not nm:
+        await query.answer("⚠️ 翻页 URL 异常", show_alert=True)
+        return
+    next_param = int(nm.group(1))
+
+    await query.answer("加载下一页...")
+    _, registry, *_ = _ctx(context)
+    try:
+        new_page = await _ehsearch_dispatch(
+            registry, state.keyword, next_param=next_param, force_host=state.host,
+        )
+    except EHSearchError as e:
+        await query.answer(f"⚠️ 翻页失败：{e}", show_alert=True)
+        return
+    except Exception as e:
+        logger.exception("ehs_next dispatch failed")
+        await query.answer(f"⚠️ 翻页失败：{e}", show_alert=True)
+        return
+
+    if not new_page.items:
+        await query.answer("下一页没有结果")
+        return
+
+    state.page = new_page
+    state.expanded = False
+    state.created_at = time.time()   # 翻页续命，避免长时间浏览过期
+
+    text, kb = _render_search_message(seid, state)
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.warning(f"ehs_next edit failed: {e}")
+
+
+async def _handle_ehs_arch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """[归档下载] 按钮：用 gid+token 触发 /archive 同款 4 模式选择。"""
+    query = update.callback_query
+    parts = query.data.split(":")
+    if len(parts) != 4:
+        await query.answer()
+        return
+    _, gid, token, host_short = parts
+    host = _eh_host_from_short(host_short)
+    await query.answer()
+
+    placeholder = await query.message.reply_text("📖 解析中...")
+    ref = ParsedRef(
+        provider=host, kind="gallery", id=f"{gid}/{token}",
+        raw=f"https://{host}/g/{gid}/{token}/",
+    )
+    await _eh_offer_archive_modes_on_placeholder(
+        context, ref, placeholder=placeholder, user_id=query.from_user.id,
+    )
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """admin only。用法见上面注释。"""
     config: Config = context.bot_data["config"]
@@ -2805,6 +3256,7 @@ __all__ = [
     "cmd_pixiv_telegraph",
     "cmd_pixiv_direct",
     "cmd_archive",
+    "cmd_ehsearch",
     "cmd_zip2tph",
     "cmd_stats",
     "handle_zip_document",
