@@ -636,11 +636,14 @@ async def _eh_offer_modes(
     )
 
     title = gallery.title.replace("<", "&lt;").replace(">", "&gt;")
-    text = (
-        f"📖 <b>{title}</b>\n"
-        f"共 {gallery.page_count} 页\n"
-        f"🌐 {ref.provider}\n\n"
-        "选择下载模式："
+    text = _render_eh_detail_card(
+        title=gallery.title,
+        host=ref.provider,
+        category=gallery.category,
+        pages=gallery.page_count,
+        tags=gallery.tags,
+        ehtagdb=_get_ehtagdb(context),
+        footer_prompt="选择下载模式：",
     )
     await placeholder.edit_text(
         text,
@@ -2080,11 +2083,14 @@ async def _eh_offer_archive_modes_on_placeholder(
     )
 
     title = gallery.title.replace("<", "&lt;").replace(">", "&gt;")
-    text = (
-        f"📦 <b>{title}</b>\n"
-        f"共 {gallery.page_count} 页\n"
-        f"🌐 {ref.provider}\n\n"
-        "选择下载模式（产出压缩包）："
+    text = _render_eh_detail_card(
+        title=gallery.title,
+        host=ref.provider,
+        category=gallery.category,
+        pages=gallery.page_count,
+        tags=gallery.tags,
+        ehtagdb=_get_ehtagdb(context),
+        footer_prompt="选择下载模式（产出压缩包）：",
     )
     # 用 eha: 前缀区分回调
     keyboard = InlineKeyboardMarkup(
@@ -2699,6 +2705,154 @@ _EHSEARCH_TAG_PRIORITY = ("parody:", "artist:", "character:")
 _EHSEARCH_MAX_TAGS_PER_ITEM = 3           # 每条结果消息文本里展示的 tag 数上限
 _EHSEARCH_MAX_TAGS_DETAIL = 6             # 详情卡上展示的 tag 数上限
 
+# 详情卡 blockquote 分组顺序（eh 详情页的 #taglist 排版顺序）
+_EH_NAMESPACE_ORDER = (
+    "language", "parody", "character", "group", "artist", "cosplayer",
+    "female", "male", "mixed", "other", "reclass", "temp",
+)
+# ehtagdb 没加载完时的 namespace 中文兜底
+_EH_NAMESPACE_ZH_FALLBACK = {
+    "language": "语言",
+    "parody": "原作",
+    "character": "角色",
+    "group": "社团",
+    "artist": "作者",
+    "cosplayer": "扮演者",
+    "female": "♀",
+    "male": "♂",
+    "mixed": "混合",
+    "other": "其它",
+    "reclass": "重分类",
+    "temp": "临时",
+}
+# 详情页头部 category（"Doujinshi" / "Manga" / ...）→ 中文，硬编码够稳，无需翻译库
+_EH_CATEGORY_ZH = {
+    "Doujinshi": "同人志",
+    "Manga": "漫画",
+    "Artist CG": "画师 CG",
+    "Game CG": "游戏 CG",
+    "Western": "西方",
+    "Non-H": "非 H",
+    "Image Set": "图集",
+    "Cosplay": "Cosplay",
+    "Asian Porn": "亚洲",
+    "Misc": "杂项",
+}
+_EH_NS_MAX_VALUES_IN_BLOCKQUOTE = 12       # 每个 namespace 最多展示 12 个 value（防 TG 4096 上限）
+
+
+def _get_ehtagdb(context: ContextTypes.DEFAULT_TYPE | None):
+    """从 bot_data 拿 EHTagDB 实例；不存在/未配置时返回 None。"""
+    if context is None:
+        return None
+    return context.bot_data.get("ehtagdb")
+
+
+def _eh_translate_ns(ns: str, ehtagdb) -> str:
+    if ehtagdb is not None and getattr(ehtagdb, "loaded", False):
+        zh = ehtagdb.translate_namespace(ns)
+        if zh and zh != ns:
+            return zh
+    return _EH_NAMESPACE_ZH_FALLBACK.get(ns, ns)
+
+
+def _eh_translate_value(ns: str, value: str, ehtagdb) -> str:
+    if ehtagdb is not None and getattr(ehtagdb, "loaded", False):
+        return ehtagdb.translate(ns, value)
+    return value
+
+
+def _eh_translate_category(category: str) -> str:
+    if not category:
+        return "—"
+    return _EH_CATEGORY_ZH.get(category, category)
+
+
+def _group_tags(tags: list[str]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for t in tags:
+        if ":" not in t:
+            continue
+        ns, v = t.split(":", 1)
+        grouped.setdefault(ns, []).append(v)
+    return grouped
+
+
+def _render_eh_detail_card(
+    *,
+    title: str,
+    host: str,
+    category: str,
+    pages: int,
+    tags: list[str],
+    ehtagdb,
+    footer_prompt: str = "",
+) -> str:
+    """共享 eh/ex 详情卡 HTML：链接流（粘 eh 链接 / /archive）+ 搜索流 L2 / L3 共用。
+
+    布局：
+        📖 <b>标题</b>
+        🌐 host · <i>类型: X · 语言: Y · N 页</i>
+
+        <blockquote expandable>
+        <b>语言</b>: chinese、translated
+        <b>原作</b>: VOICEROID
+        ...
+        </blockquote>
+
+        {footer_prompt}（"选择下载模式：" 之类）
+
+    tags 空时不渲染 blockquote。footer_prompt 空时不附底部。
+    """
+    lang = _extract_language(tags)
+    lang_zh = _eh_translate_value("language", lang, ehtagdb)
+    cat_zh = _eh_translate_category(category)
+
+    lines = [
+        f"📖 <b>{_html_escape(title)}</b>",
+        f"🌐 {host} · <i>类型: {_html_escape(cat_zh)} · "
+        f"语言: {_html_escape(lang_zh)} · {pages} 页</i>",
+    ]
+
+    grouped = _group_tags(tags)
+    bq_lines: list[str] = []
+    seen: set[str] = set()
+
+    def _emit(ns: str) -> None:
+        values = grouped.get(ns)
+        if not values:
+            return
+        seen.add(ns)
+        truncated = values[:_EH_NS_MAX_VALUES_IN_BLOCKQUOTE]
+        more = len(values) - len(truncated)
+        ns_label = _eh_translate_ns(ns, ehtagdb)
+        translated = [_eh_translate_value(ns, v, ehtagdb) for v in truncated]
+        body = "、".join(_html_escape(v) for v in translated)
+        if more > 0:
+            body += f" <i>(+{more})</i>"
+        bq_lines.append(f"<b>{_html_escape(ns_label)}</b>: {body}")
+
+    for ns in _EH_NAMESPACE_ORDER:
+        _emit(ns)
+    # 兜底未在 ORDER 里的 namespace
+    for ns in grouped:
+        if ns not in seen:
+            _emit(ns)
+
+    if bq_lines:
+        lines.append("")
+        lines.append("<blockquote expandable>" + "\n".join(bq_lines) + "</blockquote>")
+
+    if footer_prompt:
+        lines.append("")
+        lines.append(footer_prompt)
+
+    text = "\n".join(lines)
+    # TG 消息上限 4096 char。极端长 tag 列表兜底截断。
+    if len(text) > 4000:
+        text = text[:3950] + "\n<i>...(标签过多，已截断)</i>"
+    return text
+
 
 def _eh_search_providers(registry: ProviderRegistry) -> tuple[EHFamilyBase | None, EHFamilyBase | None]:
     """返回 (ex_provider, eh_provider)；任一不存在时给 None。"""
@@ -2747,22 +2901,37 @@ def _select_display_tags(tags: list[str], *, max_n: int = _EHSEARCH_MAX_TAGS_PER
     输出去掉 namespace 前缀，纯 value。**调用方应预先剔除 language: 项**（语言
     在 meta_bits 单独显示）。
     """
-    chosen: list[str] = []
+    return [v for _ns, v in _pick_display_tag_pairs(tags, max_n=max_n)]
+
+
+def _pick_display_tag_pairs(
+    tags: list[str], *, max_n: int = _EHSEARCH_MAX_TAGS_PER_ITEM,
+) -> list[tuple[str, str]]:
+    """同 _select_display_tags，但返回 (namespace, value) 对，便于按 ns 查翻译。"""
+    chosen: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(t: str) -> None:
+        if t in seen or ":" not in t:
+            return
+        ns, value = t.split(":", 1)
+        chosen.append((ns, value))
+        seen.add(t)
+
     for prefix in _EHSEARCH_TAG_PRIORITY:
         for t in tags:
-            if t.startswith(prefix) and t not in chosen:
-                chosen.append(t)
-                if len(chosen) >= max_n:
-                    break
+            if len(chosen) >= max_n:
+                break
+            if t.startswith(prefix):
+                _add(t)
         if len(chosen) >= max_n:
             break
     if len(chosen) < max_n:
         for t in tags:
-            if t not in chosen:
-                chosen.append(t)
-                if len(chosen) >= max_n:
-                    break
-    return [t.split(":", 1)[-1] for t in chosen]
+            if len(chosen) >= max_n:
+                break
+            _add(t)
+    return chosen
 
 
 def _extract_language(tags: list[str]) -> str:
@@ -2785,10 +2954,13 @@ def _ellipsize(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def _render_search_message(seid: str, state: _SearchState) -> tuple[str, InlineKeyboardMarkup]:
+def _render_search_message(
+    seid: str, state: _SearchState, ehtagdb=None,
+) -> tuple[str, InlineKeyboardMarkup]:
     """渲染搜索结果消息文本 + 按钮键盘。
 
     返回 (HTML 文本, 键盘)。文本控制在 TG 4096 字符内（25 条 × ~150 字 ≤ 4000）。
+    传 ehtagdb 时，category / language / 显示 tag 都尝试翻译为中文。
     """
     visible = (
         _EHSEARCH_MAX_VISIBLE if state.expanded else _EHSEARCH_DEFAULT_VISIBLE
@@ -2803,11 +2975,18 @@ def _render_search_message(seid: str, state: _SearchState) -> tuple[str, InlineK
     lines = [head]
     for i, it in enumerate(items, 1):
         title_safe = _html_escape(_ellipsize(it.title, 90))
-        lang = _extract_language(it.tags)
+        lang_raw = _extract_language(it.tags)
+        lang_zh = _eh_translate_value("language", lang_raw, ehtagdb)
+        cat_zh = _eh_translate_category(it.category)
         other_tags = [t for t in it.tags if not t.startswith("language:")]
-        tags_disp = " · ".join(_select_display_tags(other_tags))
+        tag_values = _select_display_tags(other_tags)
+        # _select_display_tags 已经剥了 namespace；要翻译得有原始 (ns, value)。
+        # 简化：从 other_tags 顺序挑前 N 个对应的，原 ns 重建 → 翻译 value。
+        tag_pairs = _pick_display_tag_pairs(other_tags, max_n=_EHSEARCH_MAX_TAGS_PER_ITEM)
+        tag_translated = [_eh_translate_value(ns, v, ehtagdb) for ns, v in tag_pairs]
+        tags_disp = " · ".join(tag_translated)
         # 顺序：类型 · 语言 · 页数 · 优选 tag（去掉 language）
-        meta_bits = [it.category or "—", lang, f"{it.pages} 页"]
+        meta_bits = [cat_zh, lang_zh, f"{it.pages} 页"]
         if tags_disp:
             meta_bits.append(_html_escape(tags_disp))
         lines.append(f"\n<b>{i}.</b> {title_safe}\n   <i>{' · '.join(meta_bits)}</i>")
@@ -2882,7 +3061,7 @@ async def cmd_ehsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     _SEARCH_STATES[seid] = state
 
-    text, kb = _render_search_message(seid, state)
+    text, kb = _render_search_message(seid, state, _get_ehtagdb(context))
     await placeholder.edit_text(
         text,
         parse_mode=ParseMode.HTML,
@@ -2903,25 +3082,22 @@ def _ehs_get_state(seid: str) -> _SearchState | None:
 
 
 def _render_detail_card(
-    state: _SearchState, idx: int, ptoken: str, seid: str,
+    state: _SearchState, idx: int, ptoken: str, seid: str, ehtagdb,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """L2 详情卡：标题 + 类型/语言/页数 + tags + 6 按钮（4 模式 + 归档下载 + 返回）。
+    """L2 详情卡：标题 + 类型/语言/页数 + 折叠 tag 区 + 6 按钮（4 模式 + 归档下载 + 返回）。
 
     4 模式按钮走现有 `eh:{ptoken}:<mode>` 回调（Telegra.ph 发布）。
     [归档下载] 进 L3 zip 选单。
     """
     it = state.page.items[idx]
-    lang = _extract_language(it.tags)
-    other_tags = [t for t in it.tags if not t.startswith("language:")]
-    tag_values = _select_display_tags(other_tags, max_n=_EHSEARCH_MAX_TAGS_DETAIL)
-    tags_line = " · ".join(tag_values) if tag_values else "—"
-
-    text = (
-        f"📖 <b>{_html_escape(it.title)}</b>\n"
-        f"<i>类型: {_html_escape(it.category or '—')} · 语言: {_html_escape(lang)} · {it.pages} 页</i>\n"
-        f"<i>tags: {_html_escape(tags_line)}</i>\n"
-        f"🌐 {state.host}\n\n"
-        "选择处理方式（前 4 个发 Telegra.ph，归档下载产出 zip）："
+    text = _render_eh_detail_card(
+        title=it.title,
+        host=state.host,
+        category=it.category,
+        pages=it.pages,
+        tags=it.tags,
+        ehtagdb=ehtagdb,
+        footer_prompt="选择处理方式（前 4 个发 Telegra.ph，归档下载产出 zip）：",
     )
     keyboard = InlineKeyboardMarkup(
         [
@@ -2941,14 +3117,18 @@ def _render_detail_card(
 
 
 def _render_archive_menu(
-    state: _SearchState, idx: int, ptoken: str, seid: str,
+    state: _SearchState, idx: int, ptoken: str, seid: str, ehtagdb,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """L3 zip 选单：4 模式 + 返回详情。4 模式按钮走现有 `eha:{ptoken}:<mode>` 回调。"""
     it = state.page.items[idx]
-    text = (
-        f"📦 <b>{_html_escape(it.title)}</b>\n"
-        f"<i>{it.pages} 页 · {state.host}</i>\n\n"
-        "选择下载模式（产出压缩包）："
+    text = _render_eh_detail_card(
+        title=it.title,
+        host=state.host,
+        category=it.category,
+        pages=it.pages,
+        tags=it.tags,
+        ehtagdb=ehtagdb,
+        footer_prompt="选择下载模式（产出压缩包）：",
     )
     keyboard = InlineKeyboardMarkup(
         [
@@ -3010,7 +3190,7 @@ async def _handle_ehs_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     ptoken = _make_pending_for_item(state, idx, query)
-    text, kb = _render_detail_card(state, idx, ptoken, seid)
+    text, kb = _render_detail_card(state, idx, ptoken, seid, _get_ehtagdb(context))
     await query.answer()
     try:
         await query.edit_message_text(
@@ -3049,7 +3229,7 @@ async def _handle_ehs_arch_menu(update: Update, context: ContextTypes.DEFAULT_TY
     if ptoken not in _PENDING:
         ptoken = _make_pending_for_item(state, idx, query)
 
-    text, kb = _render_archive_menu(state, idx, ptoken, seid)
+    text, kb = _render_archive_menu(state, idx, ptoken, seid, _get_ehtagdb(context))
     await query.answer()
     try:
         await query.edit_message_text(
@@ -3075,7 +3255,7 @@ async def _handle_ehs_back2list(update: Update, context: ContextTypes.DEFAULT_TY
     if query.from_user.id != state.user_id:
         await query.answer("⚠️ 这个搜索来自其他用户", show_alert=True)
         return
-    text, kb = _render_search_message(seid, state)
+    text, kb = _render_search_message(seid, state, _get_ehtagdb(context))
     await query.answer()
     try:
         await query.edit_message_text(
@@ -3108,7 +3288,7 @@ async def _handle_ehs_back2det(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("⚠️ 无效条目", show_alert=True)
         return
     ptoken = _make_pending_for_item(state, idx, query)
-    text, kb = _render_detail_card(state, idx, ptoken, seid)
+    text, kb = _render_detail_card(state, idx, ptoken, seid, _get_ehtagdb(context))
     await query.answer()
     try:
         await query.edit_message_text(
@@ -3135,7 +3315,7 @@ async def _handle_ehs_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     state.expanded = True
     await query.answer("展开全部")
-    text, kb = _render_search_message(seid, state)
+    text, kb = _render_search_message(seid, state, _get_ehtagdb(context))
     try:
         await query.edit_message_text(
             text,
@@ -3207,7 +3387,7 @@ async def _ehs_navigate(
     state.expanded = False
     state.created_at = time.time()   # 翻页续命，避免长时间浏览过期
 
-    text, kb = _render_search_message(seid, state)
+    text, kb = _render_search_message(seid, state, _get_ehtagdb(context))
     try:
         await query.edit_message_text(
             text,
