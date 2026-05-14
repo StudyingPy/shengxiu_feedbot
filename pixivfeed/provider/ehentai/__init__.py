@@ -16,10 +16,11 @@ fetch_and_download_with_mode(ref, mode)。
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
+from bs4 import BeautifulSoup
 
 from ...utils import logger
 from .. import GalleryImage, GalleryWork, ParsedRef, ProgressHook, Provider, StatusUpdater
@@ -47,6 +48,7 @@ from ._search import (
     SearchResultPage,
     search_eh,
 )
+from ._tagdb import EHTagDB
 
 
 class EHError(Exception):
@@ -70,6 +72,9 @@ class EHGallery:
     title: str
     page_count: int                # 总页数（从主页第一页 HTML 抠到）
     image_page_urls: list[str]     # 子页 URL（page_sample / page_original 用）
+    # 详情页头部信息（v0.7.x 新增；不影响下载流程，纯展示用）
+    category: str = ""                                    # "Doujinshi" / "Manga" / ...
+    tags: list[str] = field(default_factory=list)        # ["language:chinese", "parody:voiceroid", ...]
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +122,46 @@ def _normalize_gallery_url(host: str, raw_url: str) -> tuple[str, str, str]:
     if len(parts) < 3 or parts[0] != "g":
         raise EHError(f"invalid eh gallery path: {raw_url!r}")
     return f"https://{host}/g/{parts[1]}/{parts[2]}", parts[1], parts[2]
+
+
+def _parse_gallery_detail(first_page_html: str) -> tuple[str, list[str]]:
+    """从画廊详情页第一页 HTML 抠出 category + 全部 tags。
+
+    解析失败（HTML 结构变了）时不抛异常，返回 ("", [])，调用方按"没拿到详情"
+    处理——下载流程仍然能跑，只是详情卡少了几个字段。
+
+    selector：
+    - 分类：``#gdc .cs`` 文本（"Doujinshi" / "Manga" / ...）
+    - tags：``#taglist table tr`` 每行 ``td.tc`` 是 namespace（带尾巴冒号），
+      第 2 个 td 里所有 ``div.gt | div.gtl | div.gtw`` 的 ``a`` 文本是 value。
+      .gt/.gtl/.gtw 分别对应正常/低权重/警告 tag，列表里不区分。
+    """
+    try:
+        soup = BeautifulSoup(first_page_html, "html.parser")
+    except Exception as e:
+        logger.warning(f"eh detail parse: BeautifulSoup failed: {e}")
+        return "", []
+
+    category = ""
+    cs = soup.select_one("#gdc .cs")
+    if cs:
+        category = cs.get_text(strip=True)
+
+    tags: list[str] = []
+    for tr in soup.select("#taglist table tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+        ns = tds[0].get_text(strip=True).rstrip(":")
+        if not ns:
+            continue
+        for tag_div in tds[1].select("div.gt, div.gtl, div.gtw"):
+            a = tag_div.find("a")
+            value = (a.get_text(strip=True) if a else tag_div.get_text(strip=True)).strip()
+            if value:
+                tags.append(f"{ns}:{value}")
+
+    return category, tags
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +386,8 @@ class _EHFamilyProvider(Provider):
         if page_count == 0:
             page_count = len(subpages)
 
+        category, detail_tags = _parse_gallery_detail(first_page)
+
         return EHGallery(
             host=self.HOST,
             gallery_id=gid,
@@ -348,6 +395,8 @@ class _EHFamilyProvider(Provider):
             title=title,
             page_count=page_count,
             image_page_urls=subpages,
+            category=category,
+            tags=detail_tags,
         )
 
     @staticmethod
@@ -581,4 +630,5 @@ __all__ = [
     "SearchResultItem",
     "SearchResultPage",
     "search_eh",
+    "EHTagDB",
 ]
