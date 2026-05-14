@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.7.0 — 2026-05-15
+
+### 新增
+- **`/ehsearch <关键词>`** —— 直接在聊天里搜索 e-hentai / ExHentai 画廊，免去打开浏览器。站点选择策略：账号 ipb cookie 配齐时优先用 ExHentai；cookie 失效（HTTP 302/404 或空 body）自动回落到 e-hentai。结果纯文本展示前 10 条（每条 1 行：标题 / 页数 / 分类 / 优选 tag），按钮区每条 1 个 `[打开]`；末行可选 `[展开全部]`（看完 25 条）和 `[下一页 ▶]`。三层 UX：搜索 → 点 `[打开]` 走 `EHMode.PAGE_SAMPLE`（网页·显示图）→ Telegra.ph 发完后消息末尾挂 `[📦 归档下载]` → 点了进入 `/archive` 同款 4 模式按钮，按需挑 zip 模式。
+- 搜索行为计入 stats：新增 [`KIND_EH_SEARCH`](pixivfeed/storage/usage.py)，`/stats` 会自动出现一行 "eh/ex 搜索"，不需要单独改聚合逻辑。
+- `bot.py` 命令菜单（`PUBLIC_COMMANDS`）追加 `BotCommand("ehsearch", ...)`；`/start` `/help` 文本同步更新。
+
+### 变更
+- `_eh_run_with_mode`（[handlers.py](pixivfeed/channel/telegram/handlers.py)）新增可选 kwarg `extra_buttons: list[InlineKeyboardButton] | None`，发布完成（含缓存命中、fallback 后命中）后会把按钮挂在 Telegra.ph URL 消息底部一行。仅 `/ehsearch` 流程用，默认 `None` 时行为完全不变。
+- `_eh_offer_modes_for_archive`（[handlers.py:1966](pixivfeed/channel/telegram/handlers.py)）拆出 `_eh_offer_archive_modes_on_placeholder` 内层函数，接受现成的 placeholder + user_id，供 `ehs_arch` callback 复用；`/archive` 入口走 1 行壳行为零变化。
+
+### 风险说明
+- 当前使用强度（≈3 次/天）下，对 cookie 持续性影响接近 0：搜索只读 cookie；登录账号 page-load quota ≈10000/24h，差 3 个数量级；image hits 与搜索缩略图独立配额不冲突；搜索不扣 GP。唯一非零风险是 bot 未来对外开放后被滥刷——可在 `cmd_ehsearch` 入口加 per-user rate limit（保留为未来 PR）。
+
+### 已知限制
+- 不支持高级 filter（`f_cats=` 分类位、`advsearch=1`、`f_sname/f_stags`）—— 等用着需要再补 `--cats=` 类 CLI flag
+- inline mode 搜索（`@bot keyword`）保留给 wikipedia，不扩展
+- 缩略图 preview 故意省略：保持纯文本结果列表，节省流量 + 避免 25 次 thumbnail fetch 拉慢响应
+
+### 改动文件
+- `pixivfeed/provider/ehentai/_search.py`：新增 parser + `search_eh()` async 入口
+- `pixivfeed/provider/ehentai/__init__.py`：re-export 6 个搜索符号
+- `pixivfeed/storage/usage.py` + `pixivfeed/storage/__init__.py`：新增 `KIND_EH_SEARCH = "eh_search"` + 中文映射 + `__all__`
+- `pixivfeed/channel/telegram/handlers.py`：新增 `_SearchState` / `_SEARCH_STATES` / `cmd_ehsearch` / `_handle_ehs_open/_more/_next/_arch` / `_render_search_message`；`_gc_pending` 加入新 state TTL；`_eh_run_with_mode` 加 `extra_buttons` 参数；`_eh_offer_modes_for_archive` 拆出内层；`handle_callback` 加 4 个分发分支；`__all__` 加 `cmd_ehsearch`；`/start` 文本补一行
+- `pixivfeed/channel/telegram/bot.py`：`PUBLIC_COMMANDS` 加 `BotCommand("ehsearch", ...)`；`build_application` 加 `CommandHandler("ehsearch", cmd_ehsearch)`
+- `README.md`：「核心功能」段补 "eh 关键词搜索" 一条
+- `pyproject.toml`：`version` 0.6.1 → 0.7.0
+
+
 ## v0.6.1 — 2026-05-14
 
 ### 新增
