@@ -29,6 +29,7 @@ KIND_PIXIV_DIRECT = "pixiv_direct"
 KIND_PIXIV_NOVEL = "pixiv_novel"
 KIND_EH_PAGE = "eh_page"
 KIND_EH_ARCHIVE = "eh_archive"
+KIND_EH_SEARCH = "eh_search"
 KIND_NHENTAI = "nhentai"
 KIND_ARCHIVE_CMD = "archive_cmd"
 KIND_ZIP2TPH = "zip2tph"
@@ -39,6 +40,7 @@ KIND_ZH = {
     KIND_PIXIV_NOVEL: "pixiv 小说",
     KIND_EH_PAGE: "eh/ex 网页",
     KIND_EH_ARCHIVE: "eh/ex 归档",
+    KIND_EH_SEARCH: "eh/ex 搜索",
     KIND_NHENTAI: "nhentai",
     KIND_ARCHIVE_CMD: "/archive",
     KIND_ZIP2TPH: "/zip2tph",
@@ -428,6 +430,7 @@ __all__ = [
     "KIND_PIXIV_NOVEL",
     "KIND_EH_PAGE",
     "KIND_EH_ARCHIVE",
+    "KIND_EH_SEARCH",
     "KIND_NHENTAI",
     "KIND_ARCHIVE_CMD",
     "KIND_ZIP2TPH",
