@@ -39,6 +39,14 @@ from ._archive import (
     request_archive,
 )
 from ._modes import BASE_HEADERS, EHMode
+from ._search import (
+    EHSearchAuthError,
+    EHSearchBlockedError,
+    EHSearchError,
+    SearchResultItem,
+    SearchResultPage,
+    search_eh,
+)
 
 
 class EHError(Exception):
@@ -567,4 +575,10 @@ __all__ = [
     "EHError",
     "EHGalleryUnavailable",
     "EHMode",
+    "EHSearchAuthError",
+    "EHSearchBlockedError",
+    "EHSearchError",
+    "SearchResultItem",
+    "SearchResultPage",
+    "search_eh",
 ]
