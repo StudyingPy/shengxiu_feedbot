@@ -130,3 +130,4 @@ Nginx 配置、服务器更新流程、本地 Bot API 搭建等详见 [部署指
 - [DojinGo](https://github.com/Olivi-9/DojinGo) — collector 抽象与 nhentai / eh 解析逻辑
 - [telegram-bili-feed-helper](https://github.com/simonsmh/telegram-bili-feed-helper) — Provider / Registry 架构设计
 - [bot-rs](https://github.com/jizizr/bot-rs) — `/wiki` 命令实现参考
+- [EhTagTranslation](https://github.com/EhTagTranslation/Database) — 提供e-hentai标签翻译
