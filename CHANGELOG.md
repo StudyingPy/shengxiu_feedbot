@@ -1,22 +1,52 @@
 # Changelog
 
-## Unreleased
+## v0.8.1 — 2026-05-16
+
+R2 体验完善 + 体积护栏 + zip2tph 接通。
 
 ### Features
-- **R2 上传进度条**：发布 Telegra.ph 时上传 R2 阶段会在 placeholder 消息上 emit "⏳ 上传 R2 (12/25)" 状态文本，每完成一张 PUT 更新一次。`publish_gallery` 加 `on_status` 参数，3 处 callsite（链接流 / pixiv illust / nhentai 等）都传 `p.update`。
-- **`/stats system` 显示 R2 用量**：bucket 名、占用字节 + 容量百分比、对象数、LRU 90% 触发阈值、最旧/最新对象时间、上次扫描时间。读 `bot_data["r2_stats"]` 缓存毫秒级返回，不每次都重扫（list_all 80GB 量级要 ~200 次 API 调用 ~20 秒，吃 R2 Class A 免费额度）。
-- **后台 task 顺手填 stats 缓存**：原来的 `_r2_lru_loop` 每轮跑 `list_all` → 扫完聚合成 `R2StatsSnapshot` 塞 `bot_data["r2_stats"]` → 顺便复用结果做 LRU 清理（不再扫第 2 次）。开机 30 秒（原来 5 分钟）后跑首轮，admin 启动后立刻 `/stats system` 也能看到数据。
-- **`/stats r2_evict` admin 调试命令**：强制立刻跑一次 LRU 扫描 + 清理，方便手动验证 LRU 行为或紧急清缓存。低于 90% 阈值回"未触发清理"。
-- **README + DEPLOY.md 文档**：README 的功能列表新增 R2 一项；DEPLOY.md 加完整的「Cloudflare R2 / S3 兼容对象存储（可选）」一章——9 步走完含建 bucket、自定义域、API token、config.yaml 段、smoke test、容量管理、故障行为、老链接说明、计费提示。
+- **R2 单次发布体积护栏**：`storage.r2.max_upload_size_gb`（默认 1.0 GB）。一次发布总字节超过阈值时跳过 R2 走 nginx + 7 天 `cache_days`；完成消息追加"⚠️ 此 Telegra.ph 因体积过大未上传 R2... 最短 7 天 最长 30 天后图片可能失效"。设 0 关闭护栏（任意大小都上 R2）。
+- **管理员 `--r2` 强制标志**：admin 在以下入口可加 `--r2` / `--force-r2` 绕过护栏强制上 R2：
+  - 粘贴 eh/ex/nh/pixiv 链接的普通消息
+  - `/pixiv_telegraph <url> --r2`
+  - `/pixiv_direct <url> --r2`
+  - `/zip2tph` 文档 caption 或 reply 命令加 `--r2`
+  - `/ehsearch <关键词> --r2`（影响整个搜索会话内所有 [打开] 点击）
+  - 普通用户用 `--r2` 静默忽略，不暴露命令存在。
+- **`/zip2tph` 接通 R2**：原来 zip2tph 绕开 `publisher.publish_gallery` 自己手写 chunks + create_page 循环，**发布的 Telegra.ph 完全没经过 R2 路径**——7 天 cache_days 后必失效。本版改用 `publish_gallery`：自动接通 R2 上传、进度条、size guard、nginx fallback。代码减少。cache_dir 拷贝仍保留作 R2 失败/护栏跳过时的源（双份磁盘占用 7 天后清）。
+- **R2 上传进度可见**：publish 阶段 placeholder 消息显示"⏳ 上传 R2 (k/N)"，每完成一张 PUT 更新一次。原本 25 张图上传 5-10 秒对用户是黑洞。
+- **`/stats system` 显示 R2 用量**：bucket / 占用 / 容量百分比 / 对象数 / LRU 阈值 / 最旧+最新对象时间（UTC+8）/ 上次扫描时间。读 `bot_data["r2_stats"]` 缓存毫秒级返回，不每次都重扫。
+- **`/stats r2_evict`** admin 调试命令：立刻扫一次 R2 + 触发 LRU 清理，结果（清理摘要 + 当前用量）直接显示在同一条消息上。
 
 ### Internal
-- `lru_evict_to_target` 加 `objects` 可选参数复用调用方刚扫过的列表，避免 LRU loop 内一轮扫两次。
-- 新增 `R2StatsSnapshot` dataclass + `stats_from_objects(objects)` 聚合函数。
-- `upload_files_concurrent` 加 `on_progress(done, total)` 异步回调，每完成一个 PUT 触发一次（含失败的，反映总进度）。
-- `handlers.py` 把 `from ...storage.r2 import lru_evict_to_target` 提到 module 顶部，去掉函数内 import。
+- `GalleryImage` 加 `r2_key: str | None` 字段。调用方显式指定时 publisher 优先用；为空时仍按 `local_path.relative_to(cache_dir)` 推导。zip2tph 这种 cache_dir 外的图必须显式指定。
+- `PublishResult` 加 `r2_skipped_reason: str` 字段。非空时调用方应在完成消息后追加用户提示。`_r2_skipped_suffix(pub)` helper 统一生成。
+- `_Pending` / `_SearchState` 加 `force_r2: bool`，让按钮回调能跨越事件边界透传 admin --r2 标志。
+- 新增 `_parse_r2_flag(args, user_id, admin_users) -> (filtered_args, force)` helper，统一所有 cmd 入口的 flag 处理。
+- 后台 `_r2_lru_loop` 改造：每轮先 `list_all` → 聚合 `R2StatsSnapshot` 塞 `bot_data["r2_stats"]` → 用同一份 objects 喂给 `lru_evict_to_target(objects=...)`（避免扫两次）。开机 30 秒（原 5 分钟）后跑首轮。
+- `lru_evict_to_target` 加 `objects` 可选参数复用调用方刚扫过的列表。
+- 新增 `R2StatsSnapshot` dataclass + `stats_from_objects(objects)`。
+- `upload_files_concurrent` 加 `on_progress(done, total)` 异步回调（asyncio.Lock 保护 counter）。
+- R2 时间戳统一显示 UTC+8（`_fmt_utc8` helper）。
+- `/stats` help 列表加 `r2_evict` 子命令。
 
 ### Fixes
-- **`storage.r2.enabled: true` 启动崩溃**（`AttributeError: 'dict' object has no attribute 'enabled'`）。`Config._from_dict` 里 `StorageConfig(**...)` 把 yaml 解析出的 `r2:` 嵌套 dict 原样塞进 `r2` 字段，没构造成 `R2Config` 实例。v0.8.0 加 `R2Config` 时漏掉了嵌套构造逻辑（其他嵌套 dataclass 如 `collectors.ehentai` 都有显式 `EHentaiCollectorConfig(**...)`）。修复：拆开 `storage` 段处理，先 `pop('r2', None)` 单独 `R2Config(**r2_raw)` 再传给 `StorageConfig`。未启用 R2 的部署 0 影响。
+- **`storage.r2.enabled: true` 启动崩溃**（`AttributeError: 'dict' object has no attribute 'enabled'`）。`Config._from_dict` 里 `StorageConfig(**...)` 把 yaml 解析出的 `r2:` 嵌套 dict 原样塞进 `r2` 字段，没构造成 `R2Config` 实例。修复：拆开 `storage` 段处理，先 `pop('r2', None)` 单独 `R2Config(**r2_raw)` 再传给 `StorageConfig`。
+
+### 向后兼容
+- R2 仍是 opt-in。未启用时所有行为跟 v0.7.1 完全一致。
+- `--r2` 是新增 flag，老命令调用方式不变。
+- zip2tph 接 publish_gallery 后老用户感知不到差异，只是 telegra.ph 现在能持久化（前提是启用了 R2）。
+
+### 改动文件
+- `pixivfeed/config.py`（R2Config + StorageConfig 嵌套构造修复 + max_upload_size_gb）
+- `pixivfeed/storage/r2.py`（R2StatsSnapshot / stats_from_objects / upload progress / objects 复用）
+- `pixivfeed/storage/__init__.py`（re-export）
+- `pixivfeed/provider/__init__.py`（GalleryImage.r2_key）
+- `pixivfeed/publisher/telegraph.py`（_resolve_image_urls + force_r2 + r2_skipped_reason + size guard）
+- `pixivfeed/channel/telegram/bot.py`（_r2_lru_loop 改造）
+- `pixivfeed/channel/telegram/handlers.py`（force_r2 透传 + zip2tph 接通 + stats UX）
+- `config.example.yaml`、`README.md`、`docs/DEPLOY.md`
 
 
 ## v0.8.0 — 2026-05-15

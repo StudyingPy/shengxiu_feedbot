@@ -399,10 +399,16 @@ INFO  published e-hentai.org[gid/token] -> https://telegra.ph/...
 
 bot 内置 LRU 后台 task 每 `lru_check_interval_minutes` 分钟扫一次 R2，超过 `capacity_gb × 0.9` 触发清理，按 `LastModified` 升序删到 `capacity_gb × 0.7`。R2/S3 协议层不记 access_time，按上传时间近似（旧画廊基本没人翻，合理）。
 
+另一道护栏是**单次发布体积上限** `max_upload_size_gb`（默认 1.0 GB）。一次发布总字节超过此阈值时跳过 R2 走本地 nginx + 7 天 cache_days；Telegra.ph 完成消息会追加：
+
+> ⚠️ 此 Telegra.ph 因体积过大未上传 R2 持久化存储，最短 7 天 最长 30 天后图片可能失效。
+
+管理员可在命令上加 `--r2` 标志强制覆盖护栏（详见 README "管理命令"）。
+
 管理命令：
 
-- `/stats system` — 显示 R2 占用、对象数、最旧/最新对象时间、距上次扫描的分钟数。读后台 task 缓存的快照，毫秒级返回。
-- `/stats r2_evict` — admin 调试用，强制立刻跑一次 LRU 扫描+清理。低于 90% 阈值时会回"未触发清理"。
+- `/stats system` — 显示 R2 占用、对象数、最旧/最新对象时间（UTC+8）、距上次扫描的分钟数。读后台 task 缓存的快照，毫秒级返回。
+- `/stats r2_evict` — admin 调试用，立刻扫一次 R2 + 触发 LRU 清理，结果直接显示在同一条消息（含清理摘要 + 当前用量）。
 
 ### 7. R2 故障时的行为
 

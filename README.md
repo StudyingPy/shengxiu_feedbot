@@ -26,6 +26,7 @@ Bot 采用 Provider / Registry 架构，各数据源（Pixiv、e-hentai、ExHent
 - **归档下载**：`/archive` 命令将作品打包为 zip 发送。e-hentai / ExHentai 支持四种下载模式（网页显示图 / 网页原图 / 归档 1280x / 归档原图）。
 - **eh 关键词搜索**：`/ehsearch <关键词>` 搜索 e-hentai/ExHentai 画廊（自动优先用 ex cookie，失效回退 eh），结果以按钮形式列出，点 [打开] 直接发 Telegra.ph，再点 [归档下载] 可选择产出 zip。
 - **zip 转 Telegra.ph**：`/zip2tph` 命令将上传的图片 zip 包发布为 Telegra.ph 页面。
+- **管理员强制 R2 标志**：`/zip2tph`、`/ehsearch`、`/pixiv_telegraph`、`/pixiv_direct` 以及粘贴链接的消息支持 `--r2` 后缀（仅 admin），绕过 `storage.r2.max_upload_size_gb` 护栏强制把大体积发布上传到 R2。普通用户用 `--r2` 静默忽略。
 - **可选：R2 / S3 对象存储**：发布 Telegra.ph 时把图片上传到 Cloudflare R2（或任意 S3 兼容存储），用 R2 自定义域名喂给 Telegra.ph，让发布的页面不再依赖本地 cache_dir 的 7 天 TTL（解决"大画廊几天后部分图加载失败"）。默认关闭——本地缓存 + Nginx 反代仍是一等公民。详见 `config.example.yaml` 中 `storage.r2` 段。
 
 ## 快速开始
