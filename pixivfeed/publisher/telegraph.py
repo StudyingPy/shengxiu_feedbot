@@ -34,8 +34,13 @@ from telegraph.utils import html_to_nodes
 
 from ..config import Config
 from ..provider import GalleryWork, ProgressHook, StatusUpdater
-from ..storage import R2Client, upload_files_concurrent
+from ..storage import R2Client
 from ..utils import logger
+from ._resolver import (
+    FallbackReason as _ResolverFallbackReason,
+    ResolveItem,
+    resolve_image_urls,
+)
 
 NodeTree = list[Any]
 
@@ -44,18 +49,37 @@ NodeTree = list[Any]
 class PublishResult:
     """发布结果。多页作品 urls 含全部页面链接，第一页是入口。
 
-    r2_skipped_reason 非空时表示 R2 上传被护栏跳过，调用方应该在完成消息后
-    追加提示（"此 Telegra.ph 因体积过大未上传 R2..."）。
+    durability 字段（PR-2 引入）：调用方据此决定 cache.put 时 durable 标志，
+    以及完成消息是否追加风险提示。
+
+    durable 三段式判定（在 publish_gallery 内统一计算）：
+      1) image_count == 0 → durable=True（text-only 页，无可烂的图）
+      2) R2 启用 + r2_image_count == image_count → durable=True
+      3) 其它（R2 未启用 / 部分 fallback / 整批失败 / 文件缺失） → durable=False
     """
 
     urls: list[str]
     page_count: int
-    image_count: int
-    r2_skipped_reason: str = ""    # "" 表示走了 R2 或 R2 未启用；非空表示护栏跳过
+    image_count: int                   # 运行时字段；不落库（avoid 三者不一致）
+    r2_image_count: int = 0            # 成功上传到 R2 的图数
+    fallback_image_count: int = 0      # 走 nginx fallback 的图数
+    fallback_reason: str = ""          # 见 FallbackReason 枚举
 
     @property
     def primary_url(self) -> str:
         return self.urls[0]
+
+    @property
+    def durable(self) -> bool:
+        """三段式判定。调用方写 cache.put 时直接用这个 bool。"""
+        if self.image_count == 0:
+            return True
+        return self.fallback_image_count == 0 and self.r2_image_count == self.image_count
+
+
+# Re-export，让 handlers / novel_publisher 可以从 publisher.telegraph 拿到稳定 API。
+# 实际枚举定义在 publisher._resolver。
+FallbackReason = _ResolverFallbackReason
 
 
 def render_template(template: str, vars: dict[str, Any]) -> str:
@@ -115,6 +139,14 @@ class TelegraphPublisher:
     def tg(self) -> Telegraph:
         return self._tg
 
+    @property
+    def r2_client(self) -> R2Client | None:
+        """暴露给 novel publisher 等同包内 caller 复用同一份 R2Client。
+
+        publisher 内部仍用 self._r2；这个 property 只是让外部不写 _r2 私名。
+        """
+        return self._r2
+
     # ------------------------------------------------------------------
     # 通用图集发布
     # ------------------------------------------------------------------
@@ -153,7 +185,7 @@ class TelegraphPublisher:
         if len(title_str) > 256:
             title_str = title_str[:253] + "..."
 
-        urls, r2_skipped_reason = await self._resolve_image_urls(
+        urls, ok_count, fallback_count, fallback_reason = await self._resolve_image_urls(
             work, on_status=on_status, force_r2=force_r2,
         )
         if not urls:
@@ -180,7 +212,8 @@ class TelegraphPublisher:
             await _emit(1, 1)
             return PublishResult(
                 urls=[page_url], page_count=1, image_count=len(urls),
-                r2_skipped_reason=r2_skipped_reason,
+                r2_image_count=ok_count, fallback_image_count=fallback_count,
+                fallback_reason=fallback_reason,
             )
 
         # 多页：从最后一页往前发布，每页知道下一页 URL
@@ -210,117 +243,56 @@ class TelegraphPublisher:
         )
         return PublishResult(
             urls=page_urls, page_count=total_chunks, image_count=len(urls),
-            r2_skipped_reason=r2_skipped_reason,
+            r2_image_count=ok_count, fallback_image_count=fallback_count,
+            fallback_reason=fallback_reason,
         )
 
     async def _resolve_image_urls(
         self, work: GalleryWork, *, on_status: StatusUpdater = None,
         force_r2: bool = False,
-    ) -> tuple[list[str], str]:
+    ) -> tuple[list[str], int, int, str]:
         """决定喂给 telegra.ph 的 <img src> URLs。
 
-        返回 (urls, r2_skipped_reason)。r2_skipped_reason 非空时表示 R2 被
-        护栏跳过，调用方应在完成消息后追加提示。
-
-        - R2 启用且 client 注入了 + 未被护栏跳过：并发把 local_path 上传到 R2，
-          用 R2 公开 URL
-        - R2 未启用 / 上传失败 / 被护栏跳过：fallback 到 img.public_url（nginx）
-
-        护栏规则：
-          - storage.r2.max_upload_size_gb > 0 且本次发布 sum(local_path size)
-            超过阈值 → 跳过 R2，r2_skipped_reason 设为说明文本
-          - force_r2=True 时绕过护栏（admin --r2 flag）
-
-        失败策略：单图失败 → 该图回 nginx URL；整图集失败 → 全回 nginx，
-        发布仍能继续；这是关键的"R2 故障不阻塞发布"语义。
-
-        on_status 用于在 R2 上传进度上 emit 状态文本（每完成一张 PUT）。
+        gallery 专属的事：构造 ResolveItem（推导 r2_key、fallback_url），其它
+        共享逻辑（R2 启用判断、size guard、批量上传、reason 计算）走
+        publisher._resolver.resolve_image_urls。
         """
-        if self._r2 is None or not self.config.storage.r2.enabled:
-            return ([img.public_url for img in work.images], "")
-
-        # 计算本次发布总字节，判断护栏
-        total_bytes = 0
-        for img in work.images:
-            try:
-                total_bytes += img.local_path.stat().st_size
-            except OSError:
-                pass
-        max_gb = self.config.storage.r2.max_upload_size_gb
-        if not force_r2 and max_gb > 0 and total_bytes > max_gb * 1024 ** 3:
-            reason = (
-                f"本次发布总体积 {total_bytes / 1024**3:.2f} GB 超过 "
-                f"max_upload_size_gb={max_gb} 阈值，未上传 R2"
-            )
-            logger.info(
-                f"R2 size guard skipped for {work.provider}/{work.work_id}: {reason}"
-            )
-            return ([img.public_url for img in work.images], reason)
-
         cache_dir = Path(self.config.storage.cache_dir).resolve()
-        items: list[tuple[str, Path]] = []      # (r2_key, local_path)
-        fallback_urls: list[str] = [img.public_url for img in work.images]
-        keys_per_image: list[str | None] = [None] * len(work.images)
-
-        for idx, img in enumerate(work.images):
-            # 优先用 GalleryImage 显式指定的 r2_key（zip2tph 这种 tmpdir 路径需要）
+        items: list[ResolveItem] = []
+        for img in work.images:
+            # 推导 r2_key：优先用 GalleryImage 显式指定（zip2tph tmpdir 路径需要）
             if img.r2_key:
                 key = img.r2_key
             else:
-                # 没显式指定 → 尝试 local_path 相对 cache_dir 推导
                 try:
                     rel = img.local_path.resolve().relative_to(cache_dir)
+                    key = rel.as_posix()
                 except (ValueError, AttributeError):
-                    # 不在 cache_dir 下且没显式 key → 跳过 R2 走 nginx fallback
-                    continue
-                key = rel.as_posix()
-            keys_per_image[idx] = key
-            items.append((key, img.local_path))
+                    # 不在 cache_dir 下且没显式 key → 用 fallback URL 跳过 R2
+                    # 留空字符串当 r2_key 触发 helper 的 "上传失败"路径（不会真的上传，
+                    # 但这种情况其实应在 caller 显式 set r2_key——保险起见走 fallback）
+                    key = ""
+            items.append(ResolveItem(
+                r2_key=key,
+                local_path=img.local_path,
+                fallback_url=img.public_url,
+            ))
 
-        if not items:
-            return (fallback_urls, "")
-
-        if on_status is not None:
-            try:
-                await on_status(f"⏳ 上传 R2 (0/{len(items)})")
-            except Exception:
-                logger.exception("on_status raised; suppressed")
-
-        async def _r2_progress(done: int, total: int) -> None:
-            if on_status is None:
-                return
-            try:
-                await on_status(f"⏳ 上传 R2 ({done}/{total})")
-            except Exception:
-                logger.exception("on_status raised; suppressed")
-
-        try:
-            results = await upload_files_concurrent(
-                self._r2, items, concurrency=8, on_progress=_r2_progress,
-            )
-        except Exception as e:
-            logger.warning(
-                f"R2 batch upload raised for {work.provider}/{work.work_id}: {e}; "
-                "falling back to nginx URLs for entire gallery"
-            )
-            return (fallback_urls, "")
-
-        # 合成最终 URL：上传成功 → R2 URL；失败 → fallback
-        urls: list[str] = []
-        ok_count = 0
-        for idx, img in enumerate(work.images):
-            key = keys_per_image[idx]
-            if key is not None and results.get(key, False):
-                urls.append(self._r2.public_url(key))
-                ok_count += 1
-            else:
-                urls.append(img.public_url)
-        logger.info(
-            f"R2 upload for {work.provider}[{work.work_id}]: "
-            f"{ok_count}/{len(work.images)} succeeded "
-            f"({len(work.images) - ok_count} fell back to nginx)"
+        size_guard_bytes = int(self.config.storage.r2.max_upload_size_gb * 1024 ** 3)
+        result = await resolve_image_urls(
+            self._r2,
+            items,
+            r2_enabled=self.config.storage.r2.enabled,
+            force_r2=force_r2,
+            size_guard_bytes=size_guard_bytes,
+            on_status=on_status,
         )
-        return (urls, "")
+        return (
+            result.urls,
+            result.r2_ok_count,
+            result.fallback_count,
+            result.fallback_reason,
+        )
 
     @staticmethod
     def _build_content(

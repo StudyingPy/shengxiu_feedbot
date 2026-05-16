@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+from collections import deque
 import re
 import shutil
 import tempfile
@@ -81,7 +82,7 @@ from ...storage import (
     AllowList,
     TelegraphCache,
 )
-from ...storage.r2 import R2StatsSnapshot, lru_evict_to_target, stats_from_objects
+from ...storage.r2 import R2ListIncomplete, R2StatsSnapshot, lru_evict_to_target, stats_from_objects
 from ...utils import logger
 from .auth import is_authorized
 from .constants import (
@@ -135,17 +136,51 @@ def _parse_r2_flag(
     return (filtered, force)
 
 
-def _r2_skipped_suffix(pub) -> str:
-    """publish_gallery 返回的 PublishResult.r2_skipped_reason 非空时给消息追加。
+def _r2_skipped_suffix(pub, *, r2_enabled: bool) -> str:
+    """根据 PublishResult.fallback_reason 给完成消息追加风险提示。
 
-    用户友好版（不带技术 reason，只说后果）："""
-    if not getattr(pub, "r2_skipped_reason", ""):
+    关键约束（reviewer 拍板）：
+    - **R2 未启用时一律不弹提示**，避免默认部署用户每次发布都看到吓人警告。
+    - 全 R2 成功（reason="" 或 NONE）也不弹提示。
+    - 其它 reason 在 R2 启用下展示对应风险文案。
+
+    fallback_reason 枚举见 publisher.telegraph.FallbackReason。
+    """
+    if not r2_enabled:
         return ""
-    return (
-        "\n\n⚠️ 此 Telegra.ph 因体积过大未上传 R2 持久化存储，"
-        "最短 7 天 最长 30 天后图片可能失效。\n"
-        "如需保留请管理员加 <code>--r2</code> 参数重新发布。"
-    )
+    reason = getattr(pub, "fallback_reason", "") or ""
+    if not reason:
+        return ""
+    # 各 reason 对应的用户提示
+    if reason == "r2_disabled":
+        # 逻辑上 R2 enabled=True 不该出现此 reason；防御性留空
+        return ""
+    if reason == "size_guard_skipped":
+        return (
+            "\n\n⚠️ 此 Telegra.ph 因体积过大跳过 R2 持久化存储，"
+            "最短 7 天后图片可能失效。\n"
+            "如需保留请管理员加 <code>--r2</code> 参数重新发布。"
+        )
+    if reason == "r2_batch_failed":
+        return (
+            "\n\n⚠️ R2 上传失败，本次未持久化，图片可能在 7 天后失效。\n"
+            "稍后可加 <code>--r2</code> 重新发布以触发重试。"
+        )
+    if reason == "r2_partial":
+        fb = getattr(pub, "fallback_image_count", 0)
+        total = getattr(pub, "image_count", 0)
+        return (
+            f"\n\n⚠️ 部分图片（{fb}/{total}）未上传 R2，仍依赖本地缓存，"
+            "可能在 7 天后失效。\n"
+            "如需修复请管理员加 <code>--r2</code> 重新发布。"
+        )
+    if reason == "local_file_missing":
+        return (
+            "\n\n⚠️ 部分本地文件缺失，已使用 fallback URL。"
+            "如希望修复请管理员加 <code>--r2</code> 重新发布。"
+        )
+    # 未知 reason → 保守不弹提示（避免出错文案吓到用户）
+    return ""
 
 
 def _job_queue(context: ContextTypes.DEFAULT_TYPE) -> JobQueueManager:
@@ -154,6 +189,78 @@ def _job_queue(context: ContextTypes.DEFAULT_TYPE) -> JobQueueManager:
 
 def _usage_store(context: ContextTypes.DEFAULT_TYPE):
     return context.bot_data.get("usage_store")
+
+
+def _effective_force_r2(
+    context: ContextTypes.DEFAULT_TYPE, force_r2: bool,
+) -> bool:
+    """force_r2 真正生效的条件：admin 传了 flag **且** R2 已启用 + client 已注入。
+
+    R2 未启用时所有缓存行都不可能 durable（fallback_reason=r2_disabled），如果还
+    把 force_r2 当真，每次 admin --r2 都会绕过 cache 重发，但产物依旧是非 durable，
+    形成空转。所以未启用 R2 时 force_r2 在 cache gate 上视为 False。
+
+    注意：publish_gallery 内部的 force_r2 仍照常传（让它跳过 size_guard），但
+    cache 命中分支只看 _effective_force_r2 的结果。
+    """
+    if not force_r2:
+        return False
+    config: Config = context.bot_data.get("config")
+    if config is None or not config.storage.r2.enabled:
+        return False
+    if context.bot_data.get("r2_client") is None:
+        return False
+    return True
+
+
+def _record_r2_scan_failure(context: ContextTypes.DEFAULT_TYPE, exc) -> None:
+    """把 R2ListIncomplete 写进 bot_data["r2_stats_meta"]——与 bot.py 的后台 LRU
+    loop 共享同一份 meta dict，让 /stats system 一致看到 stale 标记 + 24h 失败计数。
+
+    /stats r2_evict 与后台 loop 都调这个，避免分别维护两套状态漂移。
+    """
+    meta = context.bot_data.get("r2_stats_meta")
+    if meta is None:
+        # 后台 loop 还没初始化（开机 30s 内手工触发）→ 退化为新建 meta
+        meta = {
+            "last_scan_failed_at": None,
+            "last_scan_failed_cause": None,
+            "last_scan_success_at": None,
+            "stale": False,
+            "failures_deque": deque(),
+        }
+        context.bot_data["r2_stats_meta"] = meta
+    now = _dt.datetime.now(tz=_dt.timezone.utc)
+    dq = meta.get("failures_deque")
+    if dq is None:
+        dq = deque()
+        meta["failures_deque"] = dq
+    # 写入侧裁掉 >24h 的，避免长期不重启时 deque 无界增长
+    cutoff = now.timestamp() - 86400
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    dq.append(now.timestamp())
+    meta["last_scan_failed_at"] = now
+    cause = getattr(exc, "cause", str(exc))
+    meta["last_scan_failed_cause"] = str(cause)[:200]
+    meta["stale"] = True
+
+
+def _record_r2_scan_success(
+    context: ContextTypes.DEFAULT_TYPE, scanned_at,
+) -> None:
+    """扫描成功后清掉 stale 标记 + 写 last_scan_success_at。
+
+    手动 /stats r2_evict 和后台 LRU loop 都应当调此 helper，否则会出现"后台失败 →
+    手动成功 → /stats 仍显示 stale"的视觉漂移。
+    """
+    meta = context.bot_data.get("r2_stats_meta")
+    if meta is None:
+        meta = {"failures_deque": deque()}
+        context.bot_data["r2_stats_meta"] = meta
+    meta["last_scan_success_at"] = scanned_at
+    meta["stale"] = False
+    # 不清 last_scan_failed_at——保留作历史诊断；stale=False 已足够让 /stats 不警告
 
 
 async def _track_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -580,7 +687,9 @@ async def _handle_ref(
         user_id = update.effective_user.id if update.effective_user else 0
 
         async def _do_novel() -> None:
-            await _send_pixiv_novel(update, context, ref.id, placeholder=placeholder)
+            await _send_pixiv_novel(
+                update, context, ref.id, placeholder=placeholder, force_r2=force_r2,
+            )
 
         await _enqueue(
             context,
@@ -799,16 +908,30 @@ async def _eh_run_with_mode(
 
     cache_kind = f"{ref.provider}/gallery/{mode.value}"
     cached = await tg_cache.get(cache_kind, ref.id)
-    if cached:
-        if placeholder:
-            await placeholder.edit_text(
-                cached, disable_web_page_preview=False, reply_markup=extras_markup,
+    if cached is not None:
+        # PR-2 durability gate：force_r2 admin 在非 durable 行视为 miss 重发；
+        # 普通用户命中任何状态都返回 URL，保留旧体验。
+        # R2 未启用时 force_r2 不绕过 cache（避免空转重发产出仍非 durable）。
+        eff_force = _effective_force_r2(context, force_r2)
+        if eff_force and not cached.durable:
+            logger.info(
+                f"force_r2: cache hit for {cache_kind}[{ref.id}] but durable=False "
+                f"(reason={cached.fallback_reason or 'legacy'}); treating as miss"
             )
+            # 落到下面的重发分支
         else:
-            msg = update_or_query.effective_message if hasattr(update_or_query, "effective_message") else None
-            if msg:
-                await msg.reply_text(cached, reply_markup=extras_markup)
-        return
+            reply = cached.url
+            if eff_force and cached.durable:
+                reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
+            if placeholder:
+                await placeholder.edit_text(
+                    reply, disable_web_page_preview=False, reply_markup=extras_markup,
+                )
+            else:
+                msg = update_or_query.effective_message if hasattr(update_or_query, "effective_message") else None
+                if msg:
+                    await msg.reply_text(reply, reply_markup=extras_markup)
+            return
 
     if placeholder is None:
         msg = update_or_query.effective_message
@@ -843,9 +966,14 @@ async def _eh_run_with_mode(
             ref, _gallery_meta, provider = fallback
             cache_kind = f"{ref.provider}/gallery/{mode.value}"
             cached = await tg_cache.get(cache_kind, ref.id)
-            if cached:
+            eff_force = _effective_force_r2(context, force_r2)
+            if cached is not None and not (eff_force and not cached.durable):
+                # 同主入口的 durability gate：force_r2 在非 durable 行 fall-through 重发
+                reply = cached.url
+                if eff_force and cached.durable:
+                    reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
                 await placeholder.edit_text(
-                    cached, disable_web_page_preview=False, reply_markup=extras_markup,
+                    reply, disable_web_page_preview=False, reply_markup=extras_markup,
                 )
                 return
             try:
@@ -907,12 +1035,20 @@ async def _eh_run_with_mode(
         )
         return
 
-    await tg_cache.put(cache_kind, ref.id, pub.primary_url, pub.page_count)
+    await tg_cache.put(
+        cache_kind, ref.id, pub.primary_url,
+        page_count=pub.page_count,
+        durable=pub.durable,
+        r2_image_count=pub.r2_image_count,
+        fallback_image_count=pub.fallback_image_count,
+        fallback_reason=pub.fallback_reason,
+    )
+    suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
     await placeholder.edit_text(
-        pub.primary_url + _r2_skipped_suffix(pub),
+        pub.primary_url + suffix,
         disable_web_page_preview=False,
         reply_markup=extras_markup,
-        parse_mode=ParseMode.HTML if _r2_skipped_suffix(pub) else None,
+        parse_mode=ParseMode.HTML if suffix else None,
     )
     # 用量：消息流走 telegraph 发布。bytes_in 估为图片合计，bytes_out 为 0（没回发文件）。
     total_bytes = 0
@@ -1290,11 +1426,15 @@ async def _send_via_telegraph_generic(
 
     cache_kind = f"{ref.provider}/{ref.kind}"
     cached = await tg_cache.get(cache_kind, ref.id)
-    if cached:
+    eff_force = _effective_force_r2(context, force_r2)
+    if cached is not None and not (eff_force and not cached.durable):
+        reply = cached.url
+        if eff_force and cached.durable:
+            reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
         if placeholder is not None:
-            await placeholder.edit_text(cached)
+            await placeholder.edit_text(reply)
         else:
-            await update.message.reply_text(cached)
+            await update.message.reply_text(reply)
         return
 
     if placeholder is None:
@@ -1344,8 +1484,15 @@ async def _send_via_telegraph_generic(
         )
         return
 
-    await tg_cache.put(cache_kind, ref.id, pub.primary_url, pub.page_count)
-    suffix = _r2_skipped_suffix(pub)
+    await tg_cache.put(
+        cache_kind, ref.id, pub.primary_url,
+        page_count=pub.page_count,
+        durable=pub.durable,
+        r2_image_count=pub.r2_image_count,
+        fallback_image_count=pub.fallback_image_count,
+        fallback_reason=pub.fallback_reason,
+    )
+    suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
     await placeholder.edit_text(
         pub.primary_url + suffix,
         parse_mode=ParseMode.HTML if suffix else None,
@@ -1388,11 +1535,15 @@ async def _send_pixiv_illust_via_telegraph(
     assert pixiv is not None
 
     cached = await tg_cache.get("pixiv/illust", pid)
-    if cached:
+    eff_force = _effective_force_r2(context, force_r2)
+    if cached is not None and not (eff_force and not cached.durable):
+        reply = cached.url
+        if eff_force and cached.durable:
+            reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
         if placeholder is not None:
-            await placeholder.edit_text(cached)
+            await placeholder.edit_text(reply)
         else:
-            await update.message.reply_text(cached)
+            await update.message.reply_text(reply)
         return
 
     if placeholder is None:
@@ -1441,8 +1592,15 @@ async def _send_pixiv_illust_via_telegraph(
         )
         return
 
-    await tg_cache.put("pixiv/illust", pid, pub.primary_url, pub.page_count)
-    suffix = _r2_skipped_suffix(pub)
+    await tg_cache.put(
+        "pixiv/illust", pid, pub.primary_url,
+        page_count=pub.page_count,
+        durable=pub.durable,
+        r2_image_count=pub.r2_image_count,
+        fallback_image_count=pub.fallback_image_count,
+        fallback_reason=pub.fallback_reason,
+    )
+    suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
     await placeholder.edit_text(
         pub.primary_url + suffix,
         parse_mode=ParseMode.HTML if suffix else None,
@@ -1462,6 +1620,8 @@ async def _send_pixiv_illust_via_telegraph(
 async def _send_pixiv_novel(
     update: Update, context: ContextTypes.DEFAULT_TYPE, nid: str,
     placeholder=None,
+    *,
+    force_r2: bool = False,
 ) -> None:
     config, registry, publisher, tg_cache, _ = _ctx(context)
     pixiv = _pixiv_provider(registry)
@@ -1469,11 +1629,16 @@ async def _send_pixiv_novel(
         return
 
     cached = await tg_cache.get("pixiv/novel", nid)
-    if cached:
+    eff_force = _effective_force_r2(context, force_r2)
+    if cached is not None and not (eff_force and not cached.durable):
+        # 同主入口的 durability gate：force_r2 在非 durable 行 fall-through 重发
+        reply = cached.url
+        if eff_force and cached.durable:
+            reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
         if placeholder is not None:
-            await placeholder.edit_text(cached)
+            await placeholder.edit_text(reply)
         else:
-            await update.message.reply_text(cached)
+            await update.message.reply_text(reply)
         return
 
     if placeholder is None:
@@ -1482,7 +1647,9 @@ async def _send_pixiv_novel(
     # novel 流程包含创建多页 telegraph，半路取消会留半成品。整段不可取消。
     await _drop_cancel_button(placeholder)
     try:
-        novel, pub = await publish_novel(config, publisher, pixiv, nid, progress=progress)
+        novel, pub = await publish_novel(
+            config, publisher, pixiv, nid, progress=progress, force_r2=force_r2,
+        )
     except PixivNotFoundError:
         await placeholder.edit_text(f"⚠️ 小说 {nid} 不存在或已删除")
         await _log_usage(context, update, kind=KIND_PIXIV_NOVEL, provider="pixiv",
@@ -1505,8 +1672,20 @@ async def _send_pixiv_novel(
                          ref_id=nid, status="failed")
         return
 
-    await tg_cache.put("pixiv/novel", nid, pub.primary_url, pub.page_count)
-    await placeholder.edit_text(pub.primary_url)
+    # PR-3 接通后 novel publisher 也走共享 resolver，cache 行带真实 durability 元数据
+    await tg_cache.put(
+        "pixiv/novel", nid, pub.primary_url,
+        page_count=pub.page_count,
+        durable=pub.durable,
+        r2_image_count=pub.r2_image_count,
+        fallback_image_count=pub.fallback_image_count,
+        fallback_reason=pub.fallback_reason,
+    )
+    suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
+    await placeholder.edit_text(
+        pub.primary_url + suffix,
+        parse_mode=ParseMode.HTML if suffix else None,
+    )
     await _log_usage(context, update, kind=KIND_PIXIV_NOVEL, provider="pixiv",
                      ref_id=nid)
 
@@ -1950,7 +2129,7 @@ async def _process_zip_to_telegraph(
             )
             return
 
-        suffix = _r2_skipped_suffix(pub)
+        suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
         if suffix:
             # progress.finish 直接 edit_text 不支持 parse_mode；用 placeholder 兜底
             await placeholder.edit_text(
@@ -3590,13 +3769,27 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             cap_bytes = r2_cfg.capacity_gb * 1024 ** 3
             high_at = int(cap_bytes * 0.9)
             stats = context.bot_data.get("r2_stats")
+            meta = context.bot_data.get("r2_stats_meta") or {}
+            stale = bool(meta.get("stale"))
+            failures_dq = meta.get("failures_deque")
+            failures_24h = 0
+            if failures_dq is not None:
+                # 读侧也裁一刀，避免显示陈旧 24h 窗口外的失败
+                now_ts = time.time()
+                cutoff = now_ts - 86400
+                while failures_dq and failures_dq[0] < cutoff:
+                    failures_dq.popleft()
+                failures_24h = len(failures_dq)
             if stats is None:
                 lines.extend([
                     "",
                     f"R2 bucket：{r2_cfg.bucket}（启用，但首次扫描尚未完成）",
+                    f"R2 prefix：{r2_cfg.prefix or '(整 bucket)'}",
                     f"配置容量：{r2_cfg.capacity_gb} GB",
                     f"扫描间隔：{r2_cfg.lru_check_interval_minutes} 分钟",
                 ])
+                if failures_24h:
+                    lines.append(f"扫描失败次数（rolling 24h, since process start）：{failures_24h}")
             else:
                 pct = (stats.total_bytes / cap_bytes * 100) if cap_bytes > 0 else 0
                 age_min = (
@@ -3605,6 +3798,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 lines.extend([
                     "",
                     f"R2 bucket：{r2_cfg.bucket}",
+                    f"R2 prefix：{r2_cfg.prefix or '(整 bucket)'}",
                     f"R2 占用：{fmt_bytes(stats.total_bytes)} / {r2_cfg.capacity_gb} GB ({pct:.1f}%)",
                     f"R2 对象数：{stats.object_count:,}",
                     f"LRU 触发阈值：{fmt_bytes(high_at)}（90%，清到 70%）",
@@ -3614,11 +3808,42 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         f"最旧对象：{_fmt_utc8(stats.oldest_at)}（UTC+8）",
                         f"最新对象：{_fmt_utc8(stats.newest_at)}（UTC+8）",
                     ])
-                lines.append(f"<i>数据扫描于 {age_min} 分钟前</i>")
+                if stale:
+                    fail_cause = meta.get("last_scan_failed_cause") or "unknown"
+                    lines.append(
+                        f"<i>⚠️ 上次扫描失败，数据 stale（{age_min} 分钟前）。原因：{fail_cause}</i>"
+                    )
+                else:
+                    lines.append(f"<i>数据扫描于 {age_min} 分钟前</i>")
+                if failures_24h:
+                    lines.append(
+                        f"<i>扫描失败次数（rolling 24h, since process start）：{failures_24h}</i>"
+                    )
         elif r2_cfg.enabled and r2_client is None:
             lines.extend(["", "⚠️ R2 已配置 enabled=true 但 client 未初始化"])
         else:
             lines.extend(["", "R2：未启用（storage.r2.enabled=false）"])
+
+        # Telegraph cache durability 渗透率（PR-2 引入；监测修复是否真的起作用）
+        tg_cache = context.bot_data.get("telegraph_cache")
+        if tg_cache is not None:
+            try:
+                cs = await tg_cache.stats()
+            except Exception:
+                logger.exception("/stats system: tg_cache.stats() failed; skipping")
+                cs = None
+            if cs is not None and cs.total > 0:
+                lines.extend([
+                    "",
+                    f"Telegraph cache：总 {cs.total:,} 条 / "
+                    f"durable {cs.durable:,} / legacy {cs.legacy:,}",
+                ])
+                if cs.fallback_breakdown:
+                    parts = ", ".join(
+                        f"{r or '(empty)'}={c}"
+                        for r, c in sorted(cs.fallback_breakdown.items())
+                    )
+                    lines.append(f"fallback_reason 分布：{parts}")
 
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
         return
@@ -3643,6 +3868,19 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         placeholder = await update.message.reply_text("⏳ 扫描 R2 bucket...")
         try:
             objects = await r2_client.list_all()
+        except R2ListIncomplete as e:
+            logger.warning(
+                f"/stats r2_evict: list_all incomplete after {e.scanned_pages} page(s); "
+                f"refusing to evict on partial data. cause={e.cause}"
+            )
+            # 与后台 LRU loop 一致：失败也要计入 24h rolling deque + 写 stale meta，
+            # 否则 admin 手动触发的失败会让 /stats system 显示"无失败"误导排查。
+            _record_r2_scan_failure(context, e)
+            await placeholder.edit_text(
+                f"⚠️ R2 扫描不完整（共扫到 {e.scanned_pages} 页就中断），本次拒绝在部分数据上跑 LRU。\n"
+                f"原因：{str(e.cause)[:200]}"
+            )
+            return
         except Exception as e:
             logger.exception("/stats r2_evict: list_all failed")
             await placeholder.edit_text(f"⚠️ R2 扫描失败：{e}")
@@ -3651,6 +3889,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         snapshot_before = stats_from_objects(objects)
         # 即使没触发清理也刷新缓存——这是用户 explicit 触发的最新数据
         context.bot_data["r2_stats"] = snapshot_before
+        # 同步清掉 stale meta：扫描成功了就别让 /stats system 继续显示 stale。
+        _record_r2_scan_success(context, snapshot_before.scanned_at)
 
         await placeholder.edit_text(
             f"⏳ 扫描完成（{snapshot_before.object_count:,} 对象，"

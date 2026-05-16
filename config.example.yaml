@@ -117,6 +117,11 @@ storage:
     # CF 控制台 → bucket → Settings → Public access → Connect Domain → 填你的子域名后会自动签证。
     # 形如 https://r2.your-domain.com（不要带尾斜杠）。
     custom_domain: ""
+    # bucket 内的统一前缀，强烈建议设置（尤其是 bucket 与其他服务共用时）。
+    # 配置后所有 upload/list/delete/LRU 都局限在这个前缀下，避免误删其他对象。
+    # 留空时 bot 启动会 warn 一次；list_all/LRU 会扫整 bucket。
+    # 形如 "pixivfeed/" 或 "staging-bot/"；首尾斜杠自动规范化。
+    prefix: ""
     # bot 自动 LRU 清理阈值（GB）。R2 占用超过 capacity_gb × 0.9 时触发清理，
     # 删除最旧上传的文件直到降到 capacity_gb × 0.7。设 0 关闭自动清理。
     capacity_gb: 80

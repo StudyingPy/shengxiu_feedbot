@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
+from collections import deque
 from pathlib import Path
 
 from telegram import (
@@ -26,7 +28,7 @@ from ...provider import ProviderRegistry
 from ...provider.ehentai import EHTagDB
 from ...publisher import TelegraphPublisher
 from ...storage import AllowList, Database, R2Client, RuntimeSettings, TelegraphCache, UsageStore
-from ...storage.r2 import R2StatsSnapshot, lru_evict_to_target, stats_from_objects
+from ...storage.r2 import R2ListIncomplete, R2StatsSnapshot, lru_evict_to_target, stats_from_objects
 from ...utils import logger
 from .auth import cmd_allow, cmd_chatid, cmd_deny, cmd_listallow
 from .handlers import (
@@ -249,44 +251,81 @@ async def _r2_lru_loop(app: Application, r2_client: R2Client, config: Config) ->
 
     用量超过 capacity_gb × 0.9 触发清理，清到 capacity_gb × 0.7（清理时复用
     刚才 list_all 的结果，不再扫第 2 次）。
+
+    扫描失败处理（R2ListIncomplete）：**不刷新** bot_data["r2_stats"]（沿用旧 snapshot），
+    **跳过本轮 evict**。原因：部分扫描结果做 LRU 决策会误删被截断那部分的 hot key。
+    `/stats system` 通过 bot_data["r2_stats_meta"] 显示 staleness。
     """
     r2_cfg = config.storage.r2
     interval = max(60, r2_cfg.lru_check_interval_minutes * 60)
     cap_bytes = r2_cfg.capacity_gb * 1024 ** 3
     high = int(cap_bytes * 0.9)
     low = int(cap_bytes * 0.7)
+    # rolling 24h 失败计数：deque[float] of unix timestamps，写读两端都裁剪 >24h 的项
+    failures: deque[float] = deque()
+    app.bot_data["r2_stats_meta"] = {
+        "last_scan_failed_at": None,
+        "last_scan_failed_cause": None,
+        "last_scan_success_at": None,
+        "stale": False,
+        "failures_deque": failures,
+    }
     # 开机 30 秒稳定期——bot 起来用户立刻 /stats 也能看到数据
     await asyncio.sleep(30)
     while True:
         try:
-            objects = await r2_client.list_all()
-            snapshot = stats_from_objects(objects)
-            app.bot_data["r2_stats"] = snapshot
-            logger.info(
-                f"R2 stats: {snapshot.object_count} objects, "
-                f"{snapshot.total_bytes / 1_000_000_000:.2f} GB / {r2_cfg.capacity_gb} GB"
-            )
-            # 顺便看是否要清。lru_evict_to_target 接受预扫好的 objects 复用
-            removed, freed = await lru_evict_to_target(
-                r2_client,
-                high_watermark_bytes=high, low_watermark_bytes=low,
-                objects=objects,
-            )
-            if removed > 0:
-                logger.success(
-                    f"R2 LRU: evicted {removed} objects, freed {freed / 1_000_000_000:.2f} GB"
+            try:
+                objects = await r2_client.list_all()
+            except R2ListIncomplete as e:
+                now = _dt.datetime.now(tz=_dt.timezone.utc)
+                _trim_24h(failures, now.timestamp())
+                failures.append(now.timestamp())
+                meta = app.bot_data["r2_stats_meta"]
+                meta["last_scan_failed_at"] = now
+                meta["last_scan_failed_cause"] = str(e.cause)[:200]
+                meta["stale"] = True
+                logger.warning(
+                    f"R2 list_all incomplete after {e.scanned_pages} page(s); "
+                    f"skipping evict, keeping prior snapshot. cause={e.cause}"
                 )
-                # 删完了 stats 已经过时，顺手 patch 一下避免下次 /stats 看到错的
-                app.bot_data["r2_stats"] = R2StatsSnapshot(
-                    scanned_at=snapshot.scanned_at,
-                    total_bytes=snapshot.total_bytes - freed,
-                    object_count=snapshot.object_count - removed,
-                    oldest_at=snapshot.oldest_at,    # 不精确但够用
-                    newest_at=snapshot.newest_at,
+            else:
+                snapshot = stats_from_objects(objects)
+                app.bot_data["r2_stats"] = snapshot
+                meta = app.bot_data["r2_stats_meta"]
+                meta["last_scan_success_at"] = snapshot.scanned_at
+                meta["stale"] = False
+                logger.info(
+                    f"R2 stats: {snapshot.object_count} objects, "
+                    f"{snapshot.total_bytes / 1_000_000_000:.2f} GB / {r2_cfg.capacity_gb} GB"
                 )
+                # 顺便看是否要清。lru_evict_to_target 接受预扫好的 objects 复用
+                removed, freed = await lru_evict_to_target(
+                    r2_client,
+                    high_watermark_bytes=high, low_watermark_bytes=low,
+                    objects=objects,
+                )
+                if removed > 0:
+                    logger.success(
+                        f"R2 LRU: evicted {removed} objects, freed {freed / 1_000_000_000:.2f} GB"
+                    )
+                    # 删完了 stats 已经过时，顺手 patch 一下避免下次 /stats 看到错的
+                    app.bot_data["r2_stats"] = R2StatsSnapshot(
+                        scanned_at=snapshot.scanned_at,
+                        total_bytes=snapshot.total_bytes - freed,
+                        object_count=snapshot.object_count - removed,
+                        oldest_at=snapshot.oldest_at,    # 不精确但够用
+                        newest_at=snapshot.newest_at,
+                    )
         except Exception:
             logger.exception("R2 LRU/stats iteration failed; will retry next interval")
         await asyncio.sleep(interval)
+
+
+def _trim_24h(dq: deque[float], now_ts: float) -> None:
+    """裁掉 deque 头部所有早于 now-24h 的时间戳。每次读写前调用。"""
+    cutoff = now_ts - 86400
+    while dq and dq[0] < cutoff:
+        dq.popleft()
 
 
 __all__ = ["build_application", "init_bot_async", "install_commands"]

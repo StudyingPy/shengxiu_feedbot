@@ -105,31 +105,72 @@ class AllowList:
 
 
 class TelegraphCache:
-    """作品 → 已发布的 Telegra.ph URL（永久缓存）。"""
+    """作品 → 已发布的 Telegra.ph URL（永久缓存）。
+
+    durability 元数据（PR-2 引入）：
+      - durable=True：所有图片已成功上传 R2，或 text-only 无图页
+      - durable=False：含 fallback / 部分失败 / 整批失败 / R2 未启用
+      - legacy 行（schema 升级前）：durable=0 且 r2_image_count IS NULL
+    普通用户命中任何条目都返回 URL；admin --r2 命中非 durable 行视为 miss 触发重发。
+    """
 
     def __init__(self, db: Database):
         self.db = db
 
-    async def get(self, kind: str, pixiv_id: str) -> str | None:
+    async def get(self, kind: str, pixiv_id: str) -> "CacheEntry | None":
         async with self.db.conn.execute(
-            "SELECT telegraph_url FROM telegraph_cache WHERE kind = ? AND pixiv_id = ?",
+            """SELECT telegraph_url, page_count, durable,
+                      r2_image_count, fallback_image_count, fallback_reason, created_at
+               FROM telegraph_cache WHERE kind = ? AND pixiv_id = ?""",
             (kind, pixiv_id),
         ) as cur:
             row = await cur.fetchone()
-        return row[0] if row else None
+        if row is None:
+            return None
+        return CacheEntry(
+            url=row[0],
+            page_count=row[1] or 1,
+            durable=bool(row[2]),
+            r2_image_count=row[3],
+            fallback_image_count=row[4],
+            fallback_reason=row[5] or "",
+            created_at=row[6],
+        )
 
-    async def put(self, kind: str, pixiv_id: str, url: str, page_count: int = 1) -> None:
+    async def put(
+        self, kind: str, pixiv_id: str, url: str,
+        *,
+        page_count: int = 1,
+        durable: bool = False,
+        r2_image_count: int | None = None,
+        fallback_image_count: int | None = None,
+        fallback_reason: str = "",
+    ) -> None:
+        """写入或覆盖缓存。force_r2 重发路径走 upsert（不要先 invalidate 再 put——
+        避免并发空洞让普通用户在窗口内触发第二次 publish）。
+        """
         async with self.db.write_lock:
             await self.db.conn.execute(
                 """
-                INSERT INTO telegraph_cache(kind, pixiv_id, telegraph_url, page_count, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO telegraph_cache(
+                    kind, pixiv_id, telegraph_url, page_count, created_at,
+                    durable, r2_image_count, fallback_image_count, fallback_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(kind, pixiv_id) DO UPDATE SET
                     telegraph_url = excluded.telegraph_url,
                     page_count = excluded.page_count,
-                    created_at = excluded.created_at
+                    created_at = excluded.created_at,
+                    durable = excluded.durable,
+                    r2_image_count = excluded.r2_image_count,
+                    fallback_image_count = excluded.fallback_image_count,
+                    fallback_reason = excluded.fallback_reason
                 """,
-                (kind, pixiv_id, url, page_count, int(time.time())),
+                (
+                    kind, pixiv_id, url, page_count, int(time.time()),
+                    1 if durable else 0,
+                    r2_image_count, fallback_image_count, fallback_reason or None,
+                ),
             )
             await self.db.conn.commit()
 
@@ -141,8 +182,59 @@ class TelegraphCache:
             )
             await self.db.conn.commit()
 
+    async def stats(self) -> "CacheStats":
+        """聚合 durability 分布给 /stats 用。"""
+        async with self.db.conn.execute(
+            """SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN durable = 1 THEN 1 ELSE 0 END) AS durable_count,
+                SUM(CASE WHEN durable = 0 AND r2_image_count IS NULL THEN 1 ELSE 0 END) AS legacy_count
+               FROM telegraph_cache"""
+        ) as cur:
+            row = await cur.fetchone()
+        total = row[0] or 0 if row else 0
+        durable = row[1] or 0 if row else 0
+        legacy = row[2] or 0 if row else 0
+        # fallback_reason 分布（只看非 durable 非 legacy 的行）
+        breakdown: dict[str, int] = {}
+        async with self.db.conn.execute(
+            """SELECT COALESCE(fallback_reason, ''), COUNT(*)
+               FROM telegraph_cache
+               WHERE durable = 0 AND r2_image_count IS NOT NULL
+               GROUP BY fallback_reason"""
+        ) as cur:
+            for reason, cnt in await cur.fetchall():
+                breakdown[reason or "(empty)"] = cnt
+        return CacheStats(
+            total=total,
+            durable=durable,
+            legacy=legacy,
+            fallback_breakdown=breakdown,
+        )
 
-__all__ = ["AllowList", "AllowedEntry", "TelegraphCache", "RuntimeSettings"]
+
+@dataclass
+class CacheEntry:
+    """telegraph_cache 单条行。get() 返回它而不是裸 URL，调用方可读 durable。"""
+
+    url: str
+    page_count: int
+    durable: bool
+    r2_image_count: int | None         # NULL = legacy 行（schema 升级前未知）
+    fallback_image_count: int | None
+    fallback_reason: str                # 见 publisher.telegraph.FallbackReason 枚举
+    created_at: int
+
+
+@dataclass
+class CacheStats:
+    total: int
+    durable: int
+    legacy: int                           # durable=0 且 r2_image_count IS NULL
+    fallback_breakdown: dict[str, int]    # fallback_reason → count（非 durable 非 legacy）
+
+
+__all__ = ["AllowList", "AllowedEntry", "CacheEntry", "CacheStats", "TelegraphCache", "RuntimeSettings"]
 
 
 # ---------------------------------------------------------------------------

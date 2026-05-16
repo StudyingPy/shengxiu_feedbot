@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.8.2 — 2026-05-17
+
+R2 持久化语义闭环 + 扫描完整性防御 + `--r2` 工作流修复。
+
+修复一类系统性 bug：R2 上传失败时 publisher 静默回退 nginx，但 `telegraph_cache` 仍永久写入，7 天后本地缓存清理让 Telegra.ph 页面里的图变 404，**而 cache 命中仍返回旧 URL，无路径自愈**。本版本让 cache 反映真实持久化状态，让 `--r2` 命令的承诺与实际行为一致。
+
+### Features
+- **`storage.r2.prefix` 配置项**：为 R2 bucket 内对象统一加前缀（如 `feedbot/`）。配置后所有 upload / public_url / list / delete / LRU 都局限在此前缀下，避免共用 bucket 时误删其他对象。空时启动 warning（v0.9.x 计划默认拒绝）。
+- **`PublishResult.durable` 与 `fallback_reason` 元数据**：发布结果新增 `r2_image_count` / `fallback_image_count` / `fallback_reason` / `durable` 字段，`fallback_reason` 包含 `r2_disabled` / `size_guard_skipped` / `r2_batch_failed` / `r2_partial` / `local_file_missing` 完整枚举。
+- **完成消息差异化风险提示**：根据 `fallback_reason` 显示不同文案（"体积超护栏" / "R2 上传失败" / "部分图片仍依赖本地缓存" 等）。**R2 未启用时一律不弹提示**，避免默认部署用户每次发布都看到吓人警告。
+- **`--r2` 真正绕过非 durable 缓存**：admin 加 `--r2` 时 cache 命中非 durable 行视为 miss 触发重发并 upsert；命中 durable 行追加"已是 R2 durable 缓存，跳过重发"提示。R2 未启用 / client 未初始化时 `--r2` 在 cache gate 上视为 False，避免无效空转。
+- **`/stats system` 接通 Telegraph cache durability 渗透率**：展示 `total / durable / legacy` 计数与 `fallback_reason` 分布，让管理员可见修复效果。
+- **`/stats system` 暴露 R2 扫描健康度**：`last_scan_success_at` / `stale` / `failures_24h`（rolling 24h, since process start）。
+- **Pixiv novel 接入 R2 持久化**：封面、textEmbeddedImages、`[pixivimage:]` 引用图统一走共享 `resolve_image_urls` helper 上传 R2，cache 行带真实 durability 元数据。novel 也支持 `--r2` 强制重发。
+- **`deploy/cleanup.py` 读 SQLite runtime_settings 覆盖**：`/setting set storage.cache_days N` 修改的值现在对 cleanup timer 也生效。DB 缺失 / 表缺失静默回 YAML；脏值 warning + 回 YAML（不静默吞，便于排查）。
+
+### Fixes
+- **R2 扫描部分失败不再静默污染 stats**：`R2Client.list_all()` 中途网络异常或 HTTP 非 200 时抛 `R2ListIncomplete` 异常携带已扫部分 + 失败原因（不再 break 返回部分结果）。后台 LRU loop / `/stats r2_evict` 统一 catch：不刷新 stats（沿用旧 snapshot）、**跳过本轮 evict**、写 stale meta + 计入 24h 失败 deque。避免在不完整数据上做 LRU 决策误删 hot key。
+- **R2 LRU prefix 一致性**：`lru_evict_to_target` 与 `list_all` 删除 prefix 参数，统一由 `R2Client.prefix`（构造时配置）决定扫描范围；`delete_object` 接收 list 返回的 absolute key，避免对已含 prefix 的 key 二次拼接。
+- **空 `r2_key` 不上传 R2**：resolver 把无法推导 r2_key 的项标记为"不上传"直接走 fallback，避免把空 key PUT 到 bucket 根 / `prefix/` 自身造成冲突。
+
+### Internal
+- **新增 `pixivfeed/publisher/_resolver.py`**：`ResolveItem` / `ResolveResult` / `resolve_image_urls()` —— gallery / novel 共享的 "本地路径 → R2/fallback URL" 决策层，包含完整 fallback reason 计算与 size_guard。
+- **`telegraph_cache` schema migration**：`Database.connect()` 内 `executescript(SCHEMA)` 之后调 `_migrate_schema()` 用 `PRAGMA table_info` 幂等补列。新增 4 列：`durable INTEGER NOT NULL DEFAULT 0` / `r2_image_count INTEGER` / `fallback_image_count INTEGER` / `fallback_reason TEXT`。legacy 行的 `r2_image_count IS NULL` 与 "已知 0" 严格区分。
+- **`TelegraphCache.get()` 返回 `CacheEntry`**（dataclass：url / page_count / durable / r2_image_count / fallback_image_count / fallback_reason / created_at），breaking 内部 API，handlers 所有 6 处 cache.get 调用点同步改完。
+- **`TelegraphCache.put()` 接受 keyword-only durability 参数**；handlers 4 处 cache.put 全部接通。
+- **`TelegraphCache.stats()`**：聚合 `total / durable / legacy` 与 `fallback_reason` 分组计数，供 `/stats system` 查询。
+- **`R2Client._normalize_key()` / `_normalize_prefix()`**：所有出入 R2 的 key 统一走 normalizer；调用方传相对 key（如 `pixiv/12345/0.jpg`），不感知 prefix。
+- **`R2ListIncomplete` 异常类**：携带 `partial_keys` / `scanned_pages` / `cause`。
+- **handlers 新增 `_effective_force_r2(context, force_r2)`** helper：统一 cache gate 上的 force_r2 判定，避免 R2 未启用时 admin --r2 无意义绕过 cache 重发。
+- **handlers 新增 `_record_r2_scan_failure` / `_record_r2_scan_success`** helper：让后台 LRU loop 与手动 `/stats r2_evict` 共享同一份 `bot_data["r2_stats_meta"]`，避免状态漂移。
+- **24h rolling 失败计数器**：`collections.deque[float]` 模式，写读两端都裁剪 >24h 项，文案明确 "since process start"。
+- **`apply_runtime_overrides(cfg, db_path)` 同步 helper**（`pixivfeed/config.py`）：用 sqlite3 标准库 + `PRAGMA query_only=1`，cleanup.py 等同步脚本不引入 aiosqlite。bool 解析严格白名单（`"abc"` 不再被静默归零）。
+- **`PixivProvider.publish_novel(force_r2=...)`**：novel publisher 暴露 force_r2 参数与 publish_gallery 一致。
+
+### 改动文件
+- 新增：`pixivfeed/publisher/_resolver.py`
+- 改动：`pixivfeed/storage/{r2.py, db.py, cache.py, __init__.py}`
+- 改动：`pixivfeed/publisher/telegraph.py`
+- 改动：`pixivfeed/provider/pixiv/novel_publisher.py`
+- 改动：`pixivfeed/channel/telegram/{bot.py, handlers.py}`
+- 改动：`pixivfeed/config.py`、`pixivfeed/__main__.py`、`deploy/cleanup.py`、`config.example.yaml`
+
+### 升级注意
+- **schema 自动迁移**：升级首次启动会自动 `ALTER TABLE telegraph_cache ADD COLUMN` 补 4 列，旧条目 `durable=0` 且 `r2_image_count IS NULL`（legacy 行）。
+- **legacy 缓存条目保守策略**：普通用户命中 legacy 行正常返回旧 URL；admin `--r2` 命中视为 miss 触发重发。避免升级当天热门作品集中重发引起 telegra.ph / Pixiv 限流。
+- **共用 R2 bucket 用户建议配置 `storage.r2.prefix`**：留空时启动会 warning，LRU 仍按整 bucket 扫描/驱逐（兼容存量部署）。已配置 prefix 后**新上传走 prefix，旧对象不再被 LRU 看到**——需要时请手动迁移或一次性清理。
+
 ## v0.8.1 — 2026-05-16
 
 R2 体验完善 + 体积护栏 + zip2tph 接通。

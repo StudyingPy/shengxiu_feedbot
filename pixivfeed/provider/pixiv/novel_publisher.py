@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ...config import Config
+from ...publisher._resolver import ResolveItem, resolve_image_urls
 from ...publisher.telegraph import (
     NodeTree,
     PublishResult,
@@ -57,8 +58,12 @@ async def publish_novel(
     nid: str,
     *,
     progress=None,  # channel.telegram.progress.Progress 或 None
+    force_r2: bool = False,
 ) -> tuple[NovelWork, PublishResult]:
-    """端到端：拉 novel + 下载封面与嵌入图 + 发布。"""
+    """端到端：拉 novel + 下载封面与嵌入图 + 发布。
+
+    force_r2=True 绕过 R2 size_guard（admin --r2 flag），与 publish_gallery 一致。
+    """
     templates = config.templates.novel
 
     async def _status(text: str) -> None:
@@ -76,14 +81,33 @@ async def publish_novel(
 
         downloader = PixivDownloader(api, provider.cache_dir, provider.concurrency)
 
+        # 收集所有需要解析为公网 URL 的图片。order matters：
+        # idx 0 = 封面（如果有），后续 = textEmbeddedImages，再之后 = pixivimage 引用。
+        resolve_items: list[ResolveItem] = []
+        cover_idx: int | None = None
+        embed_idx_by_img_id: dict[str, int] = {}
+        pixivimage_idx_by_id: dict[str, int] = {}
+
+        def _push_item(local_path: Path) -> int:
+            try:
+                rel = local_path.resolve().relative_to(Path(provider.cache_dir).resolve())
+                key = rel.as_posix()
+            except (ValueError, AttributeError):
+                # 不在 cache_dir 下 → helper 会把 r2_key="" 当上传失败走 fallback
+                key = ""
+            fallback = relative_url(provider.public_base_url, provider.cache_dir, local_path)
+            resolve_items.append(ResolveItem(
+                r2_key=key, local_path=local_path, fallback_url=fallback,
+            ))
+            return len(resolve_items) - 1
+
         # 1. 封面
         if novel.cover_url:
             await _status("⏳ 下载封面...")
             cover_path = await downloader.download_novel_cover(nid, novel.cover_url)
-            novel.cover_url = relative_url(provider.public_base_url, provider.cache_dir, cover_path)
+            cover_idx = _push_item(cover_path)
 
         # 2. textEmbeddedImages 嵌入图
-        embedded_public: dict[str, dict] = {}
         raw_embedded = body.get("textEmbeddedImages") or {}
         total_embed = len(raw_embedded)
         if total_embed:
@@ -96,9 +120,7 @@ async def publish_novel(
                 done += 1
                 continue
             local_path = await downloader.download_novel_embed(nid, img_id, url)
-            embedded_public[img_id] = {
-                "url": relative_url(provider.public_base_url, provider.cache_dir, local_path)
-            }
+            embed_idx_by_img_id[img_id] = _push_item(local_path)
             done += 1
             await _update(f"⏳ 下载嵌入图 {done}/{total_embed}")
 
@@ -119,16 +141,36 @@ async def publish_novel(
                 else:
                     img_url = urls["original"]
                 downloaded = await downloader.download_illust(illust_id, [img_url])
-                public = relative_url(
-                    provider.public_base_url, provider.cache_dir, downloaded[0].original_path
-                )
-                embedded_public[f"pixivimage_{illust_id}"] = {"url": public}
+                pixivimage_idx_by_id[illust_id] = _push_item(downloaded[0].original_path)
             except Exception as e:
                 logger.warning(f"failed to embed pixivimage:{illust_id} in novel {nid}: {e}")
             done += 1
             await _update(f"⏳ 下载引用插画 {done}/{total_px}")
 
-    # 4. 渲染 + 发布
+    # 4. 统一把所有图片上传 R2 / 决策 fallback URL（与 telegraph publisher 共享同一份决策逻辑）
+    r2_client = getattr(publisher, "r2_client", None)
+    r2_enabled = config.storage.r2.enabled
+    size_guard_bytes = int(config.storage.r2.max_upload_size_gb * 1024 ** 3)
+    if resolve_items:
+        await _status(f"⏳ 上传图片到 R2 (共 {len(resolve_items)})")
+    resolved = await resolve_image_urls(
+        r2_client, resolve_items,
+        r2_enabled=r2_enabled,
+        force_r2=force_r2,
+        size_guard_bytes=size_guard_bytes,
+        on_status=lambda t: _status(t),
+    )
+
+    # 回填 cover_url + embedded_public 使用 helper 返回的最终 URL
+    if cover_idx is not None:
+        novel.cover_url = resolved.urls[cover_idx]
+    embedded_public: dict[str, dict] = {}
+    for img_id, idx in embed_idx_by_img_id.items():
+        embedded_public[img_id] = {"url": resolved.urls[idx]}
+    for illust_id, idx in pixivimage_idx_by_id.items():
+        embedded_public[f"pixivimage_{illust_id}"] = {"url": resolved.urls[idx]}
+
+    # 5. 渲染 + 发布
     await _status("⏳ 发布到 Telegra.ph...")
     await publisher.ensure_account()
     tvars = novel.template_vars()
@@ -179,7 +221,12 @@ async def publish_novel(
     )
 
     return novel, PublishResult(
-        urls=page_urls, page_count=len(page_urls), image_count=len(embedded_public)
+        urls=page_urls,
+        page_count=len(page_urls),
+        image_count=len(resolve_items),
+        r2_image_count=resolved.r2_ok_count,
+        fallback_image_count=resolved.fallback_count,
+        fallback_reason=resolved.fallback_reason,
     )
 
 

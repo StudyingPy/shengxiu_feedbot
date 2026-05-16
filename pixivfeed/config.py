@@ -24,6 +24,8 @@ from typing import Any
 
 import yaml
 
+from .utils import logger
+
 
 # ---------------------------------------------------------------------------
 # 子配置 dataclass
@@ -108,6 +110,10 @@ class R2Config:
     access_key_id: str = ""
     secret_access_key: str = ""
     custom_domain: str = ""         # https://r2.your-domain.com（自定义域名 base，不含尾斜杠）
+    # bucket 内的统一前缀。配置后所有 upload/public_url/list/delete/LRU 都局限在这个前缀下，
+    # 避免共用 bucket 时误删其他项目对象。默认空（兼容存量部署），但**强烈建议配置**。
+    # 形如 "pixivfeed/" 或 "staging-bot/"；尾斜杠自动补全，首斜杠自动剥掉。
+    prefix: str = ""
     capacity_gb: int = 80           # 容量阈值（GB），<= 0 关闭自动 LRU
     # 单次发布总字节超过此阈值（GB）时，跳过 R2 走 nginx 本地缓存（7 天 TTL）。
     # 用户/管理员可在命令上加 --r2 强制覆盖，让大体积也上 R2。设 0.0 关闭护栏（全部上传）。
@@ -309,6 +315,24 @@ class Config:
                 r2.custom_domain = r2.custom_domain.rstrip("/")
             if r2.endpoint.endswith("/"):
                 r2.endpoint = r2.endpoint.rstrip("/")
+            # prefix 空 → 警告但不拒绝启动。共用 bucket 场景会让 LRU 扫到/删到无关对象。
+            # v0.8.x 软引入；v0.9.x 计划改为默认拒绝（除非显式 allow_empty_prefix）。
+            if not r2.prefix:
+                logger.warning(
+                    "storage.r2.prefix is empty; LRU will scan & evict the entire bucket. "
+                    "Set a prefix (e.g. 'feedbot/') unless this bucket is exclusively used "
+                    "by pixiv-feed-bot. See config.example.yaml for details."
+                )
+            if not r2.prefix:
+                # 不拒绝启动（兼容 v0.8.1 存量部署），但显式提醒共用 bucket 风险。
+                # 后续 minor 版本可能改为默认必填。
+                import warnings as _warnings
+                _warnings.warn(
+                    "storage.r2.prefix is empty — list/LRU/delete will operate on the entire "
+                    "bucket. If this bucket is shared with other services, set storage.r2.prefix "
+                    "to a project-specific value (e.g. 'pixivfeed/').",
+                    stacklevel=2,
+                )
 
         if errors:
             raise ValueError("Invalid config:\n  - " + "\n  - ".join(errors))
@@ -514,4 +538,105 @@ SENSITIVE_KEYS: set[str] = {
 }
 
 
-__all__ = ["Config", "RUNTIME_KEYS", "SENSITIVE_KEYS"]
+__all__ = ["Config", "RUNTIME_KEYS", "SENSITIVE_KEYS", "apply_runtime_overrides"]
+
+
+# ---------------------------------------------------------------------------
+# Runtime overlay（PR-4：让 cleanup.py 也能感知 /setting set 的覆盖值）
+# ---------------------------------------------------------------------------
+
+
+def apply_runtime_overrides(cfg: Config, db_path: str | Path) -> Config:
+    """从 SQLite runtime_settings 表读出 admin 覆盖值，叠加到 cfg 上后返回同一实例。
+
+    设计要点（reviewer 拍板）：
+    - 用 sqlite3 标准库（同步），cleanup.py 等同步脚本不引入 aiosqlite。
+    - PRAGMA query_only=1，避免与运行中的 bot 进程竞写锁。
+    - 三种降级策略：
+        1. DB 不存在 / runtime_settings 表不存在 → 静默回退到 YAML（全新部署正常路径）
+        2. key 解析失败（如 "abc" → int）→ **log warning + 跳过此 key**，
+           其它 key 继续 overlay。不能静默吞——脏值不可见会让排查很难。
+        3. 整体连库异常 → log error 并回 YAML（不让 cleanup 启动失败）
+
+    只 overlay RUNTIME_KEYS 集合里的 key。类型转换按目标字段的 type hint 做。
+    """
+    import sqlite3
+
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return cfg
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as e:
+        logger.error(f"runtime overlay: cannot open {db_path} read-only: {e}; using YAML values")
+        return cfg
+
+    try:
+        conn.execute("PRAGMA query_only=1")
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM runtime_settings"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # 表不存在 = 全新部署，正常降级
+            return cfg
+
+        for key, value in rows:
+            if key not in RUNTIME_KEYS:
+                continue
+            try:
+                _apply_one_override(cfg, key, value)
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.warning(
+                    f"runtime overlay: cannot apply {key}={value!r}: {e}; "
+                    f"falling back to YAML value"
+                )
+    finally:
+        conn.close()
+
+    return cfg
+
+
+def _apply_one_override(cfg: Config, key: str, raw_value: str) -> None:
+    """把 'storage.cache_days' = '30' 写到 cfg.storage.cache_days = 30。
+
+    类型转换：从目标 dataclass 字段的 type 注解推断（int / float / bool / str）。
+    """
+    import dataclasses
+
+    parts = key.split(".")
+    target = cfg
+    for p in parts[:-1]:
+        target = getattr(target, p)
+    leaf = parts[-1]
+
+    # 目标字段类型：通过 dataclasses.fields 查
+    fields = {f.name: f for f in dataclasses.fields(target)}
+    if leaf not in fields:
+        raise AttributeError(f"no field {leaf} on {type(target).__name__}")
+
+    field_type = fields[leaf].type
+    if isinstance(field_type, str):
+        # PEP 563 / __future__.annotations 下 type 是 str；做一个最小映射
+        type_map = {"int": int, "float": float, "bool": bool, "str": str}
+        field_type = type_map.get(field_type, str)
+
+    if field_type is bool:
+        v = raw_value.strip().lower()
+        # 严格白名单：true/false 之外（包括 "abc" 这种脏值）都视为非法，
+        # 让外层 warning 路径把它当解析失败上报，不要静默归零。
+        if v in ("1", "true", "yes", "on"):
+            coerced = True
+        elif v in ("0", "false", "no", "off", ""):
+            coerced = False
+        else:
+            raise ValueError(f"cannot coerce {raw_value!r} to bool")
+    elif field_type is int:
+        coerced = int(raw_value)
+    elif field_type is float:
+        coerced = float(raw_value)
+    else:
+        coerced = raw_value
+
+    setattr(target, leaf, coerced)

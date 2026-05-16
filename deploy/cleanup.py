@@ -16,12 +16,15 @@ from pathlib import Path
 # 允许从 deploy/ 目录直接运行
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pixivfeed.config import Config
+from pixivfeed.config import Config, apply_runtime_overrides
 from pixivfeed.utils import logger, setup_logging
 
 
 def cleanup(config_path: str) -> None:
     cfg = Config.load(config_path)
+    # PR-4：让 cleanup timer 也感知 /setting set storage.cache_days 这类运行时覆盖。
+    # DB 不存在 / 表不存在 → 静默回 YAML；脏值 → log warning + 回该 key 的 YAML 值。
+    cfg = apply_runtime_overrides(cfg, cfg.storage.db_path)
     setup_logging(level=cfg.logging.level, to_file=False)
     cache_dir = Path(cfg.storage.cache_dir)
     if not cache_dir.exists():

@@ -138,8 +138,10 @@ async def async_main(config_path: Path) -> None:
             access_key_id=r2.access_key_id,
             secret_access_key=r2.secret_access_key,
             custom_domain=r2.custom_domain,
+            prefix=r2.prefix,
         )
-        logger.info(f"R2 enabled: bucket={r2.bucket}, public={r2.custom_domain}")
+        prefix_note = f", prefix='{r2_client.prefix}'" if r2_client.prefix else " (no prefix; full-bucket scope)"
+        logger.info(f"R2 enabled: bucket={r2.bucket}, public={r2.custom_domain}{prefix_note}")
 
     # Telegraph
     publisher = TelegraphPublisher(config, r2_client=r2_client)

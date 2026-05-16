@@ -37,12 +37,22 @@ CREATE TABLE IF NOT EXISTS chat_modes (
 -- kind: 'illust' | 'novel'
 -- pixiv_id: PID 或 NID（数字字符串，避免精度问题）
 -- 复合主键 (kind, pixiv_id)，因为 PID 和 NID 命名空间独立但可能撞号
+--
+-- durability 三段式（PR-2 引入）：
+--   durable=1 → 全部图片成功上传到 R2 / 或 total_image_count=0 的 text-only 页
+--   durable=0 + r2_image_count IS NOT NULL → 部分或全部 fallback
+--   durable=0 + r2_image_count IS NULL → legacy 行（schema 升级前的旧条目）
+-- 普通用户命中任何 durable 状态都返回 URL；admin --r2 在非 durable 行视为 miss 重发。
 CREATE TABLE IF NOT EXISTS telegraph_cache (
     kind        TEXT NOT NULL,
     pixiv_id    TEXT NOT NULL,
     telegraph_url TEXT NOT NULL,
     page_count  INTEGER,
     created_at  INTEGER NOT NULL,
+    durable     INTEGER NOT NULL DEFAULT 0,
+    r2_image_count       INTEGER,
+    fallback_image_count INTEGER,
+    fallback_reason      TEXT,
     PRIMARY KEY (kind, pixiv_id)
 );
 
@@ -118,6 +128,7 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.executescript(SCHEMA)
+        await _migrate_schema(self._conn)
         await self._conn.commit()
         logger.info(f"SQLite connected: {self.db_path}")
 
@@ -136,6 +147,50 @@ class Database:
     def write_lock(self) -> asyncio.Lock:
         """写操作建议在此锁下进行。SQLite 单写者，避免 'database is locked'。"""
         return self._write_lock
+
+
+# ---------------------------------------------------------------------------
+# Schema migration（幂等、只前向）
+# ---------------------------------------------------------------------------
+
+
+async def _migrate_schema(conn: aiosqlite.Connection) -> None:
+    """对老库做幂等列补全。新库走 CREATE TABLE IF NOT EXISTS 已经包含所有列，
+    这里只对升级路径里的旧库生效。
+
+    每次新增列时：在 SCHEMA 的 CREATE TABLE 加列 + 这里加一条 _ensure_column。
+    SQLite 不支持 DROP COLUMN（3.35+ 支持但限制多），所以**只能前向迁移**。
+    """
+    # telegraph_cache：PR-2 加 durability 元数据
+    await _ensure_column(
+        conn, "telegraph_cache", "durable",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    await _ensure_column(
+        conn, "telegraph_cache", "r2_image_count",
+        "INTEGER",   # NULL = "未知（legacy 行）"，区别于"已知 0"
+    )
+    await _ensure_column(
+        conn, "telegraph_cache", "fallback_image_count",
+        "INTEGER",
+    )
+    await _ensure_column(
+        conn, "telegraph_cache", "fallback_reason",
+        "TEXT",      # 枚举见 publisher.telegraph.FallbackReason
+    )
+
+
+async def _ensure_column(
+    conn: aiosqlite.Connection, table: str, column: str, definition: str,
+) -> None:
+    """如果 table 上没有 column 就 ALTER 加上。definition 不含列名。"""
+    async with conn.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    existing = {r[1] for r in rows}   # PRAGMA table_info: (cid, name, type, ...)
+    if column in existing:
+        return
+    await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    logger.info(f"schema migration: ALTER TABLE {table} ADD COLUMN {column}")
 
 
 __all__ = ["Database"]

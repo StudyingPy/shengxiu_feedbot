@@ -159,6 +159,24 @@ def _guess_content_type(key: str) -> str:
     return _CONTENT_TYPE_BY_EXT.get(suffix, "application/octet-stream")
 
 
+class R2ListIncomplete(Exception):
+    """list_all 中途因为网络/HTTP 失败终止——已扫到的 keys 不能当全集用。
+
+    携带 partial_keys 供未来 best-effort 场景调用，但当前所有 caller 都
+    应当忽略 partial 数据：LRU 跳过本轮 evict，stats 沿用旧 snapshot。
+    """
+
+    def __init__(
+        self, *, partial_keys: list[R2Object], scanned_pages: int, cause: object,
+    ):
+        self.partial_keys = partial_keys
+        self.scanned_pages = scanned_pages
+        self.cause = cause
+        super().__init__(
+            f"R2 list_all incomplete after {scanned_pages} page(s): {cause}"
+        )
+
+
 class R2Client:
     """瘦壳 S3-compat 客户端，仅覆盖本项目用到的 op。
 
@@ -174,6 +192,7 @@ class R2Client:
         access_key_id: str,
         secret_access_key: str,
         custom_domain: str,
+        prefix: str = "",
         timeout: float = 60.0,
     ):
         self._cred = _R2Cred(
@@ -184,8 +203,26 @@ class R2Client:
             bucket=bucket,
         )
         self._public_base = custom_domain.rstrip("/")
+        # prefix 规范化：去首尾空格 + 去首斜杠 + 若非空则强制以 "/" 结尾。
+        # 所有出入 R2 的 key 都走 _normalize_key/_strip_prefix，调用方传"相对 key"即可。
+        self.prefix = self._normalize_prefix(prefix)
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
+
+    @staticmethod
+    def _normalize_prefix(prefix: str) -> str:
+        p = (prefix or "").strip().lstrip("/")
+        if p and not p.endswith("/"):
+            p += "/"
+        return p
+
+    def _normalize_key(self, relative_key: str) -> str:
+        """把相对 key 拼上 prefix，得到 absolute key。
+
+        relative_key 形如 "pixiv/12345/0.jpg"；prefix 形如 "proj/" 或 ""。
+        调用方永远不传 absolute key——避免双重拼接。
+        """
+        return f"{self.prefix}{relative_key.lstrip('/')}"
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -199,80 +236,99 @@ class R2Client:
             await self._client.aclose()
             self._client = None
 
-    def public_url(self, key: str) -> str:
-        """key 对应的公开访问 URL（CF 自定义域名）。"""
-        return f"{self._public_base}/{key.lstrip('/')}"
+    def public_url(self, relative_key: str) -> str:
+        """relative_key 对应的公开访问 URL（CF 自定义域名，含 prefix）。"""
+        absolute = self._normalize_key(relative_key)
+        return f"{self._public_base}/{absolute}"
 
-    async def head_object(self, key: str) -> dict[str, str] | None:
+    async def head_object(self, relative_key: str) -> dict[str, str] | None:
         """HEAD 检查对象是否存在；返回 response headers 或 None。"""
-        url, headers = _sign_request(self._cred, method="HEAD", key=key, payload=b"")
+        absolute = self._normalize_key(relative_key)
+        url, headers = _sign_request(self._cred, method="HEAD", key=absolute, payload=b"")
         client = await self._get_client()
         try:
             resp = await client.request("HEAD", url, headers=headers)
         except Exception as e:
-            logger.warning(f"R2 HEAD {key} failed: {e}")
+            logger.warning(f"R2 HEAD {absolute} failed: {e}")
             return None
         if resp.status_code == 200:
             return dict(resp.headers)
         if resp.status_code == 404:
             return None
-        logger.warning(f"R2 HEAD {key} → HTTP {resp.status_code}")
+        logger.warning(f"R2 HEAD {absolute} → HTTP {resp.status_code}")
         return None
 
-    async def put_file(self, key: str, local_path: Path) -> bool:
+    async def put_file(self, relative_key: str, local_path: Path) -> bool:
         """把本地文件 PUT 到 R2。返回是否成功。"""
         try:
             data = local_path.read_bytes()
         except OSError as e:
             logger.warning(f"R2 put_file: cannot read {local_path}: {e}")
             return False
-        return await self._put_bytes(key, data, _guess_content_type(key))
+        absolute = self._normalize_key(relative_key)
+        return await self._put_bytes_absolute(absolute, data, _guess_content_type(absolute))
 
-    async def put_bytes(self, key: str, data: bytes, content_type: str | None = None) -> bool:
-        return await self._put_bytes(key, data, content_type or _guess_content_type(key))
+    async def put_bytes(
+        self, relative_key: str, data: bytes, content_type: str | None = None,
+    ) -> bool:
+        absolute = self._normalize_key(relative_key)
+        return await self._put_bytes_absolute(
+            absolute, data, content_type or _guess_content_type(absolute),
+        )
 
-    async def _put_bytes(self, key: str, data: bytes, content_type: str) -> bool:
+    async def _put_bytes_absolute(
+        self, absolute_key: str, data: bytes, content_type: str,
+    ) -> bool:
         url, headers = _sign_request(
-            self._cred, method="PUT", key=key, payload=data, content_type=content_type,
+            self._cred, method="PUT", key=absolute_key, payload=data, content_type=content_type,
         )
         client = await self._get_client()
         try:
             resp = await client.put(url, headers=headers, content=data)
         except Exception as e:
-            logger.warning(f"R2 PUT {key} failed: {e}")
+            logger.warning(f"R2 PUT {absolute_key} failed: {e}")
             return False
         if 200 <= resp.status_code < 300:
             return True
         logger.warning(
-            f"R2 PUT {key} → HTTP {resp.status_code}: {resp.text[:200]}"
+            f"R2 PUT {absolute_key} → HTTP {resp.status_code}: {resp.text[:200]}"
         )
         return False
 
-    async def delete_object(self, key: str) -> bool:
-        url, headers = _sign_request(self._cred, method="DELETE", key=key, payload=b"")
+    async def delete_object(self, absolute_key: str) -> bool:
+        """删除一个 absolute key（list_all 返回的 R2Object.key 即 absolute）。
+
+        不做 prefix 拼接——避免对已含 prefix 的 key 二次拼接成 "proj/proj/..."。
+        """
+        url, headers = _sign_request(self._cred, method="DELETE", key=absolute_key, payload=b"")
         client = await self._get_client()
         try:
             resp = await client.delete(url, headers=headers)
         except Exception as e:
-            logger.warning(f"R2 DELETE {key} failed: {e}")
+            logger.warning(f"R2 DELETE {absolute_key} failed: {e}")
             return False
         if resp.status_code in (200, 204, 404):
             return True
-        logger.warning(f"R2 DELETE {key} → HTTP {resp.status_code}")
+        logger.warning(f"R2 DELETE {absolute_key} → HTTP {resp.status_code}")
         return False
 
-    async def list_all(self, prefix: str = "") -> list[R2Object]:
+    async def list_all(self) -> list[R2Object]:
         """ListObjectsV2 全分页扫，返回所有 (key, size, last_modified)。
 
-        bucket 大时这步比较慢（每页 1000 个）。LRU 调用方应该缓存结果，别一直扫。
+        扫描范围由 self.prefix 决定（构造时配置，调用方不再传 prefix——避免与配置漂移）。
+        返回的 R2Object.key 是 absolute key（含 prefix），可直接喂给 delete_object。
+
+        失败处理：任一页网络/HTTP 异常 → 抛 R2ListIncomplete，**不返回部分结果**。
+        调用方必须显式 catch；LRU 跳过本轮 evict，stats 沿用旧 snapshot。
         """
         results: list[R2Object] = []
         continuation: str | None = None
+        scanned_pages = 0
         client = await self._get_client()
         while True:
             query: dict[str, str] = {"list-type": "2", "max-keys": "1000"}
-            if prefix:
-                query["prefix"] = prefix
+            if self.prefix:
+                query["prefix"] = self.prefix
             if continuation:
                 query["continuation-token"] = continuation
             url, headers = _sign_request(
@@ -281,11 +337,16 @@ class R2Client:
             try:
                 resp = await client.get(url, headers=headers)
             except Exception as e:
-                logger.warning(f"R2 LIST failed: {e}")
-                break
+                raise R2ListIncomplete(
+                    partial_keys=results, scanned_pages=scanned_pages, cause=e,
+                ) from e
             if resp.status_code != 200:
-                logger.warning(f"R2 LIST → HTTP {resp.status_code}: {resp.text[:200]}")
-                break
+                raise R2ListIncomplete(
+                    partial_keys=results,
+                    scanned_pages=scanned_pages,
+                    cause=f"HTTP {resp.status_code}: {resp.text[:200]}",
+                )
+            scanned_pages += 1
             results.extend(_parse_list_objects_v2(resp.text))
             cont = _extract_continuation(resp.text)
             if cont is None:
@@ -389,21 +450,24 @@ async def lru_evict_to_target(
     *,
     high_watermark_bytes: int,
     low_watermark_bytes: int,
-    prefix: str = "",
     objects: list[R2Object] | None = None,
 ) -> tuple[int, int]:
     """如果当前用量 > high_watermark，按 LastModified 升序删到 <= low_watermark。
 
     返回 (删除文件数, 释放字节数)。低于 high_watermark 时 (0, 0)。
 
+    扫描范围由 client.prefix 决定（构造时配置）；不再接受 prefix 参数避免与配置漂移。
     objects 已知时（调用方刚扫过）跳过 list_all 复用——LRU loop 本来就先扫
     list_all 算 stats 缓存，没必要再扫一次。
+
+    若 objects=None 且 list_all 抛 R2ListIncomplete → 向上传播，调用方决定如何处理
+    （正确做法：跳过本轮 evict）。绝不在部分扫描结果上做 LRU 决策——会误删 hot key。
     """
     if low_watermark_bytes >= high_watermark_bytes:
         raise ValueError("low_watermark must be < high_watermark")
 
     if objects is None:
-        objects = await client.list_all(prefix=prefix)
+        objects = await client.list_all()
     total = sum(o.size for o in objects)
     if total <= high_watermark_bytes:
         return (0, 0)
@@ -414,6 +478,7 @@ async def lru_evict_to_target(
     for o in objects:
         if total <= low_watermark_bytes:
             break
+        # o.key 是 list_all 返回的 absolute key（已含 prefix），直接喂 delete_object
         ok = await client.delete_object(o.key)
         if ok:
             removed_files += 1
@@ -457,6 +522,7 @@ def stats_from_objects(objects: list[R2Object]) -> R2StatsSnapshot:
 
 __all__ = [
     "R2Client",
+    "R2ListIncomplete",
     "R2Object",
     "R2StatsSnapshot",
     "stats_from_objects",
