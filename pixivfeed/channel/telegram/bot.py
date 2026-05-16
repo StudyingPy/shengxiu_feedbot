@@ -26,7 +26,7 @@ from ...provider import ProviderRegistry
 from ...provider.ehentai import EHTagDB
 from ...publisher import TelegraphPublisher
 from ...storage import AllowList, Database, R2Client, RuntimeSettings, TelegraphCache, UsageStore
-from ...storage.r2 import lru_evict_to_target
+from ...storage.r2 import R2StatsSnapshot, lru_evict_to_target, stats_from_objects
 from ...utils import logger
 from .auth import cmd_allow, cmd_chatid, cmd_deny, cmd_listallow
 from .handlers import (
@@ -231,38 +231,61 @@ async def init_bot_async(
     tagdb: EHTagDB = app.bot_data["ehtagdb"]
     asyncio.create_task(tagdb.load())
 
-    # R2 LRU 后台 task：仅 R2 启用 + capacity_gb > 0 才挂。轻量轮询，超阈值
-    # 才会真的扫 + 删。
+    # R2 LRU + stats 后台 task：仅 R2 启用 + capacity_gb > 0 才挂。每轮跑
+    # list_all → 把 stats 塞 bot_data["r2_stats"] 给 /stats system 用 → 超阈值
+    # 时顺便清理。开机 30 秒后跑一次保证 admin 能立刻 /stats 看到数据。
     if r2_client is not None and config.storage.r2.capacity_gb > 0:
-        asyncio.create_task(_r2_lru_loop(r2_client, config))
+        asyncio.create_task(_r2_lru_loop(app, r2_client, config))
 
     return app
 
 
-async def _r2_lru_loop(r2_client: R2Client, config: Config) -> None:
-    """每 lru_check_interval_minutes 分钟跑一次 LRU。
+async def _r2_lru_loop(app: Application, r2_client: R2Client, config: Config) -> None:
+    """每 lru_check_interval_minutes 分钟跑一次 list_all 扫描 + 阈值清理。
 
-    用量超过 capacity_gb × 0.9 触发清理，清到 capacity_gb × 0.7 停手。
-    扫一次 ListObjectsV2 全量（每页 1000 条），R2 这个开销很小。
+    扫一次 list_all 在 80GB 量级要 ~200 次 API 调用（Class A），所以这是
+    bot 内**唯一**调 list_all 的地方。每次扫完把聚合结果塞 bot_data["r2_stats"]
+    给 /stats system 读，避免用户敲一次 /stats 就再扫一次。
+
+    用量超过 capacity_gb × 0.9 触发清理，清到 capacity_gb × 0.7（清理时复用
+    刚才 list_all 的结果，不再扫第 2 次）。
     """
     r2_cfg = config.storage.r2
     interval = max(60, r2_cfg.lru_check_interval_minutes * 60)
     cap_bytes = r2_cfg.capacity_gb * 1024 ** 3
     high = int(cap_bytes * 0.9)
     low = int(cap_bytes * 0.7)
-    # 开机 5 分钟内不跑一遍——给 bot 启动一段稳定期，避免冷启动 spike
-    await asyncio.sleep(300)
+    # 开机 30 秒稳定期——bot 起来用户立刻 /stats 也能看到数据
+    await asyncio.sleep(30)
     while True:
         try:
+            objects = await r2_client.list_all()
+            snapshot = stats_from_objects(objects)
+            app.bot_data["r2_stats"] = snapshot
+            logger.info(
+                f"R2 stats: {snapshot.object_count} objects, "
+                f"{snapshot.total_bytes / 1_000_000_000:.2f} GB / {r2_cfg.capacity_gb} GB"
+            )
+            # 顺便看是否要清。lru_evict_to_target 接受预扫好的 objects 复用
             removed, freed = await lru_evict_to_target(
-                r2_client, high_watermark_bytes=high, low_watermark_bytes=low,
+                r2_client,
+                high_watermark_bytes=high, low_watermark_bytes=low,
+                objects=objects,
             )
             if removed > 0:
                 logger.success(
                     f"R2 LRU: evicted {removed} objects, freed {freed / 1_000_000_000:.2f} GB"
                 )
+                # 删完了 stats 已经过时，顺手 patch 一下避免下次 /stats 看到错的
+                app.bot_data["r2_stats"] = R2StatsSnapshot(
+                    scanned_at=snapshot.scanned_at,
+                    total_bytes=snapshot.total_bytes - freed,
+                    object_count=snapshot.object_count - removed,
+                    oldest_at=snapshot.oldest_at,    # 不精确但够用
+                    newest_at=snapshot.newest_at,
+                )
         except Exception:
-            logger.exception("R2 LRU iteration failed; will retry next interval")
+            logger.exception("R2 LRU/stats iteration failed; will retry next interval")
         await asyncio.sleep(interval)
 
 
