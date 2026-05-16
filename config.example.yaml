@@ -96,6 +96,33 @@ storage:
   # SQLite 数据库文件路径
   db_path: "/var/lib/pixiv-feed-bot/data.db"
 
+  # ----------------------------------------------------------------
+  # Cloudflare R2（或任意 S3 兼容对象存储）
+  # ----------------------------------------------------------------
+  # 启用后，发布 Telegra.ph 时图片先上传 R2 再用 R2 URL 喂给 telegra.ph，
+  # 让发布的页面不再依赖本地 nginx + cache_dir 的 7 天 TTL（解决"大画廊几天后部分图加载失败"）。
+  # 上传失败/未启用时 fallback 到 publish.base_url（nginx 反代）。
+  # 老 telegra.ph 链接（v0.7.x 及之前发布）继续走 nginx，本字段不影响。
+  r2:
+    enabled: false
+    # R2 控制台 → 你的 bucket → "Settings" → "S3 API" 里能看到。形如：
+    #   https://<account-id>.r2.cloudflarestorage.com
+    endpoint: ""
+    region: "auto"          # R2 一律用 "auto"
+    bucket: ""              # 你创建的 bucket 名
+    # R2 控制台 → "Manage R2 API Tokens" → 创建一个 Object Read & Write 的 token
+    access_key_id: ""
+    secret_access_key: ""
+    # 必填：公开访问图片用的自定义域名（不要用 r2.dev 默认开发域名，那是有 ratelimit 的）。
+    # CF 控制台 → bucket → Settings → Public access → Connect Domain → 填你的子域名后会自动签证。
+    # 形如 https://r2.your-domain.com（不要带尾斜杠）。
+    custom_domain: ""
+    # bot 自动 LRU 清理阈值（GB）。R2 占用超过 capacity_gb × 0.9 时触发清理，
+    # 删除最旧上传的文件直到降到 capacity_gb × 0.7。设 0 关闭自动清理。
+    capacity_gb: 80
+    # bot 多久跑一次 LRU 扫描。单位分钟。
+    lru_check_interval_minutes: 60
+
 # ============================================================================
 # 发布
 # ============================================================================

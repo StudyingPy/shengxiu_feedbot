@@ -89,10 +89,35 @@ class CollectorsConfig:
 
 
 @dataclass
+class R2Config:
+    """Cloudflare R2 / 任意 S3 兼容对象存储配置。
+
+    启用后，publisher.publish_gallery 会先把图片上传到 R2，再用 R2 URL 喂给
+    Telegra.ph。上传失败/未启用时 fallback 到 publish.base_url（nginx 反代）。
+
+    custom_domain 必填——R2 默认开发 URL（pub-xxx.r2.dev）有 ratelimit 不可用作生产
+    Telegra.ph 图源；接 CF 的自定义域名后无 ratelimit、CDN 边缘缓存。
+
+    capacity_gb：bot 内置 LRU 自动清理的容量阈值。超过 capacity_gb × 0.9 触发清理，
+    清到 capacity_gb × 0.7 停手。设 0 关闭自动清理（让 bot 不管，靠你或 R2 lifecycle）。
+    """
+    enabled: bool = False
+    endpoint: str = ""              # https://<account>.r2.cloudflarestorage.com
+    region: str = "auto"            # R2 一律用 "auto"
+    bucket: str = ""
+    access_key_id: str = ""
+    secret_access_key: str = ""
+    custom_domain: str = ""         # https://r2.your-domain.com（自定义域名 base，不含尾斜杠）
+    capacity_gb: int = 80           # 容量阈值（GB），<= 0 关闭自动 LRU
+    lru_check_interval_minutes: int = 60   # bot 内多久跑一次 LRU 扫描（仅 R2 用量超阈值时才删）
+
+
+@dataclass
 class StorageConfig:
     cache_dir: str = "/var/cache/pixiv-feed-bot/images"
     cache_days: int = 7
     db_path: str = "/var/lib/pixiv-feed-bot/data.db"
+    r2: R2Config = field(default_factory=R2Config)
 
 
 @dataclass
@@ -264,6 +289,17 @@ class Config:
         ):
             if val < 1:
                 errors.append(f"job_queue.{name} must be >= 1 (got {val})")
+
+        # R2 启用时强制核心字段必填
+        r2 = self.storage.r2
+        if r2.enabled:
+            for f in ("endpoint", "bucket", "access_key_id", "secret_access_key", "custom_domain"):
+                if not getattr(r2, f):
+                    errors.append(f"storage.r2.{f} is required when storage.r2.enabled=true")
+            if r2.custom_domain.endswith("/"):
+                r2.custom_domain = r2.custom_domain.rstrip("/")
+            if r2.endpoint.endswith("/"):
+                r2.endpoint = r2.endpoint.rstrip("/")
 
         if errors:
             raise ValueError("Invalid config:\n  - " + "\n  - ".join(errors))
@@ -464,6 +500,8 @@ SENSITIVE_KEYS: set[str] = {
     "collectors.exhentai.ipb_pass_hash",
     "collectors.exhentai.ipb_member_id",
     "collectors.exhentai.igneous",
+    "storage.r2.access_key_id",
+    "storage.r2.secret_access_key",
 }
 
 
