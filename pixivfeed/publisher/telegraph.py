@@ -4,18 +4,29 @@
 1. Telegra.ph 账户生命周期：首次启动 createAccount 并写回 config.yaml
 2. 把 GalleryWork（任意 Provider 的图集类作品）渲染成 node tree 发布
 3. 多图作品超过 max_images_per_page 时拆多页，互链导航
+4. （v0.8.0+）发布前把图片并发上传到 R2，给 Telegra.ph 喂 R2 URL，避免
+   telegra.ph 页面靠 nginx + 7 天 cache_dir + CF 边缘缓存撑活
 
 不在这里做的：
 - pixiv novel 的小说排版（[chapter:] [newpage] [[jumpuri:]] 等自定义标记）
   → 留在 provider/pixiv/novel_publisher.py
 - 图床上传（catbox 之类）
-  → 我们坚持本地缓存 + Nginx 反代方案，所有 Provider 在 download() 阶段把
-    图片落到 cache_dir，并把 base_url 拼出的 public_url 写进 GalleryImage
+  → 用 R2 时 publisher 直接接管"对外可访问层"；不开 R2 时仍走 cache_dir +
+    Nginx 反代方案（向后兼容）
+
+R2 上传策略：
+- enabled=true 时所有 publish_gallery 都尝试上传；成功用 R2 URL，单图失败回退
+  到原 public_url（nginx），整批失败时整批回退。
+- 上传只针对 work.images[].local_path（原图）；不上传 tg_photo_path（那是
+  直发 TG sendPhoto 用的，不参与 telegra.ph）。
+- 并发上传：默认 asyncio.gather 全部图同时 PUT，由 R2Client 内部 semaphore
+  限流（upload_files_concurrent concurrency=8）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from telegraph.aio import Telegraph
@@ -23,6 +34,7 @@ from telegraph.utils import html_to_nodes
 
 from ..config import Config
 from ..provider import GalleryWork, ProgressHook
+from ..storage import R2Client, upload_files_concurrent
 from ..utils import logger
 
 NodeTree = list[Any]
@@ -70,9 +82,12 @@ class TelegraphPublisher:
     所有 Provider 通过 publish_gallery() 共享这一份。
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, r2_client: R2Client | None = None):
         self.config = config
         self._tg = Telegraph(access_token=config.publish.telegraph_token or None)
+        # R2 client：None 表示走 nginx fallback。建议由 channel 层装配，
+        # 这里不主动创建（publisher 不直接读 R2 凭据，保持职责单一）。
+        self._r2 = r2_client
 
     async def ensure_account(self) -> None:
         """如果 token 为空，自动 createAccount 并写回配置文件。"""
@@ -126,7 +141,7 @@ class TelegraphPublisher:
         if len(title_str) > 256:
             title_str = title_str[:253] + "..."
 
-        urls = [img.public_url for img in work.images]
+        urls = await self._resolve_image_urls(work)
         if not urls:
             raise ValueError(f"{work.provider}/{work.work_id}: no images to publish")
         chunks = [urls[i : i + max_per_page] for i in range(0, len(urls), max_per_page)]
@@ -177,6 +192,65 @@ class TelegraphPublisher:
             f"primary={page_urls[0]}"
         )
         return PublishResult(urls=page_urls, page_count=total_chunks, image_count=len(urls))
+
+    async def _resolve_image_urls(self, work: GalleryWork) -> list[str]:
+        """决定喂给 telegra.ph 的 <img src> URLs。
+
+        - R2 启用且 client 注入了：并发把 local_path 上传到 R2，用 R2 公开 URL
+        - R2 未启用 / 上传失败 / 没有 local_path：fallback 到 img.public_url（nginx）
+
+        R2 key 跟 cache_dir 相对路径一致（GalleryImage.public_url 现已是
+        f"{base_url}/{rel_path}"，取最后一段路径作 key 即可）。
+
+        失败策略：单图失败 → 该图回 nginx URL；整图集失败 → 全回 nginx，
+        发布仍能继续；这是关键的"R2 故障不阻塞发布"语义。
+        """
+        if self._r2 is None or not self.config.storage.r2.enabled:
+            return [img.public_url for img in work.images]
+
+        cache_dir = Path(self.config.storage.cache_dir).resolve()
+        items: list[tuple[str, Path]] = []      # (r2_key, local_path)
+        fallback_urls: list[str] = [img.public_url for img in work.images]
+        keys_per_image: list[str | None] = [None] * len(work.images)
+
+        for idx, img in enumerate(work.images):
+            try:
+                rel = img.local_path.resolve().relative_to(cache_dir)
+            except (ValueError, AttributeError):
+                # 不在 cache_dir 下的图（极少；防御）→ 跳过 R2，用 nginx
+                continue
+            key = rel.as_posix()
+            keys_per_image[idx] = key
+            items.append((key, img.local_path))
+
+        if not items:
+            return fallback_urls
+
+        try:
+            results = await upload_files_concurrent(self._r2, items, concurrency=8)
+        except Exception as e:
+            logger.warning(
+                f"R2 batch upload raised for {work.provider}/{work.work_id}: {e}; "
+                "falling back to nginx URLs for entire gallery"
+            )
+            return fallback_urls
+
+        # 合成最终 URL：上传成功 → R2 URL；失败 → fallback
+        urls: list[str] = []
+        ok_count = 0
+        for idx, img in enumerate(work.images):
+            key = keys_per_image[idx]
+            if key is not None and results.get(key, False):
+                urls.append(self._r2.public_url(key))
+                ok_count += 1
+            else:
+                urls.append(img.public_url)
+        logger.info(
+            f"R2 upload for {work.provider}[{work.work_id}]: "
+            f"{ok_count}/{len(work.images)} succeeded "
+            f"({len(work.images) - ok_count} fell back to nginx)"
+        )
+        return urls
 
     @staticmethod
     def _build_content(
