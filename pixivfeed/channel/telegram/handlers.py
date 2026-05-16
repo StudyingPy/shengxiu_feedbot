@@ -40,7 +40,7 @@ from telegram.error import TimedOut as TGTimedOut
 from telegram.ext import ContextTypes
 
 from ...config import Config
-from ...provider import ParsedRef, ProviderRegistry, StatusUpdater
+from ...provider import GalleryImage, GalleryWork, ParsedRef, ProviderRegistry, StatusUpdater
 from ...provider.ehentai import EHError, EHGalleryUnavailable, EHMode
 from ...provider.ehentai import _EHFamilyProvider as EHFamilyBase
 from ...provider.ehentai import (
@@ -112,6 +112,40 @@ def _ctx(
 ) -> tuple[Config, ProviderRegistry, TelegraphPublisher, TelegraphCache, AllowList]:
     bd = context.bot_data
     return bd["config"], bd["registry"], bd["publisher"], bd["telegraph_cache"], bd["allowlist"]
+
+
+def _parse_r2_flag(
+    args: list[str], user_id: int, admin_users: list[int],
+) -> tuple[list[str], bool]:
+    """从命令 args 里抠 --r2 / --force-r2 flag。
+
+    flag 仅 admin 可用——非 admin 用了静默忽略（避免把命令的"管理员能用"暴露）。
+    返回 (剩余 args, force_r2 是否生效)。
+    """
+    force = False
+    filtered: list[str] = []
+    is_admin = user_id in set(admin_users)
+    for a in args:
+        if a in ("--r2", "--force-r2"):
+            if is_admin:
+                force = True
+            # 非 admin 也吞掉，避免误传给参数解析
+        else:
+            filtered.append(a)
+    return (filtered, force)
+
+
+def _r2_skipped_suffix(pub) -> str:
+    """publish_gallery 返回的 PublishResult.r2_skipped_reason 非空时给消息追加。
+
+    用户友好版（不带技术 reason，只说后果）："""
+    if not getattr(pub, "r2_skipped_reason", ""):
+        return ""
+    return (
+        "\n\n⚠️ 此 Telegra.ph 因体积过大未上传 R2 持久化存储，"
+        "最短 7 天 最长 30 天后图片可能失效。\n"
+        "如需保留请管理员加 <code>--r2</code> 参数重新发布。"
+    )
 
 
 def _job_queue(context: ContextTypes.DEFAULT_TYPE) -> JobQueueManager:
@@ -371,6 +405,7 @@ class _Pending:
     msg_id: int
     user_id: int                  # 仅这个 user 可点（防群聊抢按）
     created_at: float
+    force_r2: bool = False        # admin --r2 创建时携带，回调到 _eh_run_with_mode 时透传
 
 
 _PENDING: dict[str, _Pending] = {}
@@ -390,6 +425,7 @@ class _SearchState:
     user_id: int                     # 仅这个 user 可点（与 _PENDING 一致）
     expanded: bool                   # False=10 条，True=全部 25 条
     created_at: float
+    force_r2: bool = False           # admin --r2 创建时携带，回调点开/打开时透传到 _eh_run_with_mode
 
 
 _SEARCH_STATES: dict[str, _SearchState] = {}
@@ -452,8 +488,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     refs = registry.extract_all_refs(text)
     if not refs:
         return
+    # 管理员可在消息里写 --r2 / --force-r2 强制本批发布上传 R2（绕过 max_upload_size_gb 护栏）
+    user_id = update.effective_user.id if update.effective_user else 0
+    _, force_r2 = _parse_r2_flag(text.split(), user_id, config.auth.admin_users)
     for ref in refs:
-        await _handle_ref(update, context, ref, mode="auto")
+        await _handle_ref(update, context, ref, mode="auto", force_r2=force_r2)
 
 
 async def cmd_pixiv_telegraph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -465,13 +504,16 @@ async def cmd_pixiv_telegraph(update: Update, context: ContextTypes.DEFAULT_TYPE
     if pixiv is None:
         await update.message.reply_text("⚠️ 未启用 Pixiv Provider")
         return
-    text = " ".join(context.args or []) or (update.effective_message.text or "")
+    user_id = update.effective_user.id if update.effective_user else 0
+    raw_args = list(context.args or [])
+    args, force_r2 = _parse_r2_flag(raw_args, user_id, config.auth.admin_users)
+    text = " ".join(args) or (update.effective_message.text or "")
     refs = pixiv.extract_refs(text)
     if not refs:
-        await update.message.reply_text("用法：/pixiv_telegraph <Pixiv 链接>")
+        await update.message.reply_text("用法：/pixiv_telegraph <Pixiv 链接> [--r2]")
         return
     for ref in refs:
-        await _handle_ref(update, context, ref, mode="ph")
+        await _handle_ref(update, context, ref, mode="ph", force_r2=force_r2)
 
 
 async def cmd_pixiv_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -483,7 +525,10 @@ async def cmd_pixiv_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if pixiv is None:
         await update.message.reply_text("⚠️ 未启用 Pixiv Provider")
         return
-    text = " ".join(context.args or []) or (update.effective_message.text or "")
+    user_id = update.effective_user.id if update.effective_user else 0
+    raw_args = list(context.args or [])
+    args, force_r2 = _parse_r2_flag(raw_args, user_id, config.auth.admin_users)
+    text = " ".join(args) or (update.effective_message.text or "")
     refs = pixiv.extract_refs(text)
     if not refs:
         await update.message.reply_text("用法：/pixiv_direct <Pixiv 链接>")
@@ -527,6 +572,7 @@ async def _handle_ref(
     ref: ParsedRef,
     *,
     mode: str,
+    force_r2: bool = False,
 ) -> None:
     """mode ∈ {auto, ph, direct}"""
     if ref.provider == "pixiv" and ref.kind == "novel":
@@ -547,14 +593,14 @@ async def _handle_ref(
         return
 
     if ref.provider == "pixiv" and ref.kind == "illust":
-        await _handle_pixiv_illust(update, context, ref, mode=mode)
+        await _handle_pixiv_illust(update, context, ref, mode=mode, force_r2=force_r2)
         return
 
     # eh / ex：私聊弹按钮，群聊默认模式
     if ref.provider in ("e-hentai.org", "exhentai.org"):
         chat = update.effective_chat
         if chat is not None and chat.type == "private":
-            await _eh_offer_modes(update, context, ref)
+            await _eh_offer_modes(update, context, ref, force_r2=force_r2)
         else:
             placeholder = await update.message.reply_text(
                 f"⏳ 已收到（{ref.provider}），准备处理..."
@@ -562,7 +608,10 @@ async def _handle_ref(
             user_id = update.effective_user.id if update.effective_user else 0
 
             async def _do() -> None:
-                await _eh_run_with_mode(update, context, ref, mode=None, placeholder=placeholder)
+                await _eh_run_with_mode(
+                    update, context, ref, mode=None, placeholder=placeholder,
+                    force_r2=force_r2,
+                )
 
             await _enqueue(
                 context,
@@ -579,7 +628,9 @@ async def _handle_ref(
     user_id = update.effective_user.id if update.effective_user else 0
 
     async def _do_generic() -> None:
-        await _send_via_telegraph_generic(update, context, ref, placeholder=placeholder)
+        await _send_via_telegraph_generic(
+            update, context, ref, placeholder=placeholder, force_r2=force_r2,
+        )
 
     await _enqueue(
         context,
@@ -597,7 +648,8 @@ async def _handle_ref(
 
 
 async def _eh_offer_modes(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, ref: ParsedRef
+    update: Update, context: ContextTypes.DEFAULT_TYPE, ref: ParsedRef,
+    *, force_r2: bool = False,
 ) -> None:
     config, registry, *_ = _ctx(context)
     provider = _eh_provider(registry, ref.provider)
@@ -635,6 +687,7 @@ async def _eh_offer_modes(
         msg_id=placeholder.message_id,
         user_id=update.effective_user.id,
         created_at=time.time(),
+        force_r2=force_r2,
     )
 
     title = gallery.title.replace("<", "&lt;").replace(">", "&gt;")
@@ -718,6 +771,7 @@ async def _eh_run_with_mode(
     mode: EHMode | None,
     placeholder=None,
     extra_buttons: list[InlineKeyboardButton] | None = None,
+    force_r2: bool = False,
 ) -> None:
     """实际执行 eh/ex 抓取与发布。
 
@@ -841,6 +895,7 @@ async def _eh_run_with_mode(
             page_footer_template=page_footer,
             on_progress=pub_hook,
             on_status=p.update,
+            force_r2=force_r2,
         )
     except Exception as e:
         logger.exception(f"{ref.provider} publish_gallery failed for {ref.id}")
@@ -854,9 +909,10 @@ async def _eh_run_with_mode(
 
     await tg_cache.put(cache_kind, ref.id, pub.primary_url, pub.page_count)
     await placeholder.edit_text(
-        pub.primary_url,
+        pub.primary_url + _r2_skipped_suffix(pub),
         disable_web_page_preview=False,
         reply_markup=extras_markup,
+        parse_mode=ParseMode.HTML if _r2_skipped_suffix(pub) else None,
     )
     # 用量：消息流走 telegraph 发布。bytes_in 估为图片合计，bytes_out 为 0（没回发文件）。
     total_bytes = 0
@@ -1119,7 +1175,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     category = "archive_zip" if mode.is_archive else "telegraph_publish"
 
     async def _do() -> None:
-        await _eh_run_with_mode(update, context, pending.ref, mode=mode, placeholder=msg)
+        await _eh_run_with_mode(
+            update, context, pending.ref, mode=mode, placeholder=msg,
+            force_r2=pending.force_r2,
+        )
 
     await _enqueue(
         context,
@@ -1142,6 +1201,7 @@ async def _handle_pixiv_illust(
     ref: ParsedRef,
     *,
     mode: str,
+    force_r2: bool = False,
 ) -> None:
     config, registry, publisher, tg_cache, _ = _ctx(context)
     pixiv = _pixiv_provider(registry)
@@ -1185,7 +1245,9 @@ async def _handle_pixiv_illust(
         user_id = update.effective_user.id if update.effective_user else 0
 
         async def _do_ph() -> None:
-            await _send_pixiv_illust_via_telegraph(update, context, pid, placeholder=placeholder)
+            await _send_pixiv_illust_via_telegraph(
+                update, context, pid, placeholder=placeholder, force_r2=force_r2,
+            )
 
         await _enqueue(
             context,
@@ -1221,6 +1283,8 @@ async def _handle_pixiv_illust(
 async def _send_via_telegraph_generic(
     update: Update, context: ContextTypes.DEFAULT_TYPE, ref: ParsedRef,
     placeholder=None,
+    *,
+    force_r2: bool = False,
 ) -> None:
     config, registry, publisher, tg_cache, _ = _ctx(context)
 
@@ -1268,6 +1332,7 @@ async def _send_via_telegraph_generic(
             page_footer_template=page_footer,
             on_progress=pub_hook,
             on_status=p.update,
+            force_r2=force_r2,
         )
     except Exception as e:
         logger.exception(f"{ref.provider} publish_gallery failed for {ref.id}")
@@ -1280,7 +1345,11 @@ async def _send_via_telegraph_generic(
         return
 
     await tg_cache.put(cache_kind, ref.id, pub.primary_url, pub.page_count)
-    await placeholder.edit_text(pub.primary_url)
+    suffix = _r2_skipped_suffix(pub)
+    await placeholder.edit_text(
+        pub.primary_url + suffix,
+        parse_mode=ParseMode.HTML if suffix else None,
+    )
     total_bytes = 0
     for img in gallery.images:
         try:
@@ -1311,6 +1380,8 @@ def _resolve_templates(config: Config, provider_name: str) -> tuple[str, str, st
 async def _send_pixiv_illust_via_telegraph(
     update: Update, context: ContextTypes.DEFAULT_TYPE, pid: str,
     placeholder=None,
+    *,
+    force_r2: bool = False,
 ) -> None:
     config, registry, publisher, tg_cache, _ = _ctx(context)
     pixiv = _pixiv_provider(registry)
@@ -1359,6 +1430,7 @@ async def _send_pixiv_illust_via_telegraph(
             page_footer_template=t.page_footer,
             on_progress=pub_hook,
             on_status=p.update,
+            force_r2=force_r2,
         )
     except Exception as e:
         logger.exception(f"publish pixiv illust({pid}) failed")
@@ -1370,7 +1442,11 @@ async def _send_pixiv_illust_via_telegraph(
         return
 
     await tg_cache.put("pixiv/illust", pid, pub.primary_url, pub.page_count)
-    await placeholder.edit_text(pub.primary_url)
+    suffix = _r2_skipped_suffix(pub)
+    await placeholder.edit_text(
+        pub.primary_url + suffix,
+        parse_mode=ParseMode.HTML if suffix else None,
+    )
     total_bytes = 0
     for img in gallery.images:
         try:
@@ -1573,11 +1649,18 @@ def _is_zip(document) -> bool:
 
 
 async def cmd_zip2tph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/zip2tph`：处理回复或带 caption 的 zip。"""
+    """`/zip2tph`：处理回复或带 caption 的 zip。
+
+    可选 admin flag `--r2` 强制把图传 R2（绕过 max_upload_size_gb 护栏）。
+    """
     config, registry, publisher, _, allowlist = _ctx(context)
     if not await is_authorized(update, allowlist):
         return
     await _track_user(update, context)
+
+    user_id = update.effective_user.id if update.effective_user else 0
+    raw_args = list(context.args or [])
+    _, force_r2 = _parse_r2_flag(raw_args, user_id, config.auth.admin_users)
 
     msg = update.effective_message
     target_msg = msg.reply_to_message if msg.reply_to_message else msg
@@ -1588,12 +1671,12 @@ async def cmd_zip2tph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "或对 zip 消息回复 /zip2tph"
         )
         return
-    await _enqueue_zip_to_telegraph(update, context, target_msg)
+    await _enqueue_zip_to_telegraph(update, context, target_msg, force_r2=force_r2)
 
 
 async def handle_zip_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """监听 Document：caption 含 /zip2tph 时自动处理。"""
-    _, _, _, _, allowlist = _ctx(context)
+    config, _, _, _, allowlist = _ctx(context)
     if not await is_authorized(update, allowlist):
         return
     await _track_user(update, context)
@@ -1603,13 +1686,19 @@ async def handle_zip_document(update: Update, context: ContextTypes.DEFAULT_TYPE
     caption = (msg.caption or "").strip()
     if not caption.lower().startswith("/zip2tph"):
         return
-    await _enqueue_zip_to_telegraph(update, context, msg)
+    # caption 形如 "/zip2tph --r2"；admin 才生效
+    user_id = update.effective_user.id if update.effective_user else 0
+    parts = caption.split()
+    _, force_r2 = _parse_r2_flag(parts[1:], user_id, config.auth.admin_users)
+    await _enqueue_zip_to_telegraph(update, context, msg, force_r2=force_r2)
 
 
 async def _enqueue_zip_to_telegraph(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     zip_msg,
+    *,
+    force_r2: bool = False,
 ) -> None:
     """把 zip2tph 包成队列任务。"""
     document = zip_msg.document
@@ -1621,7 +1710,7 @@ async def _enqueue_zip_to_telegraph(
     work_label = f"接收 zip ({fmt_bytes(file_size)})..."
 
     async def _do() -> None:
-        await _process_zip_to_telegraph(update, context, zip_msg, placeholder)
+        await _process_zip_to_telegraph(update, context, zip_msg, placeholder, force_r2=force_r2)
 
     await _enqueue(
         context,
@@ -1638,6 +1727,8 @@ async def _process_zip_to_telegraph(
     context: ContextTypes.DEFAULT_TYPE,
     zip_msg,
     placeholder=None,
+    *,
+    force_r2: bool = False,
 ) -> None:
     config, _, publisher, _, _ = _ctx(context)
     document = zip_msg.document
@@ -1791,72 +1882,82 @@ async def _process_zip_to_telegraph(
             await progress.finish("⚠️ zip 内没有可识别的图片")
             return
 
-        # 拷贝到 cache_dir 让 Nginx 暴露
+        # 拷贝到 cache_dir 让 Nginx 暴露。这是 R2 不可用 / R2 上传失败 / R2 被
+        # 护栏跳过 时的 fallback 源——必须存在，所以这一步对所有路径都执行。
+        # 双份磁盘占用按 cache_days（7 天）清掉。
         token = uuid.uuid4().hex[:10]
         cache_dir = Path(config.storage.cache_dir)
         public_dir = cache_dir / f"zip_{token}"
         public_dir.mkdir(parents=True, exist_ok=True)
-        public_urls: list[str] = []
+        gallery_images: list[GalleryImage] = []
         ctr = ImageCounter(total=len(images), progress=progress, label="拷贝图片")
         for i, src in enumerate(images):
             ext = src.suffix.lower() or ".jpg"
             dest = public_dir / f"p{i:04d}{ext}"
             shutil.copy2(src, dest)
             rel = dest.resolve().relative_to(cache_dir.resolve())
-            public_urls.append(f"{config.publish.base_url.rstrip('/')}/{rel.as_posix()}")
+            public_url = f"{config.publish.base_url.rstrip('/')}/{rel.as_posix()}"
+            # R2 key 用 zip_{token}/pN.ext 跟 cache_dir 相对路径完全对齐——便于
+            # /stats system 看占用时跟 nginx 上的 zip_* 目录对得上号
+            gallery_images.append(GalleryImage(
+                page_index=i,
+                local_path=dest,
+                public_url=public_url,
+                r2_key=rel.as_posix(),
+            ))
             await ctr.tick()
 
         # 标题：去掉扩展名
         raw_name = document.file_name or "archive.zip"
         title = re.sub(r"\.zip$", "", raw_name, flags=re.IGNORECASE).strip() or "图片包"
-        if len(title) > 256:
-            title = title[:253] + "..."
 
-        await progress.status("⏳ 发布到 Telegra.ph...")
         await _drop_cancel_button(placeholder)
-        await publisher.ensure_account()
+        await progress.status("⏳ 发布到 Telegra.ph...")
 
-        max_per_page = config.publish.max_images_per_page
-        chunks = [public_urls[i : i + max_per_page] for i in range(0, len(public_urls), max_per_page)]
+        # 构造 GalleryWork 走通用 publish_gallery 路径——R2 上传 + size guard +
+        # 进度条 + nginx fallback 一起接管。
+        work = GalleryWork(
+            provider="zip2tph",
+            kind="gallery",
+            work_id=document.file_unique_id,
+            source_url="",         # zip2tph 没有外部原作链接
+            title=title,
+            images=gallery_images,
+            extra_vars={"page_count": len(gallery_images)},
+        )
+        # zip2tph 没有自定义模板段（不像 illust/novel/gallery），用一个最小 header
+        header_template = (
+            f"<p>共 {len(gallery_images)} 张 · 来自上传 zip：{_html_escape(raw_name)}</p>"
+        )
 
-        page_urls: list[str] = []
-        next_url: str | None = None
-        for i in range(len(chunks) - 1, -1, -1):
-            nodes: list = []
-            if i == 0:
-                nodes.append(
-                    {
-                        "tag": "p",
-                        "children": [
-                            f"共 {len(public_urls)} 张 · 来自上传 zip：{raw_name}"
-                        ],
-                    }
-                )
-            else:
-                nodes.append({"tag": "p", "children": [f"（续 {i + 1} / {len(chunks)}）"]})
-            for url in chunks[i]:
-                nodes.append({"tag": "figure", "children": [{"tag": "img", "attrs": {"src": url}}]})
-            if next_url:
-                nodes.append(
-                    {
-                        "tag": "p",
-                        "children": [
-                            {"tag": "a", "attrs": {"href": next_url}, "children": ["下一页 →"]}
-                        ],
-                    }
-                )
-
-            page_title = title if i == 0 else f"{title} ({i + 1}/{len(chunks)})"
-            if len(page_title) > 256:
-                page_title = page_title[:253] + "..."
-            page = await publisher.tg.create_page(
-                title=page_title, content=nodes, return_content=False,
+        pub_hook = make_item_hook(progress, "发布 Telegra.ph 页面")
+        try:
+            pub = await publisher.publish_gallery(
+                work,
+                page_title_template=title,
+                page_header_template=header_template,
+                page_footer_template="",
+                on_progress=pub_hook,
+                on_status=progress.update,
+                force_r2=force_r2,
             )
-            page_urls.append(page["url"])
-            next_url = page["url"]
-        page_urls.reverse()
+        except Exception as e:
+            logger.exception("zip2tph publish_gallery failed")
+            await progress.finish(f"⚠️ 发布失败：{e}")
+            await _log_usage(
+                context, update, kind=KIND_ZIP2TPH,
+                ref_id=document.file_unique_id, status="failed",
+            )
+            return
 
-        await progress.finish(page_urls[0])
+        suffix = _r2_skipped_suffix(pub)
+        if suffix:
+            # progress.finish 直接 edit_text 不支持 parse_mode；用 placeholder 兜底
+            await placeholder.edit_text(
+                pub.primary_url + suffix, parse_mode=ParseMode.HTML,
+            )
+        else:
+            await progress.finish(pub.primary_url)
         await _log_usage(
             context, update,
             kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
@@ -3016,16 +3117,23 @@ def _render_search_message(
 
 
 async def cmd_ehsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """关键词搜索 eh/ex 画廊。"""
+    """关键词搜索 eh/ex 画廊。
+
+    admin 可加 `--r2` flag，让本次搜索后续点 [打开] 的发布强制走 R2（绕过
+    max_upload_size_gb 护栏）。
+    """
     config, registry, _, _, allowlist = _ctx(context)
     if not await is_authorized(update, allowlist):
         return
     await _track_user(update, context)
 
-    keyword = " ".join(context.args).strip() if context.args else ""
+    user_id = update.effective_user.id if update.effective_user else 0
+    raw_args = list(context.args or [])
+    args, force_r2 = _parse_r2_flag(raw_args, user_id, config.auth.admin_users)
+    keyword = " ".join(args).strip()
     if not keyword:
         await update.message.reply_text(
-            "用法：/ehsearch <关键词>\n"
+            "用法：/ehsearch <关键词> [--r2]\n"
             "示例：/ehsearch language:chinese translated"
         )
         return
@@ -3063,6 +3171,7 @@ async def cmd_ehsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         user_id=update.effective_user.id,
         expanded=False,
         created_at=time.time(),
+        force_r2=force_r2,
     )
     _SEARCH_STATES[seid] = state
 
@@ -3168,6 +3277,7 @@ def _make_pending_for_item(state: _SearchState, idx: int, query) -> str:
         msg_id=query.message.message_id,
         user_id=state.user_id,
         created_at=time.time(),
+        force_r2=state.force_r2,
     )
     return ptoken
 
