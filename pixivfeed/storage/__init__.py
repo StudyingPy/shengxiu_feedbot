@@ -1,5 +1,6 @@
 from .cache import AllowedEntry, AllowList, RuntimeSettings, TelegraphCache
 from .db import Database
+from .r2 import R2Client, R2Object, lru_evict_to_target, upload_files_concurrent
 from .usage import (
     KIND_ARCHIVE_CMD,
     KIND_EH_ARCHIVE,
@@ -22,6 +23,10 @@ __all__ = [
     "AllowedEntry",
     "TelegraphCache",
     "RuntimeSettings",
+    "R2Client",
+    "R2Object",
+    "upload_files_concurrent",
+    "lru_evict_to_target",
     "UsageStore",
     "UserSummary",
     "ChatSummary",
