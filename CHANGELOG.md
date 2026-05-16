@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.8.0 — 2026-05-15
+
+Telegra.ph 发布走 Cloudflare R2 / 任意 S3 兼容对象存储（opt-in），解决"大画廊 / 冷链接几天后部分 `<img>` 加载失败"。
+
+### 背景
+
+v0.7.x 以及之前，Telegra.ph 页面里的 `<img src>` 指向 bot 服务器自己的 nginx（反代 `cache_dir`）。`cache_dir` 默认 7 天 TTL 清理；CF 边缘缓存能续命到 ~30-40 天；但**早期**没人访问的页面 / 长画廊里部分图过冷被驱逐时，边缘 cache miss 回源 → nginx 已删 → 404 → telegra.ph 页面渲染卡死。
+
+实际表现就是用户报的"部分大 telegraph 无法即时查看"。
+
+### 变更
+
+- **新增 `storage.r2` 配置段**（默认 `enabled: false`）：endpoint / bucket / access_key / secret / custom_domain / capacity_gb / lru_check_interval_minutes。具体字段含义见 `config.example.yaml` 注释。
+- **publisher 上传 R2 后用 R2 URL 喂给 Telegra.ph**。`TelegraphPublisher` 接受 `r2_client` 注入；`publish_gallery` 内部并发上传（默认 8 并发）；URL 切到 R2 自定义域名；单图上传失败该图回退到 nginx URL；整批异常时整批回退。**发布永不因 R2 故障而失败。**
+- **R2 key 跟 cache_dir 相对路径完全一致**（例：`eh_3936793_d89fc4d30a_page_sample/p0.jpg`），方便对账 + 调试。
+- **新增后台 LRU eviction task**。R2 启用且 `capacity_gb > 0` 时，每 `lru_check_interval_minutes` 跑一次 `ListObjectsV2` 全扫；用量超过 `capacity_gb × 0.9` 触发清理，按 LastModified 升序删到 `capacity_gb × 0.7`。R2 不记 access_time，按上传时间近似 LRU。
+
+### 向后兼容（重要）
+
+- **R2 是 opt-in 增强，本地缓存 + nginx 反代仍是默认且一等公民。** clone 本项目什么都不动，行为跟 v0.7.1 完全一致——`r2.enabled` 默认 `false`，publisher 路径里第一行就 short-circuit 出去。
+- 老 Telegra.ph 链接（v0.7.x 及之前发布）`<img src>` 写死指向 nginx，本版**不动**它们；如要拯救老链接需要后续单独 PR（涉及 telegra.ph editPage API + 回填 R2）。
+- 不依赖任何新 PyPI 依赖。R2 客户端是自写 S3 sigv4 协议（~150 行，覆盖 PUT/HEAD/GET-LIST/DELETE），跑过 AWS sigv4 docs 的 well-known derivation example 校验。
+
+### 新增文件 / 改动文件
+
+- `pixivfeed/storage/r2.py`（新增，~340 行）：`R2Client` + `upload_files_concurrent` + `lru_evict_to_target`。
+- `pixivfeed/config.py`：新增 `R2Config` dataclass + 嵌入 `StorageConfig.r2`，扩展 `SENSITIVE_KEYS` + `_validate` enabled 时必填检查。
+- `pixivfeed/publisher/telegraph.py`：`TelegraphPublisher` 加 `r2_client` 参数；新增 `_resolve_image_urls` 决定喂给 telegra.ph 的 URL（R2 / fallback）。
+- `pixivfeed/__main__.py`：根据 `storage.r2.enabled` 实例化 `R2Client`，注入 publisher + init_bot_async。退出时 `aclose()` 关 httpx pool。
+- `pixivfeed/channel/telegram/bot.py`：`build_application` / `init_bot_async` 多接 `r2_client` keyword-only 参数；启用时挂 `_r2_lru_loop` 后台任务（开机 5 分钟稳定期后开始）。
+- `config.example.yaml`：示例 + 注释。
+- `pyproject.toml`：version 0.7.1 → 0.8.0。
+
+### 部署
+
+- 不开 R2：什么都不用做。自动部署 pull 后 `pip install -e .` 重启即可（pyproject 变了所以会触发）。
+- 开 R2：
+  1. CF Dashboard → R2 → Create bucket（建议 location 选离你 bot 服务器近的）
+  2. bucket Settings → Public access → Connect Custom Domain（不要用 `pub-xxx.r2.dev`，有 ratelimit 不能给 telegra.ph 用）
+  3. R2 → Manage API Tokens → Create with "Object Read & Write" + 只授本 bucket
+  4. 编辑 `/etc/pixiv-feed-bot/config.yaml` 加 `storage.r2:` 段，`enabled: true` + 填上面拿到的 endpoint / bucket / access_key / secret / custom_domain
+  5. `systemctl restart pixiv-feed-bot`
+  6. journal 应见 `R2 enabled: bucket=xxx, public=https://...`；发一个画廊看 telegra.ph 页面 `<img src>` 是否指向 R2 域名。
+
+### 已知限制
+
+- v0.7.x 及之前发布的 Telegra.ph 链接里 `<img src>` 仍指 nginx，没法批量改。bot 仍跑 nginx + cache_dir，老链接能撑多久就撑多久。
+- LRU 按"上传时间"近似，不是"最后访问时间"——R2 / S3 不在协议层记 access_time。对你的使用场景（旧画廊基本没人翻）是合理近似。
+
+
 ## v0.7.1 — 2026-05-15
 
 `/ehsearch` 后续 UX 反馈迭代 + eh/ex 详情卡统一 + tag 中文翻译。
