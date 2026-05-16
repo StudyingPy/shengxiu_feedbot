@@ -1,6 +1,6 @@
 from .cache import AllowedEntry, AllowList, RuntimeSettings, TelegraphCache
 from .db import Database
-from .r2 import R2Client, R2Object, lru_evict_to_target, upload_files_concurrent
+from .r2 import R2Client, R2Object, R2StatsSnapshot, lru_evict_to_target, stats_from_objects, upload_files_concurrent
 from .usage import (
     KIND_ARCHIVE_CMD,
     KIND_EH_ARCHIVE,
@@ -25,6 +25,8 @@ __all__ = [
     "RuntimeSettings",
     "R2Client",
     "R2Object",
+    "R2StatsSnapshot",
+    "stats_from_objects",
     "upload_files_concurrent",
     "lru_evict_to_target",
     "UsageStore",

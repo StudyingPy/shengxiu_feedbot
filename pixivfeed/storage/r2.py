@@ -354,17 +354,31 @@ async def upload_files_concurrent(
     items: list[tuple[str, Path]],     # (key, local_path)
     *,
     concurrency: int = 8,
+    on_progress: callable | None = None,   # async (done, total) -> None
 ) -> dict[str, bool]:
     """并发批量 PUT。返回 {key: ok}。
 
     单个失败不抛——调用方按 dict 决定 fallback 策略。
+    on_progress(done, total) 每完成一个文件触发一次（done 含失败的，反映总进度）。
     """
     sem = asyncio.Semaphore(concurrency)
     results: dict[str, bool] = {}
+    total = len(items)
+    done_lock = asyncio.Lock()
+    done_count = 0
 
     async def _one(key: str, path: Path) -> None:
+        nonlocal done_count
         async with sem:
-            results[key] = await client.put_file(key, path)
+            ok = await client.put_file(key, path)
+        results[key] = ok
+        if on_progress is not None:
+            async with done_lock:
+                done_count += 1
+                try:
+                    await on_progress(done_count, total)
+                except Exception:
+                    logger.exception("upload_files_concurrent on_progress raised; suppressed")
 
     await asyncio.gather(*(_one(k, p) for k, p in items), return_exceptions=False)
     return results
@@ -376,20 +390,25 @@ async def lru_evict_to_target(
     high_watermark_bytes: int,
     low_watermark_bytes: int,
     prefix: str = "",
+    objects: list[R2Object] | None = None,
 ) -> tuple[int, int]:
     """如果当前用量 > high_watermark，按 LastModified 升序删到 <= low_watermark。
 
     返回 (删除文件数, 释放字节数)。低于 high_watermark 时 (0, 0)。
+
+    objects 已知时（调用方刚扫过）跳过 list_all 复用——LRU loop 本来就先扫
+    list_all 算 stats 缓存，没必要再扫一次。
     """
     if low_watermark_bytes >= high_watermark_bytes:
         raise ValueError("low_watermark must be < high_watermark")
 
-    objects = await client.list_all(prefix=prefix)
+    if objects is None:
+        objects = await client.list_all(prefix=prefix)
     total = sum(o.size for o in objects)
     if total <= high_watermark_bytes:
         return (0, 0)
 
-    objects.sort(key=lambda o: o.last_modified)   # 最旧排前面
+    objects = sorted(objects, key=lambda o: o.last_modified)   # 最旧排前面（不破坏入参）
     removed_files = 0
     freed = 0
     for o in objects:
@@ -405,9 +424,42 @@ async def lru_evict_to_target(
     return (removed_files, freed)
 
 
+@dataclass
+class R2StatsSnapshot:
+    """LRU loop 扫一次 list_all 后存进 bot_data 的快照。
+
+    /stats system 读 bot_data["r2_stats"] 立即返回（毫秒级），不每次都
+    重扫——一次 list_all 在 80GB 量级要 200+ 次 API 调用 ~20 秒，吃免费额度。
+    """
+    scanned_at: _dt.datetime         # tz-aware UTC
+    total_bytes: int
+    object_count: int
+    oldest_at: _dt.datetime | None   # 最早上传的对象时间，None 表示空 bucket
+    newest_at: _dt.datetime | None
+
+
+def stats_from_objects(objects: list[R2Object]) -> R2StatsSnapshot:
+    """从一次 list_all 结果聚合 stats 快照。"""
+    if not objects:
+        return R2StatsSnapshot(
+            scanned_at=_dt.datetime.now(tz=_dt.timezone.utc),
+            total_bytes=0, object_count=0,
+            oldest_at=None, newest_at=None,
+        )
+    return R2StatsSnapshot(
+        scanned_at=_dt.datetime.now(tz=_dt.timezone.utc),
+        total_bytes=sum(o.size for o in objects),
+        object_count=len(objects),
+        oldest_at=min(o.last_modified for o in objects),
+        newest_at=max(o.last_modified for o in objects),
+    )
+
+
 __all__ = [
     "R2Client",
     "R2Object",
+    "R2StatsSnapshot",
+    "stats_from_objects",
     "upload_files_concurrent",
     "lru_evict_to_target",
 ]

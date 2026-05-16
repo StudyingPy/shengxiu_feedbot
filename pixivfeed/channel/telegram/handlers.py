@@ -80,6 +80,7 @@ from ...storage import (
     AllowList,
     TelegraphCache,
 )
+from ...storage.r2 import lru_evict_to_target
 from ...utils import logger
 from .auth import is_authorized
 from .constants import (
@@ -838,6 +839,7 @@ async def _eh_run_with_mode(
             page_header_template=page_header,
             page_footer_template=page_footer,
             on_progress=pub_hook,
+            on_status=p.update,
         )
     except Exception as e:
         logger.exception(f"{ref.provider} publish_gallery failed for {ref.id}")
@@ -1264,6 +1266,7 @@ async def _send_via_telegraph_generic(
             page_header_template=page_header,
             page_footer_template=page_footer,
             on_progress=pub_hook,
+            on_status=p.update,
         )
     except Exception as e:
         logger.exception(f"{ref.provider} publish_gallery failed for {ref.id}")
@@ -1354,6 +1357,7 @@ async def _send_pixiv_illust_via_telegraph(
             page_header_template=t.page_header,
             page_footer_template=t.page_footer,
             on_progress=pub_hook,
+            on_status=p.update,
         )
     except Exception as e:
         logger.exception(f"publish pixiv illust({pid}) failed")
@@ -3449,15 +3453,89 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cache_dir = Path(config.storage.cache_dir)
         cache_size = await asyncio.to_thread(_dir_size, cache_dir)
         total, used, free = _disk_usage(cache_dir if cache_dir.exists() else Path("/"))
-        text = (
-            "用量统计 · system\n"
-            f"缓存目录：{cache_dir}\n"
-            f"缓存占用：{fmt_bytes(cache_size)}\n"
-            f"磁盘总量：{fmt_bytes(total)}\n"
-            f"已用：{fmt_bytes(used)}\n"
-            f"剩余：{fmt_bytes(free)}"
-        )
-        await update.message.reply_text(text)
+        lines = [
+            "用量统计 · system",
+            f"缓存目录：{cache_dir}",
+            f"缓存占用：{fmt_bytes(cache_size)}",
+            f"磁盘总量：{fmt_bytes(total)}",
+            f"已用：{fmt_bytes(used)}",
+            f"剩余：{fmt_bytes(free)}",
+        ]
+
+        # R2 占用（仅在启用时）。读 bot_data["r2_stats"] 缓存——后台 LRU loop
+        # 每 lru_check_interval_minutes 分钟扫一次 list_all 时顺手填的，不每次
+        # /stats 都重扫（list_all 在 80GB 量级要 ~200 次 API 调用很贵）。
+        r2_client = context.bot_data.get("r2_client")
+        r2_cfg = config.storage.r2
+        if r2_client is not None and r2_cfg.enabled:
+            cap_bytes = r2_cfg.capacity_gb * 1024 ** 3
+            high_at = int(cap_bytes * 0.9)
+            stats = context.bot_data.get("r2_stats")
+            if stats is None:
+                lines.extend([
+                    "",
+                    f"R2 bucket：{r2_cfg.bucket}（启用，但首次扫描尚未完成）",
+                    f"配置容量：{r2_cfg.capacity_gb} GB",
+                    f"扫描间隔：{r2_cfg.lru_check_interval_minutes} 分钟",
+                ])
+            else:
+                pct = (stats.total_bytes / cap_bytes * 100) if cap_bytes > 0 else 0
+                age_min = (
+                    int((time.time() - stats.scanned_at.timestamp()) / 60)
+                )
+                lines.extend([
+                    "",
+                    f"R2 bucket：{r2_cfg.bucket}",
+                    f"R2 占用：{fmt_bytes(stats.total_bytes)} / {r2_cfg.capacity_gb} GB ({pct:.1f}%)",
+                    f"R2 对象数：{stats.object_count:,}",
+                    f"LRU 触发阈值：{fmt_bytes(high_at)}（90%，清到 70%）",
+                ])
+                if stats.oldest_at and stats.newest_at:
+                    lines.extend([
+                        f"最旧对象：{stats.oldest_at.strftime('%Y-%m-%d %H:%M')} UTC",
+                        f"最新对象：{stats.newest_at.strftime('%Y-%m-%d %H:%M')} UTC",
+                    ])
+                lines.append(f"<i>数据扫描于 {age_min} 分钟前</i>")
+        elif r2_cfg.enabled and r2_client is None:
+            lines.extend(["", "⚠️ R2 已配置 enabled=true 但 client 未初始化"])
+        else:
+            lines.extend(["", "R2：未启用（storage.r2.enabled=false）"])
+
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    # /stats r2_evict：手工触发一次 LRU 清理（admin 调试用，正常情况由后台 task 跑）
+    if args and args[0].lower() == "r2_evict":
+        r2_client = context.bot_data.get("r2_client")
+        r2_cfg = config.storage.r2
+        if r2_client is None or not r2_cfg.enabled:
+            await update.message.reply_text("⚠️ R2 未启用")
+            return
+        if r2_cfg.capacity_gb <= 0:
+            await update.message.reply_text("⚠️ storage.r2.capacity_gb=0，LRU 已禁用")
+            return
+        await update.message.reply_chat_action("typing")
+        cap_bytes = r2_cfg.capacity_gb * 1024 ** 3
+        high = int(cap_bytes * 0.9)
+        low = int(cap_bytes * 0.7)
+        try:
+            removed, freed = await lru_evict_to_target(
+                r2_client, high_watermark_bytes=high, low_watermark_bytes=low,
+            )
+            if removed == 0:
+                await update.message.reply_text(
+                    "未触发清理：当前用量低于 90% 阈值\n"
+                    "（用 /stats system 查看具体占用）"
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ LRU 清理完成\n"
+                    f"删除对象：{removed:,}\n"
+                    f"释放空间：{fmt_bytes(freed)}"
+                )
+        except Exception as e:
+            logger.exception("/stats r2_evict failed")
+            await update.message.reply_text(f"⚠️ LRU 清理失败：{e}")
         return
 
     # /stats chats [window]：列群组活跃排行

@@ -33,7 +33,7 @@ from telegraph.aio import Telegraph
 from telegraph.utils import html_to_nodes
 
 from ..config import Config
-from ..provider import GalleryWork, ProgressHook
+from ..provider import GalleryWork, ProgressHook, StatusUpdater
 from ..storage import R2Client, upload_files_concurrent
 from ..utils import logger
 
@@ -122,6 +122,7 @@ class TelegraphPublisher:
         page_header_template: str = "",
         page_footer_template: str = "",
         on_progress: ProgressHook = None,
+        on_status: StatusUpdater = None,
     ) -> PublishResult:
         """发布一个 GalleryWork 到 Telegra.ph。
 
@@ -131,6 +132,9 @@ class TelegraphPublisher:
 
         on_progress(done_pages, total_pages) 在每发完一页 Telegra.ph 后调用。
         单页作品只调一次终态；多页作品每页一调。
+
+        on_status(text) 用于推 R2 上传阶段的状态文本（"⏳ 上传 R2 (12/25)"）。
+        没启用 R2 / 没传 on_status 时跳过；publish 阶段仍走 on_progress。
         """
         await self.ensure_account()
 
@@ -141,7 +145,7 @@ class TelegraphPublisher:
         if len(title_str) > 256:
             title_str = title_str[:253] + "..."
 
-        urls = await self._resolve_image_urls(work)
+        urls = await self._resolve_image_urls(work, on_status=on_status)
         if not urls:
             raise ValueError(f"{work.provider}/{work.work_id}: no images to publish")
         chunks = [urls[i : i + max_per_page] for i in range(0, len(urls), max_per_page)]
@@ -193,7 +197,9 @@ class TelegraphPublisher:
         )
         return PublishResult(urls=page_urls, page_count=total_chunks, image_count=len(urls))
 
-    async def _resolve_image_urls(self, work: GalleryWork) -> list[str]:
+    async def _resolve_image_urls(
+        self, work: GalleryWork, *, on_status: StatusUpdater = None,
+    ) -> list[str]:
         """决定喂给 telegra.ph 的 <img src> URLs。
 
         - R2 启用且 client 注入了：并发把 local_path 上传到 R2，用 R2 公开 URL
@@ -204,6 +210,8 @@ class TelegraphPublisher:
 
         失败策略：单图失败 → 该图回 nginx URL；整图集失败 → 全回 nginx，
         发布仍能继续；这是关键的"R2 故障不阻塞发布"语义。
+
+        on_status 用于在 R2 上传进度上 emit 状态文本（每完成一张 PUT）。
         """
         if self._r2 is None or not self.config.storage.r2.enabled:
             return [img.public_url for img in work.images]
@@ -226,8 +234,24 @@ class TelegraphPublisher:
         if not items:
             return fallback_urls
 
+        if on_status is not None:
+            try:
+                await on_status(f"⏳ 上传 R2 (0/{len(items)})")
+            except Exception:
+                logger.exception("on_status raised; suppressed")
+
+        async def _r2_progress(done: int, total: int) -> None:
+            if on_status is None:
+                return
+            try:
+                await on_status(f"⏳ 上传 R2 ({done}/{total})")
+            except Exception:
+                logger.exception("on_status raised; suppressed")
+
         try:
-            results = await upload_files_concurrent(self._r2, items, concurrency=8)
+            results = await upload_files_concurrent(
+                self._r2, items, concurrency=8, on_progress=_r2_progress,
+            )
         except Exception as e:
             logger.warning(
                 f"R2 batch upload raised for {work.provider}/{work.work_id}: {e}; "
