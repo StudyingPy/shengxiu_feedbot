@@ -240,12 +240,18 @@ class Config:
             nhentai=NHentaiCollectorConfig(**(collectors_raw.get("nhentai") or {})),
         )
 
+        # storage 含嵌套 R2Config，需要单独构造（直接 **storage_raw 会把 r2 dict
+        # 原样塞进字段，运行时 attrgetter 会炸 'dict has no attribute enabled'）
+        storage_raw = dict(data.get("storage") or {})
+        r2_raw = storage_raw.pop("r2", None) or {}
+        storage = StorageConfig(**storage_raw, r2=R2Config(**r2_raw))
+
         return cls(
             telegram=TelegramConfig(**(data.get("telegram") or {})),
             auth=AuthConfig(**(data.get("auth") or {})),
             pixiv=PixivConfig(**(data.get("pixiv") or {})),
             collectors=collectors,
-            storage=StorageConfig(**(data.get("storage") or {})),
+            storage=storage,
             publish=PublishConfig(**(data.get("publish") or {})),
             templates=templates,
             logging=LoggingConfig(**(data.get("logging") or {})),

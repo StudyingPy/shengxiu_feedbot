@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+- **`storage.r2.enabled: true` 启动崩溃**（`AttributeError: 'dict' object has no attribute 'enabled'`）。`Config._from_dict` 里 `StorageConfig(**...)` 把 yaml 解析出的 `r2:` 嵌套 dict 原样塞进 `r2` 字段，没构造成 `R2Config` 实例。v0.8.0 加 `R2Config` 时漏掉了嵌套构造逻辑（其他嵌套 dataclass 如 `collectors.ehentai` 都有显式 `EHentaiCollectorConfig(**...)`）。修复：拆开 `storage` 段处理，先 `pop('r2', None)` 单独 `R2Config(**r2_raw)` 再传给 `StorageConfig`。未启用 R2 的部署 0 影响。
+
+
 ## v0.8.0 — 2026-05-15
 
 Telegra.ph 发布走 Cloudflare R2 / 任意 S3 兼容对象存储（opt-in），解决"大画廊 / 冷链接几天后部分 `<img>` 加载失败"。
