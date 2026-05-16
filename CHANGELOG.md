@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Features
+- **R2 上传进度条**：发布 Telegra.ph 时上传 R2 阶段会在 placeholder 消息上 emit "⏳ 上传 R2 (12/25)" 状态文本，每完成一张 PUT 更新一次。`publish_gallery` 加 `on_status` 参数，3 处 callsite（链接流 / pixiv illust / nhentai 等）都传 `p.update`。
+- **`/stats system` 显示 R2 用量**：bucket 名、占用字节 + 容量百分比、对象数、LRU 90% 触发阈值、最旧/最新对象时间、上次扫描时间。读 `bot_data["r2_stats"]` 缓存毫秒级返回，不每次都重扫（list_all 80GB 量级要 ~200 次 API 调用 ~20 秒，吃 R2 Class A 免费额度）。
+- **后台 task 顺手填 stats 缓存**：原来的 `_r2_lru_loop` 每轮跑 `list_all` → 扫完聚合成 `R2StatsSnapshot` 塞 `bot_data["r2_stats"]` → 顺便复用结果做 LRU 清理（不再扫第 2 次）。开机 30 秒（原来 5 分钟）后跑首轮，admin 启动后立刻 `/stats system` 也能看到数据。
+- **`/stats r2_evict` admin 调试命令**：强制立刻跑一次 LRU 扫描 + 清理，方便手动验证 LRU 行为或紧急清缓存。低于 90% 阈值回"未触发清理"。
+- **README + DEPLOY.md 文档**：README 的功能列表新增 R2 一项；DEPLOY.md 加完整的「Cloudflare R2 / S3 兼容对象存储（可选）」一章——9 步走完含建 bucket、自定义域、API token、config.yaml 段、smoke test、容量管理、故障行为、老链接说明、计费提示。
+
+### Internal
+- `lru_evict_to_target` 加 `objects` 可选参数复用调用方刚扫过的列表，避免 LRU loop 内一轮扫两次。
+- 新增 `R2StatsSnapshot` dataclass + `stats_from_objects(objects)` 聚合函数。
+- `upload_files_concurrent` 加 `on_progress(done, total)` 异步回调，每完成一个 PUT 触发一次（含失败的，反映总进度）。
+- `handlers.py` 把 `from ...storage.r2 import lru_evict_to_target` 提到 module 顶部，去掉函数内 import。
+
 ### Fixes
 - **`storage.r2.enabled: true` 启动崩溃**（`AttributeError: 'dict' object has no attribute 'enabled'`）。`Config._from_dict` 里 `StorageConfig(**...)` 把 yaml 解析出的 `r2:` 嵌套 dict 原样塞进 `r2` 字段，没构造成 `R2Config` 实例。v0.8.0 加 `R2Config` 时漏掉了嵌套构造逻辑（其他嵌套 dataclass 如 `collectors.ehentai` 都有显式 `EHentaiCollectorConfig(**...)`）。修复：拆开 `storage` 段处理，先 `pop('r2', None)` 单独 `R2Config(**r2_raw)` 再传给 `StorageConfig`。未启用 R2 的部署 0 影响。
 

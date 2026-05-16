@@ -314,6 +314,120 @@ journalctl -u pixiv-feed-bot-cleanup.service -n 20 --no-pager
 
 默认每天 04:00 触发（带 30min 抖动），跑 `deploy/cleanup.py` 删 `storage.cache_dir` 下 mtime 超过 `cache_days` 天的文件。telegra.ph_cache 表里的永久映射不动，免得旧链接失效。
 
+## Cloudflare R2 / S3 兼容对象存储（可选）
+
+启用后 publisher 在生成 Telegra.ph 页面前把图片**先上传 R2**，用 R2 自定义域名喂给 Telegra.ph，让发布的页面不再依赖本地 nginx + 7 天 `cache_dir` + CF 边缘缓存撑活——彻底解决"大画廊或冷链接几天后部分图加载失败"。
+
+**默认关闭**（`storage.r2.enabled: false`）。本地缓存 + nginx 反代仍是默认且一等公民，clone 这个项目什么都不动跟之前行为完全一致。
+
+### 1. 在 Cloudflare 控制台建 bucket
+
+1. 登录 Cloudflare → 左侧 **R2 Object Storage** → 第一次用要绑信用卡（不会真扣，10GB 免费额度）
+2. **Create bucket**
+   - Bucket name：自取，全局唯一在你账户内
+   - Location：选 **Asia-Pacific (APAC)** 或 **Automatic**
+   - Storage class：**Standard**
+
+### 2. 绑自定义域名（必须）
+
+bucket → **Settings** → **Public Access** → **Connect Domain**：
+
+1. 输入一个你域名下没用过的子域名（如 `r2.your-domain.com`）
+2. CF 自动加 DNS CNAME（前提：域名 DNS 在 CF 托管），等几十秒到几分钟变 `Active`
+
+> ⚠️ **不要用 `pub-<hash>.r2.dev` 默认开发域名**——它带 ratelimit，Telegra.ph 拉图会被打挂。
+
+### 3. 创建 API token
+
+CF Dashboard 左下角 → **R2** → **Manage R2 API Tokens** → **Create API token**：
+
+| 字段 | 值 |
+|---|---|
+| Token name | `pixiv-feed-bot` |
+| Permissions | **Object Read & Write** |
+| Specify bucket(s) | **Apply to specific buckets only** → 勾你的 bucket |
+| TTL | Forever |
+
+确认后 CF 一次性显示 Access Key ID + Secret Access Key + S3 endpoint URL（形如 `https://<account-id>.r2.cloudflarestorage.com`）。**这页只显示一次**，关掉就找不回 Secret，先拷贝下来。
+
+### 4. 编辑 config.yaml
+
+`/etc/pixiv-feed-bot/config.yaml` 的 `storage:` 段：
+
+```yaml
+storage:
+  cache_dir: "/var/cache/pixiv-feed-bot/images"
+  cache_days: 7
+  db_path: "/var/lib/pixiv-feed-bot/data.db"
+  r2:
+    enabled: true
+    endpoint: "https://<account-id>.r2.cloudflarestorage.com"
+    region: "auto"
+    bucket: "your-bucket-name"
+    access_key_id: "<32 字符 Access Key ID>"
+    secret_access_key: "<64 字符 Secret Access Key>"
+    custom_domain: "https://r2.your-domain.com"   # 不带尾斜杠
+    capacity_gb: 80                               # bot 内置 LRU 阈值
+    lru_check_interval_minutes: 60                # LRU 后台扫描间隔
+```
+
+注意 `r2:` 下面字段必须再缩 2 格变成 `r2` 的子字段（yaml 缩进敏感）。
+
+### 5. 重启与验证
+
+```bash
+sudo systemctl restart pixiv-feed-bot
+sudo journalctl -u pixiv-feed-bot --since "2 min ago" | grep -iE 'r2 enabled|r2 stats'
+```
+
+期望看到：
+```
+INFO  R2 enabled: bucket=your-bucket-name, public=https://r2.your-domain.com
+INFO  R2 stats: 0 objects, 0.00 GB / 80 GB           ← 30 秒后首次扫描
+```
+
+发个之前没发过的画廊（已发过的会命中 `telegraph_cache` 走老链接），等 Telegra.ph URL 出来后日志会出现：
+
+```
+INFO  R2 upload for e-hentai.org[gid/token]: 25/25 succeeded (0 fell back to nginx)
+INFO  published e-hentai.org[gid/token] -> https://telegra.ph/...
+```
+
+浏览器开发者工具 → Network 看图的 URL 应是 `https://r2.your-domain.com/...`，而不是 `https://feed.your-domain.com/p/...`。
+
+### 6. 容量管理
+
+bot 内置 LRU 后台 task 每 `lru_check_interval_minutes` 分钟扫一次 R2，超过 `capacity_gb × 0.9` 触发清理，按 `LastModified` 升序删到 `capacity_gb × 0.7`。R2/S3 协议层不记 access_time，按上传时间近似（旧画廊基本没人翻，合理）。
+
+管理命令：
+
+- `/stats system` — 显示 R2 占用、对象数、最旧/最新对象时间、距上次扫描的分钟数。读后台 task 缓存的快照，毫秒级返回。
+- `/stats r2_evict` — admin 调试用，强制立刻跑一次 LRU 扫描+清理。低于 90% 阈值时会回"未触发清理"。
+
+### 7. R2 故障时的行为
+
+publisher 内部 R2 上传失败时**自动回退到 nginx URL**，单图失败该图回退、整图集失败全回退。**发布永不因 R2 故障而失败**，这是关键的鲁棒性保障。日志会显示 fallback 数：
+
+```
+INFO  R2 upload for ...: 23/25 succeeded (2 fell back to nginx)
+```
+
+### 8. 老 Telegra.ph 链接
+
+启用 R2 之**前**发布的 Telegra.ph 页面里 `<img src>` 写死指向 nginx，不会被自动迁移到 R2——但本地 cache_dir 里还在的图会继续可用。彻底拯救老链接（迁移老图到 R2 + 用 Telegra.ph editPage API 改写所有老页面 URL）需要后续单独做，本期不动。
+
+### 9. 计费提示
+
+R2 计费（截至 2026 年）：
+
+- **存储**：$0.015/GB/月 → 80GB ≈ $1.2/月
+- **Class A**（PUT/LIST/DELETE）：每月免费 1 万次，超出 $4.5/百万
+- **Class B**（GET/HEAD）：每月免费 1000 万次
+- **出口流量**：**0 元**（R2 vs S3 最大优势）
+
+bot 主动 LRU 默认每小时扫一次 list_all（80GB 量级 ~200 次 API 调用 = ~5K Class A/月），加上每次发布的 PUT，远低于免费额度。
+
+
 ## 本地 Bot API
 
 Telegram 官方 Bot API 限制 `getFile` 20MB、`sendDocument` 50MB。使用 `/zip2tph`（接收用户上传 zip）或 `/archive`（打包图集回发）时，文件大小几乎一定超过此限制。需要自建 [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) 服务绕开。
