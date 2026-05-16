@@ -18,6 +18,7 @@ eh/ex 流程（群聊或非交互场景）：
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import re
 import shutil
 import tempfile
@@ -80,7 +81,7 @@ from ...storage import (
     AllowList,
     TelegraphCache,
 )
-from ...storage.r2 import lru_evict_to_target
+from ...storage.r2 import R2StatsSnapshot, lru_evict_to_target, stats_from_objects
 from ...utils import logger
 from .auth import is_authorized
 from .constants import (
@@ -3432,6 +3433,14 @@ async def _handle_ehs_arch(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+_TZ_UTC8 = _dt.timezone(_dt.timedelta(hours=8))
+
+
+def _fmt_utc8(ts: _dt.datetime) -> str:
+    """tz-aware UTC datetime → 北京时间 (UTC+8) 字符串。"""
+    return ts.astimezone(_TZ_UTC8).strftime("%Y-%m-%d %H:%M")
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """admin only。用法见上面注释。"""
     config: Config = context.bot_data["config"]
@@ -3492,8 +3501,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 ])
                 if stats.oldest_at and stats.newest_at:
                     lines.extend([
-                        f"最旧对象：{stats.oldest_at.strftime('%Y-%m-%d %H:%M')} UTC",
-                        f"最新对象：{stats.newest_at.strftime('%Y-%m-%d %H:%M')} UTC",
+                        f"最旧对象：{_fmt_utc8(stats.oldest_at)}（UTC+8）",
+                        f"最新对象：{_fmt_utc8(stats.newest_at)}（UTC+8）",
                     ])
                 lines.append(f"<i>数据扫描于 {age_min} 分钟前</i>")
         elif r2_cfg.enabled and r2_client is None:
@@ -3504,7 +3513,10 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
         return
 
-    # /stats r2_evict：手工触发一次 LRU 清理（admin 调试用，正常情况由后台 task 跑）
+    # /stats r2_evict：手工触发一次 R2 扫描 + LRU 清理（admin 调试用）。
+    # 行为：发"⏳ 扫描 R2..."占位 → list_all → 把新 snapshot 塞 bot_data["r2_stats"]
+    #      （顺带刷新 /stats system 看到的缓存）→ 用同一份 objects 跑 LRU 清理 →
+    #      edit 占位为最终结果（含清理摘要 + 当前用量），不需要再敲 /stats system 查。
     if args and args[0].lower() == "r2_evict":
         r2_client = context.bot_data.get("r2_client")
         r2_cfg = config.storage.r2
@@ -3514,28 +3526,75 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if r2_cfg.capacity_gb <= 0:
             await update.message.reply_text("⚠️ storage.r2.capacity_gb=0，LRU 已禁用")
             return
-        await update.message.reply_chat_action("typing")
         cap_bytes = r2_cfg.capacity_gb * 1024 ** 3
         high = int(cap_bytes * 0.9)
         low = int(cap_bytes * 0.7)
+
+        placeholder = await update.message.reply_text("⏳ 扫描 R2 bucket...")
+        try:
+            objects = await r2_client.list_all()
+        except Exception as e:
+            logger.exception("/stats r2_evict: list_all failed")
+            await placeholder.edit_text(f"⚠️ R2 扫描失败：{e}")
+            return
+
+        snapshot_before = stats_from_objects(objects)
+        # 即使没触发清理也刷新缓存——这是用户 explicit 触发的最新数据
+        context.bot_data["r2_stats"] = snapshot_before
+
+        await placeholder.edit_text(
+            f"⏳ 扫描完成（{snapshot_before.object_count:,} 对象，"
+            f"{fmt_bytes(snapshot_before.total_bytes)}）。"
+            f"评估清理..."
+        )
+
         try:
             removed, freed = await lru_evict_to_target(
-                r2_client, high_watermark_bytes=high, low_watermark_bytes=low,
+                r2_client,
+                high_watermark_bytes=high, low_watermark_bytes=low,
+                objects=objects,
             )
-            if removed == 0:
-                await update.message.reply_text(
-                    "未触发清理：当前用量低于 90% 阈值\n"
-                    "（用 /stats system 查看具体占用）"
-                )
-            else:
-                await update.message.reply_text(
-                    f"✅ LRU 清理完成\n"
-                    f"删除对象：{removed:,}\n"
-                    f"释放空间：{fmt_bytes(freed)}"
-                )
         except Exception as e:
-            logger.exception("/stats r2_evict failed")
-            await update.message.reply_text(f"⚠️ LRU 清理失败：{e}")
+            logger.exception("/stats r2_evict: evict failed")
+            await placeholder.edit_text(f"⚠️ LRU 清理失败：{e}")
+            return
+
+        # 清理完成 → 用 patched snapshot 反映现状
+        if removed > 0:
+            new_total = snapshot_before.total_bytes - freed
+            new_count = snapshot_before.object_count - removed
+            patched = R2StatsSnapshot(
+                scanned_at=snapshot_before.scanned_at,
+                total_bytes=new_total,
+                object_count=new_count,
+                oldest_at=snapshot_before.oldest_at,   # 删的是最旧——精确值要重扫
+                newest_at=snapshot_before.newest_at,
+            )
+            context.bot_data["r2_stats"] = patched
+            pct = (new_total / cap_bytes * 100) if cap_bytes > 0 else 0
+            text = (
+                f"✅ LRU 清理完成\n"
+                f"删除对象：{removed:,}\n"
+                f"释放空间：{fmt_bytes(freed)}\n"
+                "─────────\n"
+                f"R2 当前占用：{fmt_bytes(new_total)} / {r2_cfg.capacity_gb} GB ({pct:.1f}%)\n"
+                f"R2 对象数：{new_count:,}"
+            )
+        else:
+            pct = (snapshot_before.total_bytes / cap_bytes * 100) if cap_bytes > 0 else 0
+            text = (
+                f"未触发清理：当前用量低于 90% 阈值\n"
+                "─────────\n"
+                f"R2 占用：{fmt_bytes(snapshot_before.total_bytes)} / {r2_cfg.capacity_gb} GB ({pct:.1f}%)\n"
+                f"R2 对象数：{snapshot_before.object_count:,}\n"
+                f"LRU 触发阈值：{fmt_bytes(high)}（90%）"
+            )
+            if snapshot_before.oldest_at and snapshot_before.newest_at:
+                text += (
+                    f"\n最旧对象：{_fmt_utc8(snapshot_before.oldest_at)}（UTC+8）"
+                    f"\n最新对象：{_fmt_utc8(snapshot_before.newest_at)}（UTC+8）"
+                )
+        await placeholder.edit_text(text)
         return
 
     # /stats chats [window]：列群组活跃排行
@@ -3617,7 +3676,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "  /stats chats [窗口]            按群组/私聊活跃度排行\n"
                 "  /stats user <@u|id> [窗口]     单用户\n"
                 "  /stats chat <id|@u> [窗口]     单群组（接受 -100… / 短 id / @username）\n"
-                "  /stats system                  缓存与磁盘\n"
+                "  /stats system                  缓存与磁盘 + R2 用量\n"
+                "  /stats r2_evict                立刻扫一次 R2 + 触发 LRU 清理\n"
                 "窗口示例：1h / 24h / 7d / 30d（默认 24h）"
             )
             return
