@@ -81,6 +81,10 @@ class GalleryImage:
     # tg_photo 是缩放/压缩到 TG sendPhoto 上限的派生 JPEG。
     # 不是所有 Provider 都需要它（多数图集站只走 telegraph）。
     tg_photo_path: Path | None = None
+    # R2 key（可选）。调用方显式指定时优先用这个；为空时 publisher 会尝试
+    # 从 local_path 相对 cache_dir 推导。zip2tph 这种 local_path 在 tmpdir
+    # 不在 cache_dir 下的场景必须显式指定，否则会被 publisher 跳过 R2 走 fallback。
+    r2_key: str | None = None
 
 
 @dataclass

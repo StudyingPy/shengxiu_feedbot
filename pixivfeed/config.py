@@ -109,6 +109,9 @@ class R2Config:
     secret_access_key: str = ""
     custom_domain: str = ""         # https://r2.your-domain.com（自定义域名 base，不含尾斜杠）
     capacity_gb: int = 80           # 容量阈值（GB），<= 0 关闭自动 LRU
+    # 单次发布总字节超过此阈值（GB）时，跳过 R2 走 nginx 本地缓存（7 天 TTL）。
+    # 用户/管理员可在命令上加 --r2 强制覆盖，让大体积也上 R2。设 0.0 关闭护栏（全部上传）。
+    max_upload_size_gb: float = 1.0
     lru_check_interval_minutes: int = 60   # bot 内多久跑一次 LRU 扫描（仅 R2 用量超阈值时才删）
 
 
