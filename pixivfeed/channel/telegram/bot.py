@@ -25,7 +25,8 @@ from ...config import Config
 from ...provider import ProviderRegistry
 from ...provider.ehentai import EHTagDB
 from ...publisher import TelegraphPublisher
-from ...storage import AllowList, Database, RuntimeSettings, TelegraphCache, UsageStore
+from ...storage import AllowList, Database, R2Client, RuntimeSettings, TelegraphCache, UsageStore
+from ...storage.r2 import lru_evict_to_target
 from ...utils import logger
 from .auth import cmd_allow, cmd_chatid, cmd_deny, cmd_listallow
 from .handlers import (
@@ -114,6 +115,8 @@ def build_application(
     registry: ProviderRegistry,
     publisher: TelegraphPublisher,
     runtime_settings: RuntimeSettings,
+    *,
+    r2_client: R2Client | None = None,
 ) -> Application:
     builder = ApplicationBuilder().token(config.telegram.token)
     if config.telegram.base_url:
@@ -166,6 +169,10 @@ def build_application(
     tagdb_path = Path(config.storage.db_path).parent / "ehtagdb.json"
     app.bot_data["ehtagdb"] = EHTagDB(tagdb_path)
 
+    # R2 客户端（可选；未启用为 None）。publisher 自己持有，这里仅供 LRU
+    # 后台 task 读取。
+    app.bot_data["r2_client"] = r2_client
+
     # 命令
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -204,8 +211,10 @@ async def init_bot_async(
     registry: ProviderRegistry,
     publisher: TelegraphPublisher,
     runtime_settings: RuntimeSettings,
+    *,
+    r2_client: R2Client | None = None,
 ) -> Application:
-    app = build_application(config, db, registry, publisher, runtime_settings)
+    app = build_application(config, db, registry, publisher, runtime_settings, r2_client=r2_client)
 
     allowlist: AllowList = app.bot_data["allowlist"]
     for uid in config.auth.initial_allowed_users:
@@ -222,7 +231,39 @@ async def init_bot_async(
     tagdb: EHTagDB = app.bot_data["ehtagdb"]
     asyncio.create_task(tagdb.load())
 
+    # R2 LRU 后台 task：仅 R2 启用 + capacity_gb > 0 才挂。轻量轮询，超阈值
+    # 才会真的扫 + 删。
+    if r2_client is not None and config.storage.r2.capacity_gb > 0:
+        asyncio.create_task(_r2_lru_loop(r2_client, config))
+
     return app
+
+
+async def _r2_lru_loop(r2_client: R2Client, config: Config) -> None:
+    """每 lru_check_interval_minutes 分钟跑一次 LRU。
+
+    用量超过 capacity_gb × 0.9 触发清理，清到 capacity_gb × 0.7 停手。
+    扫一次 ListObjectsV2 全量（每页 1000 条），R2 这个开销很小。
+    """
+    r2_cfg = config.storage.r2
+    interval = max(60, r2_cfg.lru_check_interval_minutes * 60)
+    cap_bytes = r2_cfg.capacity_gb * 1024 ** 3
+    high = int(cap_bytes * 0.9)
+    low = int(cap_bytes * 0.7)
+    # 开机 5 分钟内不跑一遍——给 bot 启动一段稳定期，避免冷启动 spike
+    await asyncio.sleep(300)
+    while True:
+        try:
+            removed, freed = await lru_evict_to_target(
+                r2_client, high_watermark_bytes=high, low_watermark_bytes=low,
+            )
+            if removed > 0:
+                logger.success(
+                    f"R2 LRU: evicted {removed} objects, freed {freed / 1_000_000_000:.2f} GB"
+                )
+        except Exception:
+            logger.exception("R2 LRU iteration failed; will retry next interval")
+        await asyncio.sleep(interval)
 
 
 __all__ = ["build_application", "init_bot_async", "install_commands"]

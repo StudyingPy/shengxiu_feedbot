@@ -34,7 +34,7 @@ from .provider.ehentai import EHentaiProvider, ExHentaiProvider
 from .provider.nhentai import NHentaiProvider
 from .provider.pixiv import PixivProvider
 from .publisher import TelegraphPublisher
-from .storage import Database, RuntimeSettings
+from .storage import Database, R2Client, RuntimeSettings
 from .utils import logger, setup_logging
 
 
@@ -127,12 +127,26 @@ async def async_main(config_path: Path) -> None:
     # Provider Registry
     registry = build_registry(config)
 
+    # R2（可选；未启用时 r2_client=None，publisher 全程走本地 nginx fallback）
+    r2_client: R2Client | None = None
+    if config.storage.r2.enabled:
+        r2 = config.storage.r2
+        r2_client = R2Client(
+            endpoint=r2.endpoint,
+            region=r2.region,
+            bucket=r2.bucket,
+            access_key_id=r2.access_key_id,
+            secret_access_key=r2.secret_access_key,
+            custom_domain=r2.custom_domain,
+        )
+        logger.info(f"R2 enabled: bucket={r2.bucket}, public={r2.custom_domain}")
+
     # Telegraph
-    publisher = TelegraphPublisher(config)
+    publisher = TelegraphPublisher(config, r2_client=r2_client)
     await publisher.ensure_account()
 
     # Bot
-    app = await init_bot_async(config, db, registry, publisher, runtime_settings)
+    app = await init_bot_async(config, db, registry, publisher, runtime_settings, r2_client=r2_client)
 
     logger.success("Starting bot polling...")
 
@@ -167,6 +181,11 @@ async def async_main(config_path: Path) -> None:
         except Exception:
             logger.exception("error during shutdown")
         await db.close()
+        if r2_client is not None:
+            try:
+                await r2_client.aclose()
+            except Exception:
+                pass
         logger.info("Bye.")
 
 
