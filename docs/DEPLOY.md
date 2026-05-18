@@ -318,7 +318,7 @@ journalctl -u pixiv-feed-bot-cleanup.service -n 20 --no-pager
 
 启用后 publisher 在生成 Telegra.ph 页面前把图片**先上传 R2**，用 R2 自定义域名喂给 Telegra.ph，让发布的页面不再依赖本地 nginx + 7 天 `cache_dir` + CF 边缘缓存撑活——彻底解决"大画廊或冷链接几天后部分图加载失败"。
 
-**默认关闭**（`storage.r2.enabled: false`）。本地缓存 + nginx 反代仍是默认且一等公民，clone 这个项目什么都不动跟之前行为完全一致。
+**默认关闭**（`storage.r2.enabled: false`）。本地缓存 + nginx 反代仍是默认行为，clone 这个项目什么都不动跟之前行为完全一致。
 
 ### 1. 在 Cloudflare 控制台建 bucket
 
@@ -335,7 +335,7 @@ bucket → **Settings** → **Public Access** → **Connect Domain**：
 1. 输入一个你域名下没用过的子域名（如 `r2.your-domain.com`）
 2. CF 自动加 DNS CNAME（前提：域名 DNS 在 CF 托管），等几十秒到几分钟变 `Active`
 
-> ⚠️ **不要用 `pub-<hash>.r2.dev` 默认开发域名**——它带 ratelimit，Telegra.ph 拉图会被打挂。
+> ⚠️ **不要用 `pub-<hash>.r2.dev` 默认开发域名**——它带 ratelimit，Telegra.ph 拉取图片可能会被限制。
 
 ### 3. 创建 API token
 
@@ -397,13 +397,13 @@ INFO  published e-hentai.org[gid/token] -> https://telegra.ph/...
 
 ### 6. 容量管理
 
-bot 内置 LRU 后台 task 每 `lru_check_interval_minutes` 分钟扫一次 R2，超过 `capacity_gb × 0.9` 触发清理，按 `LastModified` 升序删到 `capacity_gb × 0.7`。R2/S3 协议层不记 access_time，按上传时间近似（旧画廊基本没人翻，合理）。
+bot 内置 LRU 后台 task 每 `lru_check_interval_minutes` 分钟（默认 60 分钟）扫一次 R2，超过设定容量的 90% 触发清理，按 `LastModified` 升序删到设定容量的 70% 。自动清除最早上传的文件。
 
 另一道护栏是**单次发布体积上限** `max_upload_size_gb`（默认 1.0 GB）。一次发布总字节超过此阈值时跳过 R2 走本地 nginx + 7 天 cache_days；Telegra.ph 完成消息会追加：
 
 > ⚠️ 此 Telegra.ph 因体积过大未上传 R2 持久化存储，最短 7 天 最长 30 天后图片可能失效。
 
-管理员可在命令上加 `--r2` 标志强制覆盖护栏（详见 README "管理命令"）。
+管理员可在命令上加 `--r2` 标志强制上传至 R2 （详见 README "管理命令"）。
 
 管理命令：
 
