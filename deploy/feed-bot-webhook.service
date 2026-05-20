@@ -9,7 +9,7 @@ Type=simple
 User=deploy
 Group=deploy
 
-# 仅监听 127.0.0.1，外部访问由 Nginx 反代 https://feed.fengshengxiu.club/deploy 进入
+# 仅监听 127.0.0.1，外部访问由 Nginx 反代 https://<your-domain>/deploy 进入
 ExecStart=/usr/bin/webhook \
     -hooks /etc/feed-bot-webhook/hooks.json \
     -ip 127.0.0.1 \
