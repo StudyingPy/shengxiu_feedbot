@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -107,4 +108,51 @@ __all__ = [
     "fmt_bytes",
     "fmt_duration",
     "ByteRateTracker",
+    "MIN_FREE_DISK_BYTES",
+    "disk_free_bytes",
+    "check_disk_free",
+    "format_disk_full_message",
 ]
+
+
+# ---------------------------------------------------------------------------
+# 磁盘剩余空间护栏
+# ---------------------------------------------------------------------------
+# 任何"重活"（下载图片、归档 zip、zip2tph 接收）在入队前都先调用
+# check_disk_free() 看 cache_dir 所在挂载点是否还剩 >= MIN_FREE_DISK_BYTES。
+# 不足则在 placeholder 消息上回 format_disk_full_message()，避免把磁盘顶满。
+
+MIN_FREE_DISK_BYTES = 500 * 1024 * 1024  # 500 MB 安全余量
+
+
+def disk_free_bytes(path: Path | str) -> int:
+    """返回 path 所在挂载点的剩余字节数。失败时返回 0（保守地视为磁盘满）。"""
+    try:
+        return shutil.disk_usage(str(path)).free
+    except OSError:
+        return 0
+
+
+def check_disk_free(path: Path | str, extra_required: int = 0) -> tuple[bool, int, int]:
+    """检查 path 所在挂载点是否还有 MIN_FREE_DISK_BYTES + extra_required 字节。
+
+    返回 (ok, free_bytes, required_bytes)。
+    extra_required 用于已知体积的任务（如 zip2tph 已知 document.file_size）。
+    """
+    free = disk_free_bytes(path)
+    required = MIN_FREE_DISK_BYTES + max(0, extra_required)
+    return free >= required, free, required
+
+
+def format_disk_full_message(free_bytes: int, extra_required: int = 0) -> str:
+    """生成统一的中文用户提示。"""
+    head = f"⚠️ 服务器磁盘剩余 {fmt_bytes(free_bytes)}，"
+    if extra_required > 0:
+        mid = (
+            f"本次任务约需 {fmt_bytes(extra_required)} + "
+            f"{fmt_bytes(MIN_FREE_DISK_BYTES)} 安全余量，"
+        )
+    else:
+        mid = f"低于 {fmt_bytes(MIN_FREE_DISK_BYTES)} 安全余量阈值，"
+    tail = "已拒绝任务以避免顶满磁盘。请稍后重试或联系管理员清理缓存。"
+    return head + mid + tail

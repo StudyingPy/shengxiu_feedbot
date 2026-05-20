@@ -83,7 +83,11 @@ from ...storage import (
     TelegraphCache,
 )
 from ...storage.r2 import R2ListIncomplete, R2StatsSnapshot, lru_evict_to_target, stats_from_objects
-from ...utils import logger
+from ...utils import (
+    check_disk_free,
+    format_disk_full_message,
+    logger,
+)
 from .auth import is_authorized
 from .constants import (
     CANCEL_TOKEN_TTL,
@@ -403,6 +407,36 @@ def _attach_progress_markup(progress, placeholder) -> None:
         progress.set_markup(markup)
 
 
+async def _gate_disk_space(
+    context: ContextTypes.DEFAULT_TYPE,
+    placeholder,
+    *,
+    extra_required: int = 0,
+) -> bool:
+    """任务入队前的磁盘剩余空间护栏。
+
+    检查 storage.cache_dir 所在挂载点是否还有 ≥ MIN_FREE_DISK_BYTES + extra_required。
+    不足时在 placeholder 上写中文提示并返回 False；调用方应直接 return。
+    充足时返回 True，调用方继续 _enqueue。
+    """
+    config, *_ = _ctx(context)
+    cache_dir = Path(config.storage.cache_dir)
+    # cache_dir 在启动时已确保存在；若意外不存在则退到其父目录 / 根，避免 disk_usage 报错
+    probe = cache_dir if cache_dir.exists() else (cache_dir.parent if cache_dir.parent.exists() else Path("/"))
+    ok, free, required = check_disk_free(probe, extra_required=extra_required)
+    if ok:
+        return True
+    logger.warning(
+        f"disk gate refused task: free={free} bytes, required={required} bytes "
+        f"(extra={extra_required}) at {probe}"
+    )
+    try:
+        await placeholder.edit_text(format_disk_full_message(free, extra_required))
+    except Exception:
+        pass
+    return False
+
+
 async def _enqueue(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -684,6 +718,8 @@ async def _handle_ref(
     """mode ∈ {auto, ph, direct}"""
     if ref.provider == "pixiv" and ref.kind == "novel":
         placeholder = await update.message.reply_text(f"⏳ 已收到（pixiv novel {ref.id}），准备处理...")
+        if not await _gate_disk_space(context, placeholder):
+            return
         user_id = update.effective_user.id if update.effective_user else 0
 
         async def _do_novel() -> None:
@@ -714,6 +750,8 @@ async def _handle_ref(
             placeholder = await update.message.reply_text(
                 f"⏳ 已收到（{ref.provider}），准备处理..."
             )
+            if not await _gate_disk_space(context, placeholder):
+                return
             user_id = update.effective_user.id if update.effective_user else 0
 
             async def _do() -> None:
@@ -734,6 +772,8 @@ async def _handle_ref(
 
     # nhentai 与其它走默认 telegraph
     placeholder = await update.message.reply_text(f"⏳ 已收到（{ref.provider}），准备处理...")
+    if not await _gate_disk_space(context, placeholder):
+        return
     user_id = update.effective_user.id if update.effective_user else 0
 
     async def _do_generic() -> None:
@@ -1306,6 +1346,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception:
         pass
 
+    if not await _gate_disk_space(context, msg):
+        return
+
     user_id = pending.user_id
     # archive_* 模式归 archive_zip 队列；page_* 走 telegraph_publish
     category = "archive_zip" if mode.is_archive else "telegraph_publish"
@@ -1378,6 +1421,8 @@ async def _handle_pixiv_illust(
     if final_mode == "ph":
         # 拉队列；pixiv illust 通过 telegraph_publish 类别走
         placeholder = await update.message.reply_text(f"⏳ 已收到（pixiv {pid}），准备处理...")
+        if not await _gate_disk_space(context, placeholder):
+            return
         user_id = update.effective_user.id if update.effective_user else 0
 
         async def _do_ph() -> None:
@@ -1396,6 +1441,8 @@ async def _handle_pixiv_illust(
     else:
         # 直发图片走 direct_image 队列
         placeholder = await update.message.reply_text(f"⏳ 已收到（pixiv {pid}），准备处理...")
+        if not await _gate_disk_space(context, placeholder):
+            return
         user_id = update.effective_user.id if update.effective_user else 0
 
         async def _do_direct() -> None:
@@ -1885,6 +1932,11 @@ async def _enqueue_zip_to_telegraph(
     placeholder = await update.effective_message.reply_text(
         f"⏳ 已收到 zip ({fmt_bytes(file_size)})，准备处理..."
     )
+    # zip 接收阶段会落盘 file_size 字节；解压 + 拷贝到 cache_dir 还需要一份。
+    # 取 2×file_size 作为保守预估（实际峰值 ≈ 下载 + 解压同时存在的那段时间）。
+    extra_required = file_size * 2 if file_size > 0 else 0
+    if not await _gate_disk_space(context, placeholder, extra_required=extra_required):
+        return
     user_id = update.effective_user.id if update.effective_user else 0
     work_label = f"接收 zip ({fmt_bytes(file_size)})..."
 
@@ -2236,6 +2288,8 @@ async def _archive_one_ref(
     placeholder = await update.message.reply_text(
         f"⏳ 已收到 /archive 请求（{ref.provider} {ref.id}），准备处理..."
     )
+    if not await _gate_disk_space(context, placeholder):
+        return
     user_id = update.effective_user.id if update.effective_user else 0
 
     async def _do() -> None:
@@ -2863,6 +2917,9 @@ async def handle_callback_archive(update: Update, context: ContextTypes.DEFAULT_
         )
     except Exception:
         pass
+
+    if not await _gate_disk_space(context, placeholder):
+        return
 
     async def _do() -> None:
         await _eh_archive_with_mode(
