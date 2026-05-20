@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.8.3 — 2026-05-20
+
+磁盘剩余空间护栏 + 文档大幅重写。鲁棒性补强，无新功能。
+
+### Fixes
+- **磁盘满时不再以 OSError(28) 顶死**。下载图片 / 归档 zip / `/zip2tph` 接收 / `shutil.copy2` 拷贝到 `cache_dir` 等所有"重活"路径在 ENOSPC 发生前均无任何预检查；磁盘满时 Python 抛裸 `[Errno 28] No space left on device`，placeholder 只显示这一行错误，同时 `cache_dir` 已被部分写入的脏数据撑满，可能波及同主机其它服务。
+  本版在 `pixivfeed/utils.py` 新增 `MIN_FREE_DISK_BYTES = 500 MB` 与 `check_disk_free` / `format_disk_full_message` 共享 helper；`pixivfeed/channel/telegram/handlers.py` 新增 `_gate_disk_space()` 并在所有任务入队前调用一次（贴链接、`/archive`、`/zip2tph`、eh/ex 模式按钮回调等共 7 处入口），cache_dir 所在挂载点剩余空间不足 500 MB 时直接 edit placeholder 给中文提示并 return，避免顶满磁盘。`/zip2tph` 因已知 `document.file_size`，按 2×file_size + 500 MB 余量做复合预估（覆盖 zip 接收 + 解压同时落盘的峰值）。
+
+### Docs
+- **README.md 重构**。原 README 把功能清单铺成一长串，既不突出价值也不提醒部署资源需求。重写后开头一句话概括用途 + 5 条特点；新增「部署要求」表格明确列出磁盘空间（建议 ≥50 GB）、公网域名、Nginx 等硬性需求；「快速开始」精简为只列最少必填项；散落的命令整合到「其它命令」表，避免新用户首屏被淹没。
+- **docs/DEPLOY.md 重写**。删除内部架构描述（ASCII 流程图、Provider/Registry 等实现层概念），改为以行为视角描述；大量口语化措辞改为书面化（"deploy 用户被打穿也接管不了系统" → "即使 deploy 账号被攻陷，攻击者也无法通过该账号取得系统控制权" 等）；R2 配置示例补全 v0.8.2 引入的 `prefix` 与 v0.8.1 的 `max_upload_size_gb`。
+- **「GitHub Webhook 自动部署」节默认折叠**（`<details>/<summary>`）。该机制本身不绑定原仓库，fork 用户替换域名、SECRET、仓库地址等自有值即可使用；折叠避免对仅做基础部署的用户造成干扰。
+- **去除仓库内硬编码的私人域名 `feed.fengshengxiu.club`**。`docs/DEPLOY.md`（5 处）、`deploy/feed-bot-webhook.nginx.conf.example`（2 处）、`deploy/feed-bot-webhook.service`（1 处）统一替换为 `<your-domain>` 占位符。
+
+### 改动文件
+- `pixivfeed/utils.py`：新增 `MIN_FREE_DISK_BYTES` / `disk_free_bytes` / `check_disk_free` / `format_disk_full_message`
+- `pixivfeed/channel/telegram/handlers.py`：新增 `_gate_disk_space()` + 7 处入队前接入
+- `README.md`、`docs/DEPLOY.md`：重写
+- `deploy/feed-bot-webhook.nginx.conf.example`、`deploy/feed-bot-webhook.service`：私人域名替换为占位符
+- `pyproject.toml`：version 0.8.2 → 0.8.3
+
 ## v0.8.2 — 2026-05-17
 
 R2 持久化语义闭环 + 扫描完整性防御 + `--r2` 工作流修复。
