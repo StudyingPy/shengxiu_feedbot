@@ -85,9 +85,15 @@ _EH_TITLE_RE = re.compile(r'<h1 id="gn">(.*?)</h1>')
 # 主页 HTML 里的 "X pages" 文本
 _EH_PAGE_COUNT_RE = re.compile(r"<td class=\"gdt2\">(\d+)\s*pages?</td>", re.IGNORECASE)
 _EH_IMAGE_RE = re.compile(r'<img id="img" src="(.*?)"')
-# 子页里 "Download original X x Y" 链接
+# 子页里 "Download original X x Y" 链接的 href。
+# e-hentai 在 2025 前后把这条链接从 query 形式改成路径形式，两种都要兼容：
+#   老式 query : https://e-hentai.org/fullimg.php?gid=X&page=Y&key=Z
+#   新式 path  : https://e-hentai.org/fullimg/X/Y/Z/N.png  （无 .php、无 ?）
+# 老正则只接受 `?query` → 在新页面上拿不到 fullimg，_extract_page_image_urls
+# 会静默 fallback 回 sample，导致 PAGE_ORIGINAL 实际产出 = PAGE_SAMPLE 大小。
+# `<a[^>]*?href=` 是为了兼容 href 不在第一个属性位（极少见但便宜）。
 _EH_FULLIMG_RE = re.compile(
-    r'<a href="(https?://[^"]+/fullimg(?:\.php)?\?[^"]+)"',
+    r'<a[^>]*?href="(https?://[^"]+/fullimg(?:\.php\?[^"]+|/[^"]+?))"',
     re.IGNORECASE,
 )
 # 画廊不可用的几类错误文案。eh 通常返回 200 + 错误页，需要识别这些文案
