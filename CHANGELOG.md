@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixes
+- **e-hentai 子页 `fullimg` 链接路径式 URL 兼容**。e-hentai 在 2025 前后把 "Download original" 链接从 `?query` 形式（`/fullimg.php?gid=X&page=Y&key=Z`）改成路径形式（`/fullimg/X/Y/Z/N.png`），老正则 `_EH_FULLIMG_RE` 只接受 `?query`，新页面上拿不到 fullimg → `_extract_page_image_urls` 静默回退到 sample，导致 `PAGE_ORIGINAL` 实际产出 = `PAGE_SAMPLE` 大小。正则改为 `<a[^>]*?href="(https?://[^"]+/fullimg(?:\.php\?[^"]+|/[^"]+?))"` 同时匹配两种形式。
+
 ## v0.9.0 — 2026-05-25
 
 下载前预获取并展示作品大小。eh/ex 归档按钮 label 加 `~XX MB`，Pixiv / nhentai 私聊弹详情卡（标题 + 张数 + 预估大小 + 模式按钮）；网络估算走 HEAD → streaming Range fallback，永不读 body。
