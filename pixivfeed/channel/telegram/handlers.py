@@ -56,11 +56,14 @@ from ...provider.ehentai._archive import (
     ArchiveLockedError,
     compute_archive_timeout,
     download_archive_with_timeout,
+    fetch_archive_sizes,
     fetch_archiver_token,
     refresh_download_link,
     request_archive,
 )
 from ...provider.ehentai._modes import BASE_HEADERS as EH_BASE_HEADERS
+from ...provider._size_prefetch import estimate_total_bytes
+from ...provider.nhentai import NHENTAI_CDNS, NHentaiAlbum, NHentaiError, NHentaiProvider
 from ...provider.pixiv import (
     PixivAPIError,
     PixivAuthError,
@@ -542,11 +545,16 @@ def _eh_provider(registry: ProviderRegistry, host: str) -> EHFamilyBase | None:
 @dataclass
 class _Pending:
     ref: ParsedRef
-    chat_id: int
-    msg_id: int
+    chat_id: int                  # 详情卡（带按钮）所在 chat
+    msg_id: int                   # 详情卡 message_id
     user_id: int                  # 仅这个 user 可点（防群聊抢按）
     created_at: float
     force_r2: bool = False        # admin --r2 创建时携带，回调到 _eh_run_with_mode 时透传
+    # 用户原始链接消息的 chat/id；用于回调里走"直发图片"时把图片 reply 到原消息，
+    # 而不是 reply 到即将被删除的详情卡 placeholder。
+    # 来自搜索流（/ehsearch 没有原始 message）时保持 None，sender 退回不带 reply_to。
+    orig_chat_id: int | None = None
+    orig_msg_id: int | None = None
 
 
 _PENDING: dict[str, _Pending] = {}
@@ -567,6 +575,10 @@ class _SearchState:
     expanded: bool                   # False=10 条，True=全部 25 条
     created_at: float
     force_r2: bool = False           # admin --r2 创建时携带，回调点开/打开时透传到 _eh_run_with_mode
+    # 当前消息正显示的 ptoken（仅 L2/L3 有），切层/翻页时必须失效掉，
+    # 防止晚到的 size prefetch 把按钮覆盖回旧详情卡。
+    # see _search_invalidate_active_ptoken / _make_pending_for_item
+    active_ptoken: str | None = None
 
 
 _SEARCH_STATES: dict[str, _SearchState] = {}
@@ -592,21 +604,179 @@ def _gc_pending() -> None:
         _CANCEL_TOKENS.pop(k, None)
 
 
-def _make_eh_keyboard(token: str) -> InlineKeyboardMarkup:
-    """eh/ex 模式选择键盘。callback_data 只放短 token + mode value。"""
-    return InlineKeyboardMarkup(
+def _eh_mode_buttons(
+    token: str,
+    *,
+    prefix: str = "eh",
+    sizes: dict[EHMode, int] | None = None,
+) -> list[list[InlineKeyboardButton]]:
+    """eh/ex 4 模式按钮的两行（前 4 个模式）。所有详情卡入口共用。
+
+    sizes 不为 None 时按 mode 在 label 后拼 " ~XX MB"。当前只有 archive_* 走
+    `fetch_archive_sizes` 拿得到数字，page_* 仍是裸 label。
+    prefix: 'eh' / 'eha'，区分回调路由（私聊粘链 vs /archive）。
+    """
+    def label(m: EHMode) -> str:
+        n = (sizes or {}).get(m)
+        if n and n > 0:
+            return f"{m.label_zh} ~{fmt_bytes(n)}"
+        return m.label_zh
+
+    return [
         [
-            [
-                InlineKeyboardButton(EHMode.PAGE_SAMPLE.label_zh, callback_data=f"eh:{token}:page_sample"),
-                InlineKeyboardButton(EHMode.PAGE_ORIGINAL.label_zh, callback_data=f"eh:{token}:page_original"),
-            ],
-            [
-                InlineKeyboardButton(EHMode.ARCHIVE_RES.label_zh, callback_data=f"eh:{token}:archive_resample"),
-                InlineKeyboardButton(EHMode.ARCHIVE_ORG.label_zh, callback_data=f"eh:{token}:archive_original"),
-            ],
-            [InlineKeyboardButton("取消", callback_data=f"eh:{token}:cancel")],
-        ]
-    )
+            InlineKeyboardButton(label(EHMode.PAGE_SAMPLE), callback_data=f"{prefix}:{token}:page_sample"),
+            InlineKeyboardButton(label(EHMode.PAGE_ORIGINAL), callback_data=f"{prefix}:{token}:page_original"),
+        ],
+        [
+            InlineKeyboardButton(label(EHMode.ARCHIVE_RES), callback_data=f"{prefix}:{token}:archive_resample"),
+            InlineKeyboardButton(label(EHMode.ARCHIVE_ORG), callback_data=f"{prefix}:{token}:archive_original"),
+        ],
+    ]
+
+
+def _make_eh_keyboard(
+    token: str,
+    *,
+    sizes: dict[EHMode, int] | None = None,
+    prefix: str = "eh",
+) -> InlineKeyboardMarkup:
+    """eh/ex 模式选择键盘。callback_data 只放短 token + mode value。
+
+    `sizes` 由 size prefetch 完成后回填；首次发送时为 None（裸 label）。
+    `prefix` 决定回调路由：'eh' 走 handle_callback（私聊粘链），
+    'eha' 走 handle_callback_archive（/archive）。
+    """
+    rows = _eh_mode_buttons(token, prefix=prefix, sizes=sizes)
+    rows.append([InlineKeyboardButton("取消", callback_data=f"{prefix}:{token}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------------------------------------------------------------------------
+# size prefetch：发完详情卡后异步拿真实大小，回填按钮 label
+# ---------------------------------------------------------------------------
+#
+# 为什么单独抽：eh/ex 详情卡有 5 处入口，每处发完按钮都要起一次 prefetch；
+# Pixiv / nhentai 也要复用同一套竞态保护。
+#
+# 竞态保护背景：
+#   prefetch 是 fire-and-forget 的 create_task，但用户可能在 prefetch 完成前
+#   就点了按钮——按钮回调会把消息文本 edit 成 "⏳ 已收到..." 并 _PENDING.pop(token)。
+#   如果 prefetch 后于按钮点击完成，简单的 edit_reply_markup 会把"处理中"消息的
+#   按钮换回详情卡按钮，造成视觉错乱。
+#   `_safe_update_buttons` 在写按钮前三重校验：
+#     1. token 仍在 _PENDING（用户没点取消/没点模式按钮）
+#     2. _PENDING[token].chat_id 等于 placeholder.chat.id
+#     3. _PENDING[token].msg_id 等于 placeholder.message_id
+#   全部通过才动按钮；并且**只动 reply_markup**（不动文本），以减少冲突面。
+
+
+async def _safe_update_buttons(
+    placeholder, token: str, new_markup: InlineKeyboardMarkup,
+) -> bool:
+    """竞态安全地仅更新按钮 label。
+
+    仅当 `_PENDING[token]` 仍指向 `placeholder` 同一条消息时才发 edit。
+    其它情况（token 已被 pop / placeholder 被换成另一条 / edit 抛异常）
+    一律静默返回 False；prefetch 永远不应该把"处理中"覆盖回详情卡。
+    """
+    pending = _PENDING.get(token)
+    if pending is None:
+        return False
+    if pending.chat_id != placeholder.chat.id or pending.msg_id != placeholder.message_id:
+        return False
+    try:
+        await placeholder.edit_reply_markup(reply_markup=new_markup)
+        return True
+    except Exception as e:
+        logger.debug(f"_safe_update_buttons {token}: edit failed: {e}")
+        return False
+
+
+async def _safe_update_card(
+    placeholder, token: str, new_text: str, new_markup: InlineKeyboardMarkup,
+    *, parse_mode: str | None = ParseMode.HTML,
+) -> bool:
+    """竞态安全地更新整张卡（文本 + 按钮）。
+
+    Pixiv / nhentai 详情卡把 ~XX MB 写在正文里，prefetch 完成时需要重写正文；
+    eh/ex 详情卡走 _safe_update_buttons（只动按钮 label）减小冲突面。
+
+    校验维度与 _safe_update_buttons 一致（token + chat + msg_id 三重）。
+    """
+    pending = _PENDING.get(token)
+    if pending is None:
+        return False
+    if pending.chat_id != placeholder.chat.id or pending.msg_id != placeholder.message_id:
+        return False
+    try:
+        await placeholder.edit_text(
+            new_text,
+            parse_mode=parse_mode,
+            reply_markup=new_markup,
+            disable_web_page_preview=True,
+        )
+        return True
+    except Exception as e:
+        logger.debug(f"_safe_update_card {token}: edit failed: {e}")
+        return False
+
+
+def _schedule_eh_size_prefetch(
+    context: ContextTypes.DEFAULT_TYPE,
+    placeholder,
+    token: str,
+    ref: ParsedRef,
+    *,
+    prefix: str = "eh",
+    keyboard_builder=None,
+) -> None:
+    """私聊详情卡发完后调用一次；起异步任务拿 archive 两档大小，回填按钮 label。
+
+    - 受 `config.size_prefetch.enabled` 与 `size_prefetch.eh_archive` 双开关控制
+    - prefetch 不会消耗 archive 配额（只 GET chooser 页）
+    - 失败一律静默：fetch_archive_sizes 返回空 dict / 抛异常 → 按钮 label 保持原样
+    - 调用方传 prefix 决定回调路由（'eh' 走 handle_callback，'eha' 走 handle_callback_archive）
+    - `keyboard_builder(sizes: dict[EHMode, int]) -> InlineKeyboardMarkup` 用于
+      搜索流 L2/L3 这类带"返回"等额外行的键盘；不传则用标准 `_make_eh_keyboard`。
+    """
+    config, registry, *_ = _ctx(context)
+    sp = config.size_prefetch
+    if not sp.enabled or not sp.eh_archive:
+        return
+    provider = _eh_provider(registry, ref.provider)
+    if provider is None:
+        return
+
+    try:
+        gid, gtoken = ref.id.split("/", 1)
+    except ValueError:
+        return
+    host = ref.provider
+    album_url = f"https://{host}/g/{gid}/{gtoken}"
+
+    async def _run() -> None:
+        try:
+            # archive chooser 需要登录态；用 ARCHIVE_ORG 的 cookies
+            # （在 e-hentai 上会带 exhentai 登录 cookie，在 exhentai 上一样）
+            async with provider._make_client(EHMode.ARCHIVE_ORG) as client:
+                sizes = await fetch_archive_sizes(client, album_url, host, gid, gtoken)
+        except Exception as e:
+            logger.debug(f"size prefetch {ref.id} failed: {e}")
+            return
+        if not sizes:
+            return
+        if keyboard_builder is not None:
+            try:
+                new_markup = keyboard_builder(sizes)
+            except Exception as e:
+                logger.debug(f"size prefetch {ref.id}: keyboard_builder failed: {e}")
+                return
+        else:
+            new_markup = _make_eh_keyboard(token, sizes=sizes, prefix=prefix)
+        await _safe_update_buttons(placeholder, token, new_markup)
+
+    # fire-and-forget：详情卡 UI 不等 prefetch
+    asyncio.create_task(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +908,12 @@ async def _handle_ref(
         return
 
     if ref.provider == "pixiv" and ref.kind == "illust":
+        # 私聊 + auto 模式弹详情卡（含张数 + ~XX MB + 两按钮）；
+        # 群聊 / /pixiv_direct / /pixiv_telegraph 跳过详情卡，照旧行为。
+        chat = update.effective_chat
+        if chat is not None and chat.type == "private" and mode == "auto":
+            await _pixiv_offer_modes(update, context, ref, force_r2=force_r2)
+            return
         await _handle_pixiv_illust(update, context, ref, mode=mode, force_r2=force_r2)
         return
 
@@ -770,7 +946,14 @@ async def _handle_ref(
             )
         return
 
-    # nhentai 与其它走默认 telegraph
+    # nhentai 私聊弹详情卡，群聊 / 其它直接走 telegraph
+    if ref.provider == "nhentai":
+        chat = update.effective_chat
+        if chat is not None and chat.type == "private":
+            await _nhentai_offer_modes(update, context, ref, force_r2=force_r2)
+            return
+
+    # nhentai 群聊与其它走默认 telegraph
     placeholder = await update.message.reply_text(f"⏳ 已收到（{ref.provider}），准备处理...")
     if not await _gate_disk_space(context, placeholder):
         return
@@ -830,6 +1013,7 @@ async def _eh_offer_modes(
 
     _gc_pending()
     token = uuid.uuid4().hex[:10]
+    orig_msg = update.effective_message
     _PENDING[token] = _Pending(
         ref=ref,
         chat_id=placeholder.chat.id,
@@ -837,9 +1021,11 @@ async def _eh_offer_modes(
         user_id=update.effective_user.id,
         created_at=time.time(),
         force_r2=force_r2,
+        orig_chat_id=orig_msg.chat.id if orig_msg else None,
+        orig_msg_id=orig_msg.message_id if orig_msg else None,
     )
 
-    title = gallery.title.replace("<", "&lt;").replace(">", "&gt;")
+    # title 转义在 _render_eh_detail_card 内部统一走 _html_escape
     text = _render_eh_detail_card(
         title=gallery.title,
         host=ref.provider,
@@ -855,6 +1041,9 @@ async def _eh_offer_modes(
         reply_markup=_make_eh_keyboard(token),
         disable_web_page_preview=True,
     )
+
+    # 异步拿 archive 两档大小，回填按钮 label。失败/超时静默跳过，不影响 UX。
+    _schedule_eh_size_prefetch(context, placeholder, token, ref)
 
 
 async def _try_fallback_to_exhentai(
@@ -1304,6 +1493,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # 委托给 /archive 流程
         await handle_callback_archive(update, context)
         return
+    if parts[0] == "pix":
+        # 委托给 pixiv 详情卡回调
+        await _handle_pixiv_callback(update, context)
+        return
+    if parts[0] == "nh":
+        # 委托给 nhentai 详情卡回调
+        await _handle_nhentai_callback(update, context)
+        return
     if parts[0] != "eh":
         await query.answer()
         return
@@ -1459,6 +1656,509 @@ async def _handle_pixiv_illust(
 
 
 # ---------------------------------------------------------------------------
+# pixiv illust 私聊详情卡：标题 / 张数 / x_restrict / ~XX MB + 模式按钮
+# ---------------------------------------------------------------------------
+#
+# 触发条件：私聊 + mode == "auto"。其它路径（群聊 / /pixiv_direct / /pixiv_telegraph）
+# 全部跳过详情卡，照旧行为。
+#
+# 按钮：
+#   - page_count == 1                  → [直发图片] [Telegra.ph] [取消]
+#   - 1 < page_count <= direct_threshold → [直发图片] [Telegra.ph] [取消]
+#   - page_count > 10                  → [Telegra.ph] [取消]（direct 强制不可用）
+#   - 否则                              → [直发图片] [Telegra.ph] [取消]
+#
+# callback_data：pix:{token}:{action}，action ∈ {direct, ph, cancel}。
+# `_Pending` 复用 eh/ex 那套，ref.provider == "pixiv"。
+
+
+def _render_pixiv_detail_card(
+    work, *, total_bytes: int | None,
+) -> str:
+    """私聊 Pixiv 详情卡正文。
+
+    `total_bytes is None` 时不渲染大小行（prefetch 失败 / disabled / 还没回来）；
+    `>= 0` 时渲染 "~XX MB"（0 也渲染，表示估算到了 0，调用方一般不会传 0）。
+
+    title/author/tag 全部走 `_html_escape`（处理 `&` `<` `>`）；裸 `&` 会让
+    Telegram HTML parse_mode 报 Bad Request: can't parse entities。
+    """
+    title = _html_escape(work.title or "")
+    author = _html_escape(work.author or "")
+    lines = [
+        f"<b>{title}</b>",
+        f"画师：<a href=\"https://www.pixiv.net/users/{work.user_id}\">{author}</a>",
+    ]
+    pages_line = f"张数：{work.page_count}"
+    if total_bytes is not None and total_bytes > 0:
+        pages_line += f" · 预估约 {fmt_bytes(total_bytes)}"
+    lines.append(pages_line)
+    badges: list[str] = []
+    if work.x_restrict_label:
+        badges.append(_html_escape(work.x_restrict_label))
+    if work.ai_type_label:
+        badges.append(_html_escape(work.ai_type_label))
+    if badges:
+        lines.append("标记：" + " · ".join(badges))
+    if work.tags:
+        tag_text = " ".join(f"#{_html_escape(t)}" for t in work.tags[:8])
+        lines.append(f"标签：{tag_text}")
+    lines.append("")
+    lines.append(f"<a href=\"https://www.pixiv.net/artworks/{work.pid}\">在 Pixiv 查看原作</a>")
+    lines.append("")
+    lines.append("选择处理方式：")
+    return "\n".join(lines)
+
+
+def _make_pixiv_keyboard(
+    token: str, work, config: Config,
+) -> InlineKeyboardMarkup:
+    """根据 page_count + direct_threshold 决定显示哪些按钮。"""
+    rows: list[list[InlineKeyboardButton]] = []
+    # page_count > 10 时强制不发 direct（与 _handle_pixiv_illust 内部一致）
+    can_direct = work.page_count <= 10
+    btn_row: list[InlineKeyboardButton] = []
+    if can_direct:
+        btn_row.append(InlineKeyboardButton("📷 直发图片", callback_data=f"pix:{token}:direct"))
+    btn_row.append(InlineKeyboardButton("📰 Telegra.ph", callback_data=f"pix:{token}:ph"))
+    rows.append(btn_row)
+    rows.append([InlineKeyboardButton("取消", callback_data=f"pix:{token}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _schedule_pixiv_size_prefetch(
+    context: ContextTypes.DEFAULT_TYPE,
+    placeholder,
+    token: str,
+    work,
+) -> None:
+    """异步采样 i.pximg.net 头几张原图，估算总字节数后回填详情卡正文。"""
+    config, *_ = _ctx(context)
+    sp = config.size_prefetch
+    if not sp.enabled or not sp.pixiv:
+        return
+    # 没图片 URL 的情况（fetch_illust 已派发 pages，但保险起见）
+    if not work.images:
+        return
+    urls = [img.original for img in work.images if getattr(img, "original", None)]
+    if not urls:
+        return
+
+    async def _run() -> None:
+        try:
+            # i.pximg.net 严格校验 Referer = www.pixiv.net；其它 host 可能无 HEAD/Range，
+            # estimate_total_bytes 内部会 HEAD → Range fallback。
+            import httpx
+            async with httpx.AsyncClient(
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                },
+                timeout=sp.timeout,
+                follow_redirects=True,
+            ) as client:
+                total = await estimate_total_bytes(
+                    client, urls,
+                    referer="https://www.pixiv.net/",
+                    sample_count=sp.sample_count,
+                    timeout=float(sp.timeout),
+                )
+        except Exception as e:
+            logger.debug(f"pixiv size prefetch {work.pid} failed: {e}")
+            return
+        if total is None or total <= 0:
+            return
+        new_text = _render_pixiv_detail_card(work, total_bytes=total)
+        new_markup = _make_pixiv_keyboard(token, work, config)
+        await _safe_update_card(placeholder, token, new_text, new_markup)
+
+    asyncio.create_task(_run())
+
+
+async def _pixiv_offer_modes(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, ref: ParsedRef,
+    *, force_r2: bool = False,
+) -> None:
+    """私聊粘 pixiv illust 链接 + mode=='auto' 时弹详情卡。
+
+    与 `_eh_offer_modes` 对齐：fetch 元数据 → 写卡 + 按钮 → 异步 prefetch 大小。
+    """
+    config, registry, *_ = _ctx(context)
+    pixiv = _pixiv_provider(registry)
+    if pixiv is None:
+        return
+    pid = ref.id
+
+    placeholder = await update.message.reply_text("📖 解析中...")
+    try:
+        work = await pixiv.fetch_illust(pid)
+    except PixivNotFoundError:
+        await placeholder.edit_text(f"⚠️ 作品 {pid} 不存在或已删除")
+        return
+    except PixivAuthError as e:
+        await placeholder.edit_text(f"⚠️ 需要登录才能查看（PHPSESSID 可能失效）：{e}")
+        return
+    except PixivAPIError as e:
+        logger.exception(f"fetch_illust({pid}) failed")
+        await placeholder.edit_text(f"⚠️ 拉取作品失败：{e}")
+        return
+
+    if work.is_ugoira:
+        await placeholder.edit_text(
+            f"⚠️ 暂不支持动图（ugoira）：https://www.pixiv.net/artworks/{pid}"
+        )
+        return
+
+    _gc_pending()
+    token = uuid.uuid4().hex[:10]
+    orig_msg = update.effective_message
+    _PENDING[token] = _Pending(
+        ref=ref,
+        chat_id=placeholder.chat.id,
+        msg_id=placeholder.message_id,
+        user_id=update.effective_user.id,
+        created_at=time.time(),
+        force_r2=force_r2,
+        orig_chat_id=orig_msg.chat.id if orig_msg else None,
+        orig_msg_id=orig_msg.message_id if orig_msg else None,
+    )
+
+    text = _render_pixiv_detail_card(work, total_bytes=None)
+    keyboard = _make_pixiv_keyboard(token, work, config)
+    await placeholder.edit_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+    _schedule_pixiv_size_prefetch(context, placeholder, token, work)
+
+
+async def _handle_pixiv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """pix:{token}:{action} 回调入口。"""
+    query = update.callback_query
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer()
+        return
+    _, token, action = parts
+
+    pending = _PENDING.get(token)
+    if pending is None:
+        await query.answer("⚠️ 选项已过期，请重新发送链接", show_alert=True)
+        return
+    if query.from_user.id != pending.user_id:
+        await query.answer("⚠️ 这个选择来自其他用户", show_alert=True)
+        return
+
+    if action == "cancel":
+        _PENDING.pop(token, None)
+        await query.answer("已取消")
+        try:
+            await query.edit_message_text("已取消")
+        except Exception:
+            pass
+        _schedule_delete_after_cancel(context, query.message)
+        return
+
+    if action not in ("direct", "ph"):
+        await query.answer("⚠️ 未知操作", show_alert=True)
+        return
+
+    _PENDING.pop(token, None)
+    label = "直发图片" if action == "direct" else "Telegra.ph"
+    await query.answer(f"使用 {label}")
+
+    # 复用同一条消息（详情卡）做 placeholder。
+    msg = query.message
+    try:
+        await msg.edit_text(f"⏳ 已收到（pixiv {pending.ref.id} · {label}），准备处理...")
+    except Exception:
+        pass
+
+    if not await _gate_disk_space(context, msg):
+        return
+
+    pid = pending.ref.id
+    user_id = pending.user_id
+    force_r2 = pending.force_r2
+    orig_chat_id = pending.orig_chat_id
+    orig_msg_id = pending.orig_msg_id
+
+    if action == "ph":
+        async def _do_ph() -> None:
+            await _send_pixiv_illust_via_telegraph(
+                update, context, pid, placeholder=msg, force_r2=force_r2,
+            )
+
+        await _enqueue(
+            context,
+            category="telegraph_publish",
+            user_id=user_id,
+            placeholder=msg,
+            work_label=f"pixiv {pid} 处理中...",
+            coro_factory=_do_ph,
+        )
+    else:
+        # direct：图片 reply 到用户原始消息，而不是即将被 delete 的详情卡 placeholder
+        async def _do_direct() -> None:
+            await _send_pixiv_illust_direct(
+                update, context, pid, placeholder=msg,
+                reply_to_message_id=orig_msg_id,
+                reply_to_chat_id=orig_chat_id,
+            )
+
+        await _enqueue(
+            context,
+            category="direct_image",
+            user_id=user_id,
+            placeholder=msg,
+            work_label=f"pixiv {pid} 下载图片中...",
+            coro_factory=_do_direct,
+        )
+
+
+# ---------------------------------------------------------------------------
+# nhentai 私聊详情卡：标题 / 张数 / ~XX MB / tags + [开始下载] [取消]
+# ---------------------------------------------------------------------------
+#
+# nhentai 只有"发 Telegra.ph"一种处理路径（没有直发选项），所以按钮只有
+# [开始下载] / [取消] 两个。callback_data：nh:{token}:{action}，action ∈ {go, cancel}。
+#
+# 与 Pixiv 一致，size prefetch 写在正文里。开关在 size_prefetch.nhentai。
+
+
+def _render_nhentai_detail_card(
+    album: NHentaiAlbum, *, total_bytes: int | None,
+) -> str:
+    """nhentai 详情卡正文。total_bytes is None 表示不显示大小行。
+
+    title/tag 走 `_html_escape`（处理 `&` `<` `>`）；裸 `&` 会让 TG HTML
+    parse_mode 报 Bad Request。
+    """
+    title = _html_escape(album.title or "")
+    lines = [
+        f"<b>{title}</b>",
+    ]
+    pages_line = f"张数：{album.num_pages}"
+    if total_bytes is not None and total_bytes > 0:
+        pages_line += f" · 预估约 {fmt_bytes(total_bytes)}"
+    lines.append(pages_line)
+    if album.tags:
+        # tags 太多就截前 12 个，TG 4096 字符不会塞太满。
+        # tag 里的空格转下划线（hashtag 习惯）后还要 escape 处理 & 等字符。
+        tag_text = " ".join(
+            f"#{_html_escape(t.replace(' ', '_'))}" for t in album.tags[:12]
+        )
+        lines.append(f"标签：{tag_text}")
+    lines.append("")
+    lines.append(f"<a href=\"https://nhentai.net/g/{album.gallery_id}\">原作品</a>")
+    lines.append("")
+    lines.append("选择操作：")
+    return "\n".join(lines)
+
+
+def _make_nhentai_keyboard(token: str) -> InlineKeyboardMarkup:
+    # plan v3 Phase 4：文案统一为"开始下载"（与 eh 详情卡的下载按钮口径一致），
+    # nhentai 只有 telegraph 一条路径，所以不暴露发布渠道细节。
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 开始下载", callback_data=f"nh:{token}:go")],
+        [InlineKeyboardButton("取消", callback_data=f"nh:{token}:cancel")],
+    ])
+
+
+def _nhentai_sample_urls(album: NHentaiAlbum, sample_count: int) -> list[str]:
+    """生成前 N 张图的代表 URL（主 CDN 第一项）用于 HEAD/Range 采样。
+
+    nhentai CDN i1~i4 同一张图同 path，HEAD 失败率较高 → 用 estimate_total_bytes
+    内部的 Range fallback 兜底。
+    """
+    n = min(sample_count, album.num_pages)
+    if n <= 0:
+        return []
+    urls: list[str] = []
+    base = NHENTAI_CDNS[0]
+    for idx in range(1, n + 1):
+        t = album.page_types[idx - 1] if idx - 1 < len(album.page_types) else "j"
+        ext = {"j": ".jpg", "p": ".png", "g": ".gif", "w": ".webp"}.get(t, ".jpg")
+        urls.append(f"{base}/{album.media_id}/{idx}{ext}")
+    return urls
+
+
+def _schedule_nhentai_size_prefetch(
+    context: ContextTypes.DEFAULT_TYPE,
+    placeholder,
+    token: str,
+    album: NHentaiAlbum,
+) -> None:
+    """异步采样 nhentai CDN 头几张图，估算总字节数后回填详情卡正文。"""
+    config, *_ = _ctx(context)
+    sp = config.size_prefetch
+    if not sp.enabled or not sp.nhentai:
+        return
+    sample_urls = _nhentai_sample_urls(album, sp.sample_count)
+    if not sample_urls:
+        return
+
+    async def _run() -> None:
+        try:
+            import httpx
+            async with httpx.AsyncClient(
+                timeout=sp.timeout,
+                follow_redirects=True,
+            ) as client:
+                avg = await estimate_total_bytes(
+                    client, sample_urls,
+                    sample_count=len(sample_urls),
+                    timeout=float(sp.timeout),
+                )
+        except Exception as e:
+            logger.debug(f"nhentai size prefetch {album.gallery_id} failed: {e}")
+            return
+        if avg is None or avg <= 0:
+            return
+        # estimate_total_bytes 给的 total 是按 len(urls) 算的，这里 urls 只是采样池，
+        # 需要用单张均值 * 总页数才是估算值
+        per_image = avg / len(sample_urls)
+        total = int(per_image * album.num_pages)
+        if total <= 0:
+            return
+        new_text = _render_nhentai_detail_card(album, total_bytes=total)
+        new_markup = _make_nhentai_keyboard(token)
+        await _safe_update_card(placeholder, token, new_text, new_markup)
+
+    asyncio.create_task(_run())
+
+
+async def _nhentai_offer_modes(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, ref: ParsedRef,
+    *, force_r2: bool = False,
+) -> None:
+    """私聊粘 nhentai 链接时弹详情卡。"""
+    config, registry, *_ = _ctx(context)
+    provider = registry.find_by_name("nhentai")
+    if not isinstance(provider, NHentaiProvider):
+        # nhentai 未启用：回退到泛型 telegraph 路径
+        placeholder = await update.message.reply_text(f"⏳ 已收到（{ref.provider}），准备处理...")
+        if not await _gate_disk_space(context, placeholder):
+            return
+        user_id = update.effective_user.id if update.effective_user else 0
+
+        async def _do_generic() -> None:
+            await _send_via_telegraph_generic(
+                update, context, ref, placeholder=placeholder, force_r2=force_r2,
+            )
+
+        await _enqueue(
+            context,
+            category="telegraph_publish",
+            user_id=user_id,
+            placeholder=placeholder,
+            work_label=f"{ref.provider} 处理中...",
+            coro_factory=_do_generic,
+        )
+        return
+
+    placeholder = await update.message.reply_text("📖 解析中...")
+    try:
+        album = await provider.fetch_work(ref)
+    except NHentaiError as e:
+        await placeholder.edit_text(f"⚠️ 解析失败：{e}")
+        return
+    except Exception as e:
+        logger.exception(f"nhentai fetch_work({ref.id}) failed")
+        await placeholder.edit_text(f"⚠️ 解析失败：{e}")
+        return
+
+    _gc_pending()
+    token = uuid.uuid4().hex[:10]
+    orig_msg = update.effective_message
+    _PENDING[token] = _Pending(
+        ref=ref,
+        chat_id=placeholder.chat.id,
+        msg_id=placeholder.message_id,
+        user_id=update.effective_user.id,
+        created_at=time.time(),
+        force_r2=force_r2,
+        orig_chat_id=orig_msg.chat.id if orig_msg else None,
+        orig_msg_id=orig_msg.message_id if orig_msg else None,
+    )
+
+    text = _render_nhentai_detail_card(album, total_bytes=None)
+    keyboard = _make_nhentai_keyboard(token)
+    await placeholder.edit_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+    _schedule_nhentai_size_prefetch(context, placeholder, token, album)
+
+
+async def _handle_nhentai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """nh:{token}:{action} 回调入口。"""
+    query = update.callback_query
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer()
+        return
+    _, token, action = parts
+
+    pending = _PENDING.get(token)
+    if pending is None:
+        await query.answer("⚠️ 选项已过期，请重新发送链接", show_alert=True)
+        return
+    if query.from_user.id != pending.user_id:
+        await query.answer("⚠️ 这个选择来自其他用户", show_alert=True)
+        return
+
+    if action == "cancel":
+        _PENDING.pop(token, None)
+        await query.answer("已取消")
+        try:
+            await query.edit_message_text("已取消")
+        except Exception:
+            pass
+        _schedule_delete_after_cancel(context, query.message)
+        return
+
+    if action != "go":
+        await query.answer("⚠️ 未知操作", show_alert=True)
+        return
+
+    _PENDING.pop(token, None)
+    await query.answer("开始处理")
+    msg = query.message
+    try:
+        await msg.edit_text(f"⏳ 已收到（nhentai {pending.ref.id}），准备处理...")
+    except Exception:
+        pass
+
+    if not await _gate_disk_space(context, msg):
+        return
+
+    ref = pending.ref
+    user_id = pending.user_id
+    force_r2 = pending.force_r2
+
+    async def _do() -> None:
+        await _send_via_telegraph_generic(
+            update, context, ref, placeholder=msg, force_r2=force_r2,
+        )
+
+    await _enqueue(
+        context,
+        category="telegraph_publish",
+        user_id=user_id,
+        placeholder=msg,
+        work_label=f"nhentai {ref.id} 处理中...",
+        coro_factory=_do,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 通用 telegraph（nhentai 等）
 # ---------------------------------------------------------------------------
 
@@ -1577,6 +2277,12 @@ async def _send_pixiv_illust_via_telegraph(
     *,
     force_r2: bool = False,
 ) -> None:
+    """走 Telegra.ph 流程发布 pixiv illust。
+
+    注意：这个函数不需要 reply_to_message_id —— 它不发新消息，只 `placeholder.edit_text`
+    把 telegra.ph URL 写进 placeholder。详情卡按钮回调里直接复用同一条 placeholder
+    （即详情卡）就行；reply_to 仅是 direct sender 的痛点。
+    """
     config, registry, publisher, tg_cache, _ = _ctx(context)
     pixiv = _pixiv_provider(registry)
     assert pixiv is not None
@@ -1752,7 +2458,20 @@ def _render_direct_caption(template: str, vars: dict) -> str:
 async def _send_pixiv_illust_direct(
     update: Update, context: ContextTypes.DEFAULT_TYPE, pid: str,
     placeholder=None,
+    *,
+    reply_to_message_id: int | None = None,
+    reply_to_chat_id: int | None = None,
 ) -> None:
+    """直发 pixiv illust 图片。
+
+    `reply_to_message_id`/`reply_to_chat_id`：覆盖默认的 reply_to。
+      - 经过详情卡按钮回调进来时，`update.effective_message` 是 bot 的详情卡，
+        不是用户原始消息——而且函数尾部会 `placeholder.delete()`，图片就 reply
+        到一条即将被删的消息上。caller 显式传 `pending.orig_chat_id` /
+        `pending.orig_msg_id` 覆盖。
+      - 直接命令路径（/pixiv_direct）或 `mode=='auto'` 不弹卡时，
+        `reply_to_message_id=None`，照原行为用 `update.effective_message.message_id`。
+    """
     config, registry, _, _, _ = _ctx(context)
     pixiv = _pixiv_provider(registry)
     assert pixiv is not None
@@ -1775,8 +2494,12 @@ async def _send_pixiv_illust_direct(
     caption = _render_direct_caption(
         config.templates.illust.direct_caption, illust.work.template_vars()
     )
-    chat_id = update.effective_chat.id
-    reply_to = update.effective_message.message_id
+    # 默认走 update.effective_message（与历史行为一致），caller 想覆盖时传 kw 参数。
+    chat_id = reply_to_chat_id if reply_to_chat_id is not None else update.effective_chat.id
+    if reply_to_message_id is not None:
+        reply_to = reply_to_message_id
+    else:
+        reply_to = update.effective_message.message_id
     # R-18 / R-18G 在群聊里默认加 spoiler 遮罩，私聊不加（私聊就是为了直接看）。
     # x_restrict 0=全年龄, 1=R-18, 2=R-18G
     chat = update.effective_chat
@@ -2371,8 +3094,11 @@ async def _eh_offer_modes_for_archive(
 ) -> None:
     """eh/ex /archive：弹四模式按钮，回调走 archive 分支。"""
     placeholder = await update.message.reply_text("📖 解析中...")
+    orig_msg = update.effective_message
     await _eh_offer_archive_modes_on_placeholder(
         context, ref, placeholder=placeholder, user_id=update.effective_user.id,
+        orig_chat_id=orig_msg.chat.id if orig_msg else None,
+        orig_msg_id=orig_msg.message_id if orig_msg else None,
     )
 
 
@@ -2382,10 +3108,13 @@ async def _eh_offer_archive_modes_on_placeholder(
     *,
     placeholder,
     user_id: int,
+    orig_chat_id: int | None = None,
+    orig_msg_id: int | None = None,
 ) -> None:
     """复用版本：接现成 placeholder，供 /ehsearch [归档下载] callback 调用。
 
     与 _eh_offer_modes_for_archive 行为等价，仅入口不同（callback 没有 update.message）。
+    搜索流没有用户原始消息，orig_chat_id/orig_msg_id 保持 None。
     """
     config, registry, *_ = _ctx(context)
     provider = _eh_provider(registry, ref.provider)
@@ -2419,9 +3148,11 @@ async def _eh_offer_archive_modes_on_placeholder(
         msg_id=placeholder.message_id,
         user_id=user_id,
         created_at=time.time(),
+        orig_chat_id=orig_chat_id,
+        orig_msg_id=orig_msg_id,
     )
 
-    title = gallery.title.replace("<", "&lt;").replace(">", "&gt;")
+    # title 转义在 _render_eh_detail_card 内部统一走 _html_escape
     text = _render_eh_detail_card(
         title=gallery.title,
         host=ref.provider,
@@ -2432,25 +3163,16 @@ async def _eh_offer_archive_modes_on_placeholder(
         footer_prompt="选择下载模式（产出压缩包）：",
     )
     # 用 eha: 前缀区分回调
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(EHMode.PAGE_SAMPLE.label_zh, callback_data=f"eha:{token}:page_sample"),
-                InlineKeyboardButton(EHMode.PAGE_ORIGINAL.label_zh, callback_data=f"eha:{token}:page_original"),
-            ],
-            [
-                InlineKeyboardButton(EHMode.ARCHIVE_RES.label_zh, callback_data=f"eha:{token}:archive_resample"),
-                InlineKeyboardButton(EHMode.ARCHIVE_ORG.label_zh, callback_data=f"eha:{token}:archive_original"),
-            ],
-            [InlineKeyboardButton("取消", callback_data=f"eha:{token}:cancel")],
-        ]
-    )
+    keyboard = _make_eh_keyboard(token, prefix="eha")
     await placeholder.edit_text(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
+
+    # 异步拿 archive 两档大小，回填按钮 label。失败/超时静默跳过。
+    _schedule_eh_size_prefetch(context, placeholder, token, ref, prefix="eha")
 
 
 async def _eh_archive_with_mode(
@@ -3433,11 +4155,13 @@ def _ehs_get_state(seid: str) -> _SearchState | None:
 
 def _render_detail_card(
     state: _SearchState, idx: int, ptoken: str, seid: str, ehtagdb,
+    *, sizes: dict[EHMode, int] | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """L2 详情卡：标题 + 类型/语言/页数 + 折叠 tag 区 + 6 按钮（4 模式 + 归档下载 + 返回）。
 
     4 模式按钮走现有 `eh:{ptoken}:<mode>` 回调（Telegra.ph 发布）。
     [归档下载] 进 L3 zip 选单。
+    `sizes` 由 size prefetch 完成后回填；首次渲染时为 None（裸 label）。
     """
     it = state.page.items[idx]
     text = _render_eh_detail_card(
@@ -3449,27 +4173,21 @@ def _render_detail_card(
         ehtagdb=ehtagdb,
         footer_prompt="选择处理方式（前 4 个发 Telegra.ph，归档下载产出 zip）：",
     )
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(EHMode.PAGE_SAMPLE.label_zh, callback_data=f"eh:{ptoken}:page_sample"),
-                InlineKeyboardButton(EHMode.PAGE_ORIGINAL.label_zh, callback_data=f"eh:{ptoken}:page_original"),
-            ],
-            [
-                InlineKeyboardButton(EHMode.ARCHIVE_RES.label_zh, callback_data=f"eh:{ptoken}:archive_resample"),
-                InlineKeyboardButton(EHMode.ARCHIVE_ORG.label_zh, callback_data=f"eh:{ptoken}:archive_original"),
-            ],
-            [InlineKeyboardButton("📦 归档下载（zip）", callback_data=f"ehs_arch_menu:{ptoken}:{seid}:{idx}")],
-            [InlineKeyboardButton("⬅ 返回搜索结果", callback_data=f"ehs_back2list:{seid}")],
-        ]
-    )
-    return text, keyboard
+    # 复用 _eh_mode_buttons：sizes 非 None 时按 mode 在 label 后拼 ' ~XX MB'
+    rows = _eh_mode_buttons(ptoken, prefix="eh", sizes=sizes)
+    rows.append([InlineKeyboardButton("📦 归档下载（zip）", callback_data=f"ehs_arch_menu:{ptoken}:{seid}:{idx}")])
+    rows.append([InlineKeyboardButton("⬅ 返回搜索结果", callback_data=f"ehs_back2list:{seid}")])
+    return text, InlineKeyboardMarkup(rows)
 
 
 def _render_archive_menu(
     state: _SearchState, idx: int, ptoken: str, seid: str, ehtagdb,
+    *, sizes: dict[EHMode, int] | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """L3 zip 选单：4 模式 + 返回详情。4 模式按钮走现有 `eha:{ptoken}:<mode>` 回调。"""
+    """L3 zip 选单：4 模式 + 返回详情。4 模式按钮走现有 `eha:{ptoken}:<mode>` 回调。
+
+    `sizes` 由 size prefetch 完成后回填；首次渲染时为 None（裸 label）。
+    """
     it = state.page.items[idx]
     text = _render_eh_detail_card(
         title=it.title,
@@ -3480,26 +4198,28 @@ def _render_archive_menu(
         ehtagdb=ehtagdb,
         footer_prompt="选择下载模式（产出压缩包）：",
     )
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(EHMode.PAGE_SAMPLE.label_zh, callback_data=f"eha:{ptoken}:page_sample"),
-                InlineKeyboardButton(EHMode.PAGE_ORIGINAL.label_zh, callback_data=f"eha:{ptoken}:page_original"),
-            ],
-            [
-                InlineKeyboardButton(EHMode.ARCHIVE_RES.label_zh, callback_data=f"eha:{ptoken}:archive_resample"),
-                InlineKeyboardButton(EHMode.ARCHIVE_ORG.label_zh, callback_data=f"eha:{ptoken}:archive_original"),
-            ],
-            [InlineKeyboardButton("⬅ 返回详情", callback_data=f"ehs_back2det:{seid}:{idx}")],
-        ]
-    )
-    return text, keyboard
+    rows = _eh_mode_buttons(ptoken, prefix="eha", sizes=sizes)
+    rows.append([InlineKeyboardButton("⬅ 返回详情", callback_data=f"ehs_back2det:{seid}:{idx}")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _search_invalidate_active_ptoken(state: _SearchState) -> None:
+    """切层/翻页前调用：把当前 L2/L3 的 ptoken 从 _PENDING 立刻清掉，
+    让晚到的 size prefetch 在 `_safe_update_buttons` 第一关就失败。
+
+    没有 active_ptoken（L1 列表页）时是 no-op。
+    """
+    old = state.active_ptoken
+    state.active_ptoken = None
+    if old is not None:
+        _PENDING.pop(old, None)
 
 
 def _make_pending_for_item(state: _SearchState, idx: int, query) -> str:
     """为 L2/L3 的 eh:/eha: 按钮生成新的 _PENDING token + ref。返回 ptoken。
 
-    每次进 L2 或返回 L2 都新生成（旧的留 GC 清理，无副作用）。
+    每次进 L2 或返回 L2 都新生成；调用前必须先 _search_invalidate_active_ptoken
+    把旧 ptoken 从 _PENDING 清掉，避免旧 prefetch 把按钮覆盖回旧详情卡按钮。
     """
     it = state.page.items[idx]
     ptoken = uuid.uuid4().hex[:10]
@@ -3515,6 +4235,7 @@ def _make_pending_for_item(state: _SearchState, idx: int, query) -> str:
         created_at=time.time(),
         force_r2=state.force_r2,
     )
+    state.active_ptoken = ptoken
     return ptoken
 
 
@@ -3540,6 +4261,11 @@ async def _handle_ehs_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("⚠️ 无效条目", show_alert=True)
         return
 
+    # 进 L2 前先把可能存在的旧 L2/L3 ptoken 失效，否则旧 prefetch 完成时
+    # 仍会把按钮覆盖为旧条目的按钮（lambda 捕获 idx 是不变的，但 state.page
+    # 和 active_ptoken 已经变了，需要在 _PENDING 这一关把旧 ptoken 拦掉）。
+    _search_invalidate_active_ptoken(state)
+
     ptoken = _make_pending_for_item(state, idx, query)
     text, kb = _render_detail_card(state, idx, ptoken, seid, _get_ehtagdb(context))
     await query.answer()
@@ -3552,6 +4278,22 @@ async def _handle_ehs_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     except Exception as e:
         logger.warning(f"ehs_open edit failed: {e}")
+        return
+    # 异步拿 archive 两档大小，回填按钮 label。L2 详情卡有"归档下载"+"返回"两条额外行，
+    # 用 keyboard_builder 复用 _render_detail_card 自己的渲染逻辑。
+    # 显式快照本次 idx：lambda 捕获的是绑定时的局部 idx；但 keyboard_builder
+    # 即便用错 idx，最终 _safe_update_buttons 也会因 ptoken 已被清而拒绝写入。
+    ehtagdb = _get_ehtagdb(context)
+    pending = _PENDING.get(ptoken)
+    ref = pending.ref if pending else None
+    if ref is not None:
+        snapshot_idx = idx
+        _schedule_eh_size_prefetch(
+            context, query.message, ptoken, ref, prefix="eh",
+            keyboard_builder=lambda sizes: _render_detail_card(
+                state, snapshot_idx, ptoken, seid, ehtagdb, sizes=sizes,
+            )[1],
+        )
 
 
 async def _handle_ehs_arch_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3561,7 +4303,7 @@ async def _handle_ehs_arch_menu(update: Update, context: ContextTypes.DEFAULT_TY
     if len(parts) != 4:
         await query.answer()
         return
-    ptoken, seid, idx_str = parts[1], parts[2], parts[3]
+    _ptoken_in_cb, seid, idx_str = parts[1], parts[2], parts[3]
     state = _SEARCH_STATES.get(seid)
     if state is None:
         await query.answer("⚠️ 搜索已过期，请重新 /ehsearch", show_alert=True)
@@ -3569,16 +4311,19 @@ async def _handle_ehs_arch_menu(update: Update, context: ContextTypes.DEFAULT_TY
     if query.from_user.id != state.user_id:
         await query.answer("⚠️ 这个搜索来自其他用户", show_alert=True)
         return
-    # _PENDING 也得在；否则 eha:{ptoken}:mode 回调会找不到 pending → 用户体验 confusing。
-    # 不在就重新挂一份。
     try:
         idx = int(idx_str)
         _ = state.page.items[idx]
     except (ValueError, IndexError):
         await query.answer("⚠️ 无效条目", show_alert=True)
         return
-    if ptoken not in _PENDING:
-        ptoken = _make_pending_for_item(state, idx, query)
+
+    # 进 L3 前先把 L2 的 active ptoken 失效，再为 L3 挂新 ptoken。
+    # 否则 L2 起的 size prefetch 可能在 L3 已显示后回填，把 L3 按钮覆盖回 L2 模板。
+    # callback_data 里的旧 ptoken 不复用——_make_pending_for_item 会把 active_ptoken
+    # 替换为新 ptoken；下一步 _render_archive_menu 用新 ptoken 渲染按钮。
+    _search_invalidate_active_ptoken(state)
+    ptoken = _make_pending_for_item(state, idx, query)
 
     text, kb = _render_archive_menu(state, idx, ptoken, seid, _get_ehtagdb(context))
     await query.answer()
@@ -3589,6 +4334,19 @@ async def _handle_ehs_arch_menu(update: Update, context: ContextTypes.DEFAULT_TY
         )
     except Exception as e:
         logger.warning(f"ehs_arch_menu edit failed: {e}")
+        return
+    # L3 zip 选单异步拿大小回填
+    ehtagdb = _get_ehtagdb(context)
+    pending = _PENDING.get(ptoken)
+    ref = pending.ref if pending else None
+    if ref is not None:
+        snapshot_idx = idx
+        _schedule_eh_size_prefetch(
+            context, query.message, ptoken, ref, prefix="eha",
+            keyboard_builder=lambda sizes: _render_archive_menu(
+                state, snapshot_idx, ptoken, seid, ehtagdb, sizes=sizes,
+            )[1],
+        )
 
 
 async def _handle_ehs_back2list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3606,6 +4364,8 @@ async def _handle_ehs_back2list(update: Update, context: ContextTypes.DEFAULT_TY
     if query.from_user.id != state.user_id:
         await query.answer("⚠️ 这个搜索来自其他用户", show_alert=True)
         return
+    # 回 L1 列表后没有 active ptoken；旧 L2/L3 起的 prefetch 不应再覆盖按钮。
+    _search_invalidate_active_ptoken(state)
     text, kb = _render_search_message(seid, state, _get_ehtagdb(context))
     await query.answer()
     try:
@@ -3638,6 +4398,8 @@ async def _handle_ehs_back2det(update: Update, context: ContextTypes.DEFAULT_TYP
     except (ValueError, IndexError):
         await query.answer("⚠️ 无效条目", show_alert=True)
         return
+    # L3→L2 切层：把 L3 的 ptoken 立刻失效，再为 L2 挂新 ptoken。
+    _search_invalidate_active_ptoken(state)
     ptoken = _make_pending_for_item(state, idx, query)
     text, kb = _render_detail_card(state, idx, ptoken, seid, _get_ehtagdb(context))
     await query.answer()
@@ -3648,6 +4410,19 @@ async def _handle_ehs_back2det(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     except Exception as e:
         logger.warning(f"ehs_back2det edit failed: {e}")
+        return
+    # L3 → L2 同样异步拿大小回填
+    ehtagdb = _get_ehtagdb(context)
+    pending = _PENDING.get(ptoken)
+    ref = pending.ref if pending else None
+    if ref is not None:
+        snapshot_idx = idx
+        _schedule_eh_size_prefetch(
+            context, query.message, ptoken, ref, prefix="eh",
+            keyboard_builder=lambda sizes: _render_detail_card(
+                state, snapshot_idx, ptoken, seid, ehtagdb, sizes=sizes,
+            )[1],
+        )
 
 
 async def _handle_ehs_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3666,6 +4441,9 @@ async def _handle_ehs_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     state.expanded = True
     await query.answer("展开全部")
+    # 展开本身没切 L2/L3，但稳妥起见：active_ptoken 不应该在 L1 时还活着；
+    # 万一上一次 back2list 漏清，这里再保一次。
+    _search_invalidate_active_ptoken(state)
     text, kb = _render_search_message(seid, state, _get_ehtagdb(context))
     try:
         await query.edit_message_text(
@@ -3737,6 +4515,9 @@ async def _ehs_navigate(
     state.page = new_page
     state.expanded = False
     state.created_at = time.time()   # 翻页续命，避免长时间浏览过期
+    # 翻页后 page.items 已变；旧 L2/L3 ptoken 对应的 idx 现在指向不同条目，
+    # 必须立刻把它从 _PENDING 清掉，不让旧 prefetch 把按钮覆盖到错误条目上。
+    _search_invalidate_active_ptoken(state)
 
     text, kb = _render_search_message(seid, state, _get_ehtagdb(context))
     try:

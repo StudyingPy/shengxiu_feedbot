@@ -194,6 +194,25 @@ class JobQueueConfig:
     telegraph_publish: int = 3
 
 
+@dataclass
+class SizePrefetchConfig:
+    """下载前预获取作品大小（详情卡 / 按钮 label 上展示 ~XX MB）。
+
+    eh/ex 归档：GET archiver.php chooser 页解析 Estimated Size，准确，不消耗配额；
+    Pixiv / nhentai：HEAD（失败 fallback Range bytes=0-0）采样前 N 张图求均值乘以总页数。
+
+    任何阶段失败都静默回退（不显示预估行 / 按钮不带数字），不会影响下载主流程。
+    """
+
+    enabled: bool = True
+    sample_count: int = 3        # Pixiv / nhentai HEAD 采样数
+    timeout: int = 5             # 单请求超时秒；总 prefetch 超时 ≈ timeout
+    # 各 provider 子开关：某个 provider 频繁失败时可单独关，不影响其他
+    eh_archive: bool = True      # eh/ex 归档（chooser 解析）
+    pixiv: bool = True
+    nhentai: bool = True
+
+
 # ---------------------------------------------------------------------------
 # 顶层
 # ---------------------------------------------------------------------------
@@ -210,6 +229,7 @@ class Config:
     templates: TemplatesConfig = field(default_factory=TemplatesConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     job_queue: JobQueueConfig = field(default_factory=JobQueueConfig)
+    size_prefetch: SizePrefetchConfig = field(default_factory=SizePrefetchConfig)
 
     _source_path: Path | None = field(default=None, repr=False)
     _runtime: Any | None = field(default=None, repr=False)  # RuntimeSettings 实例（可空）
@@ -265,6 +285,7 @@ class Config:
             templates=templates,
             logging=LoggingConfig(**(data.get("logging") or {})),
             job_queue=JobQueueConfig(**(data.get("job_queue") or {})),
+            size_prefetch=SizePrefetchConfig(**(data.get("size_prefetch") or {})),
         )
 
     def _apply_env_overrides(self) -> None:
@@ -525,6 +546,13 @@ RUNTIME_KEYS: set[str] = {
     "templates.gallery.page_title",
     "templates.gallery.page_header",
     "templates.gallery.page_footer",
+    # size_prefetch
+    "size_prefetch.enabled",
+    "size_prefetch.sample_count",
+    "size_prefetch.timeout",
+    "size_prefetch.eh_archive",
+    "size_prefetch.pixiv",
+    "size_prefetch.nhentai",
 }
 
 # 敏感字段（/setting list 显示时打码）

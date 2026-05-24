@@ -224,3 +224,21 @@ job_queue:
   direct_image: 2
   # 多页 telegraph 发布
   telegraph_publish: 3
+
+# ============================================================================
+# 下载前预获取作品大小（详情卡 / 按钮 label 上展示 ~XX MB）
+# ============================================================================
+# eh/ex 归档：GET archiver.php chooser 页解析 Estimated Size，准确，不消耗配额；
+# Pixiv / nhentai：HEAD（失败 fallback Range bytes=0-0）采样前 N 张图求均值乘以总页数。
+# 任何阶段失败都静默回退（不显示预估行 / 按钮不带数字），不会影响下载主流程。
+# 所有字段都是运行时可改的（/setting set size_prefetch.xxx）。
+size_prefetch:
+  enabled: true
+  # Pixiv / nhentai HEAD 采样数（多采样更准但更慢）
+  sample_count: 3
+  # 单请求超时秒；总 prefetch 超时 ≈ timeout
+  timeout: 5
+  # 各 provider 子开关：某个 provider 频繁失败时可单独关，不影响其他
+  eh_archive: true
+  pixiv: true
+  nhentai: true

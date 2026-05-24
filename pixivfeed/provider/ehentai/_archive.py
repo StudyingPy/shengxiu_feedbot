@@ -153,6 +153,65 @@ def parse_gp_cost(html: str, mode: EHMode) -> int:
     return 0
 
 
+async def fetch_archive_sizes(
+    client: httpx.AsyncClient,
+    album_url: str,
+    host: str,
+    gid: str,
+    token: str,
+) -> dict[EHMode, int]:
+    """在用户按归档按钮之前，预先 GET archiver.php chooser 页拿两档预估字节数。
+
+    返回 `{EHMode.ARCHIVE_RES: bytes, EHMode.ARCHIVE_ORG: bytes}`，
+    解析失败的 mode 不出现在 dict 里。完全失败时返回空 dict。
+
+    **不消耗 archive 配额**：只 GET chooser，不提交 form。
+    会复用 `fetch_archiver_token` + `_ARCHIVE_LOCKED_RE` / `_ARCHIVE_ERROR_RE`
+    检测，碰到这些已知错误状态直接静默返回 {}，不抛异常。
+
+    上层用法：private chat 给用户发完详情卡+按钮后，create_task 跑这个函数，
+    完成后用 `parse_estimated_size_bytes` 已经写进 dict 的数字更新按钮 label。
+    """
+    try:
+        archiver_url = await fetch_archiver_token(client, album_url)
+    except Exception as e:
+        logger.debug(f"fetch_archive_sizes: fetch_archiver_token failed: {e}")
+        return {}
+
+    if archiver_url.startswith("http://") or archiver_url.startswith("https://"):
+        chooser_url = archiver_url
+    else:
+        chooser_url = f"https://{host}/archiver.php?gid={gid}&token={token}&or={archiver_url}"
+
+    try:
+        resp = await client.get(
+            chooser_url,
+            headers={**BASE_HEADERS, "Referer": f"https://{host}/g/{gid}/{token}"},
+        )
+    except Exception as e:
+        logger.debug(f"fetch_archive_sizes: GET chooser failed: {e}")
+        return {}
+    if resp.status_code != 200:
+        logger.debug(f"fetch_archive_sizes: chooser HTTP {resp.status_code}")
+        return {}
+
+    # 不主动 invalidate session：prefetch 是只读探测，如果撞到 locked 状态
+    # 应该让真正的下载流程去处理，而不是 prefetch 提前把 session 作废。
+    if _ARCHIVE_LOCKED_RE.search(resp.text):
+        logger.debug(f"fetch_archive_sizes: session locked (skipped)")
+        return {}
+    if _ARCHIVE_ERROR_RE.search(resp.text):
+        logger.debug(f"fetch_archive_sizes: archive denied (skipped)")
+        return {}
+
+    out: dict[EHMode, int] = {}
+    for m in (EHMode.ARCHIVE_RES, EHMode.ARCHIVE_ORG):
+        n = parse_estimated_size_bytes(resp.text, m)
+        if n > 0:
+            out[m] = n
+    return out
+
+
 async def invalidate_archive_session(
     client: httpx.AsyncClient,
     host: str,

@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.9.0 — 2026-05-25
+
+下载前预获取并展示作品大小。eh/ex 归档按钮 label 加 `~XX MB`，Pixiv / nhentai 私聊弹详情卡（标题 + 张数 + 预估大小 + 模式按钮）；网络估算走 HEAD → streaming Range fallback，永不读 body。
+
+### Features
+- **eh/ex 归档按钮显示预估大小**。私聊粘 eh/ex 链接、`/archive` 命令、`/ehsearch` 进 L2 详情卡 / L3 zip 选单共 5 处入口，发完详情卡后异步 GET `archiver.php` chooser 页解析 res / org 两档预估字节数（不消耗 archive 配额），1~3s 后通过 `edit_message_reply_markup` 把"归档 · 重采样" / "归档 · 原图"按钮 label 改成 `归档 · 原图 ~1.8GB`。失败一律静默回退到裸 label。
+- **Pixiv 私聊详情卡**。`mode=auto` 时不再直接下载，而是先发卡片显示标题 / 画师 / 张数 / R-18 / `~XX MB` / 标签 + 按钮 `[直发图片] [Telegra.ph]`（page_count > 10 时仅 Telegra.ph）+ `[取消]`。`/pixiv_direct` `/pixiv_telegraph` 命令保留原 UX 不弹卡片。
+- **nhentai 私聊详情卡**。新增 `nh:{token}:{action}` 路由 + `[开始下载] [取消]` 按钮，正文显示张数 / 预估大小 / 前 12 个 tag。
+- **`size_prefetch` 配置段**。新增 `size_prefetch.enabled` / `sample_count` / `timeout` / `eh_archive` / `pixiv` / `nhentai` 6 个 key，全部进 `RUNTIME_KEYS`，私聊 `/setting set size_prefetch.enabled false` 可热关。
+
+### Fixes
+- **修复 Pixiv 私聊 direct 模式 reply_to 落到将被删 placeholder 的 bug**。`_Pending` 新增 `orig_chat_id` / `orig_msg_id` 字段记录用户原始消息身份；`_send_pixiv_illust_direct` 接收 `reply_to_message_id` / `reply_to_chat_id` 参数，按钮回调时显式传入。原来回调里 `update.effective_message` 是 bot 的详情卡，函数末尾 `placeholder.delete()` 后图片就回复到一条不存在的消息上。
+- **`_size_prefetch.head_or_range_content_length` Range fallback 改 streaming**。原实现用 `client.get()`，服务端忽略 `Range` 返 200 时 httpx 会读完整响应体，把"下载前估算"反过来变成下载本身（i.pximg.net 大图、nhentai CDN 都可能这样）。改成 `client.stream("GET", ...)` 只读 headers，离开 `async with` 时 httpx aclose 连接，body 一字节不下。
+- **Pixiv / nhentai 详情卡 HTML 转义不完整**。原 `.replace("<","&lt;").replace(">","&gt;")` 不处理 `&`，含 `&` 的 title / tag 会让 TG `edit_text(parse_mode=HTML)` 报 `Bad Request: can't parse entities`。统一改走仓库内已有的 `_html_escape`。
+- **`/ehsearch` 切层 / 翻页时旧 ptoken 没失效的竞态**。L1 / L2 / L3 / 翻页复用同一条消息，旧 ptoken 在 TTL 过期前都活在 `_PENDING` 里；晚到的 size prefetch 可能把当前列表页或新页详情卡的按钮覆盖回旧条目的按钮。`_SearchState` 新增 `active_ptoken` 字段，所有切层入口（`ehs_open` / `ehs_arch_menu` / `ehs_back2det` / `ehs_back2list` / `ehs_more` / `_ehs_navigate` next/prev）调用 `_search_invalidate_active_ptoken(state)` 立刻把旧 ptoken 从 `_PENDING` 弹出，`_safe_update_buttons` 第一关 `pending is None` 就拒绝写入。`_handle_ehs_arch_menu` 不再"按需复用"callback_data 里的 ptoken，改为无条件重挂 + invalidate，避免 L2 起的 prefetch 回填到 L3。
+
+### Internal
+- **新增 `pixivfeed/provider/_size_prefetch.py`**：`head_or_range_content_length(client, url)` HEAD 优先 + streaming Range fallback；`estimate_total_bytes(client, urls, sample_count=N)` 采样均值 × len(urls) 求估算总大小。任何失败一律返回 None，永不抛给上层。
+- **新增 `pixivfeed/provider/ehentai/_archive.fetch_archive_sizes(client, host, gid, token)`**：从 `request_archive` 内部 GET chooser 部分独立抽出，只 GET 不 POST，不消耗配额，解析 chooser HTML 的 `Estimated Size` 字段返回 `dict[EHMode, int]`。
+- **新增 `pixivfeed/config.SizePrefetchConfig`** dataclass 与 6 个 `RUNTIME_KEYS`，挂在 `AppConfig.size_prefetch` 上。
+- **`handlers._Pending` 加 `orig_chat_id` / `orig_msg_id`** 字段，4 处 `_Pending(...)` 构造点（eh / `/archive` / Pixiv / nhentai）均填充用户原始消息身份。
+- **`handlers._safe_update_buttons` / `_safe_update_card`** 竞态保护 helper：三重校验 `token in _PENDING` + `chat_id` + `msg_id`，prefetch 完成时仅在三者全部匹配才发 edit。
+- **`handlers._schedule_eh_size_prefetch` / `_schedule_pixiv_size_prefetch` / `_schedule_nhentai_size_prefetch`** fire-and-forget 任务封装；`_schedule_eh_size_prefetch` 支持可选 `keyboard_builder` 让搜索流 L2/L3 复用各自渲染逻辑，并接受 `prefix` 参数区分 `eh:` / `eha:` 回调路由。
+- **`_make_eh_keyboard` / `_eh_mode_buttons`** 签名扩展：加 `sizes: dict[EHMode, int] | None` 与 `prefix: str` 参数；首次发送时 sizes=None 出裸 label，prefetch 完成回填出 `~XX MB`。
+- **`provider/nhentai/__init__.py`** 把 `NHENTAI_CDNS` 加进 `__all__`，供 handlers 复用 CDN 列表生成 size 采样 URL。
+
+### 改动文件
+- 新增：`pixivfeed/provider/_size_prefetch.py`
+- `pixivfeed/channel/telegram/handlers.py`：详情卡 + 竞态保护 + 路由
+- `pixivfeed/config.py`：`SizePrefetchConfig` + RUNTIME_KEYS
+- `pixivfeed/provider/ehentai/_archive.py`：抽 `fetch_archive_sizes`
+- `pixivfeed/provider/nhentai/__init__.py`：`__all__` 暴露 `NHENTAI_CDNS`
+- `config.example.yaml`：`size_prefetch` 段
+- `pyproject.toml`：version 0.8.3 → 0.9.0
+
 ## v0.8.3 — 2026-05-20
 
 磁盘剩余空间护栏 + 文档大幅重写。鲁棒性补强，无新功能。

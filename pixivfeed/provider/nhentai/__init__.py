@@ -284,4 +284,4 @@ class NHentaiProvider(Provider):
             await _tick()
 
 
-__all__ = ["NHentaiProvider", "NHentaiAlbum", "NHentaiError"]
+__all__ = ["NHentaiProvider", "NHentaiAlbum", "NHentaiError", "NHENTAI_CDNS"]
