@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixes
+- **`/cache stats` 文案打磨**：[handlers.py:cmd_cache](pixivfeed/channel/telegram/handlers.py)。"legacy（升级前条目，状态未知）" 容易让人误读为"图坏了"，实际语义是 v0.8.2 schema 升级前的旧条目缺 `r2_image_count` 元数据；改为"升级前条目，元数据缺失"。"非 durable 非 legacy" 否定式拗口，改为"fallback（存于服务器中，到期失效）"。fallback 原因分布从裸 enum 名（`size_guard_skipped` / `r2_partial` 等）改为附中文一句话解释（`画廊 >1GB 跳过 R2` 等），新增 `_FALLBACK_REASON_ZH` 映射表对账 [publisher/_resolver.py:FallbackReason](pixivfeed/publisher/_resolver.py)。
+
 ## v0.10.0 — 2026-05-25
 
 telegraph 缓存联动失效：底层图片（R2 对象 / cache_dir 文件）被清理时，对应 `telegraph_cache` 行自动失效，避免用户重提相同链接命中"图已 404 的旧 telegra.ph 链接"。同时新增 `/cache invalidate` admin 救济命令。

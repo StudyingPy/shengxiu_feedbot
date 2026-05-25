@@ -4574,6 +4574,18 @@ def _fmt_utc8(ts: _dt.datetime) -> str:
     return ts.astimezone(_TZ_UTC8).strftime("%Y-%m-%d %H:%M")
 
 
+# /cache stats 展示用：FallbackReason 枚举 → 中文一句话解释。
+# 枚举值定义在 pixivfeed/publisher/_resolver.py:FallbackReason。
+# 新增 reason 时同步加一行；缺失项渲染时退化为只显示英文。
+_FALLBACK_REASON_ZH: dict[str, str] = {
+    "r2_disabled":        "R2 未启用",
+    "size_guard_skipped": "画廊 >1GB 跳过 R2",
+    "r2_batch_failed":    "整批 R2 上传失败",
+    "r2_partial":         "部分图上传失败",
+    "local_file_missing": "本地图片文件缺失",
+}
+
+
 async def cmd_cache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/cache <子命令> —— admin only。telegraph_cache 表管理。
 
@@ -4623,13 +4635,15 @@ async def cmd_cache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "─────────",
             f"总条目：{cs.total}",
             f"  durable（图在 R2，长期可用）：{cs.durable}",
-            f"  legacy（升级前条目，状态未知）：{cs.legacy}",
-            f"  非 durable 非 legacy：{cs.total - cs.durable - cs.legacy}",
+            f"  legacy（升级前条目，元数据缺失）：{cs.legacy}",
+            f"  fallback（存于服务器中，到期失效）：{cs.total - cs.durable - cs.legacy}",
         ]
         if cs.fallback_breakdown:
-            lines.append("\nfallback_reason 分布：")
+            lines.append("\nfallback 原因分布：")
             for reason, cnt in sorted(cs.fallback_breakdown.items(), key=lambda x: -x[1]):
-                lines.append(f"  {reason}: {cnt}")
+                zh = _FALLBACK_REASON_ZH.get(reason, "")
+                label = f"{reason} ({zh})" if zh else reason
+                lines.append(f"  {label}: {cnt}")
         await update.message.reply_text("\n".join(lines))
         return
 
