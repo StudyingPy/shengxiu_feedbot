@@ -33,11 +33,18 @@ def _invalidate_cache_rows_sync(
 
     cleanup.py 是同步脚本，不引 aiosqlite。bot 进程同时可能在读写，
     用短连接 + WAL 模式（schema 已默认开 WAL）下 DELETE 是原子安全的。
+
+    **只删 durable=0 的行**：durable=1 表示 telegra.ph 页面 <img> 指向
+    R2 公开 URL，不依赖本地 cache_dir 文件——本地 7 天清理对页面无影响，
+    失效该 cache 行只会让用户重提走不必要的重发。R2 LRU 联动那条路径
+    （bot.py:_r2_lru_loop）才需要无视 durable——R2 对象真没了无论 durable
+    与否页面都坏了。
     """
     conn = sqlite3.connect(db_path, timeout=10.0)
     try:
         cur = conn.execute(
-            "DELETE FROM telegraph_cache WHERE kind LIKE ? AND pixiv_id = ?",
+            "DELETE FROM telegraph_cache "
+            "WHERE kind LIKE ? AND pixiv_id = ? AND durable = 0",
             (kind_pattern, pixiv_id),
         )
         conn.commit()
