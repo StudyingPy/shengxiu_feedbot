@@ -140,8 +140,16 @@ async def publish_novel(
                     img_url = pages[0]["urls"]["original"]
                 else:
                     img_url = urls["original"]
-                downloaded = await downloader.download_illust(illust_id, [img_url])
-                pixivimage_idx_by_id[illust_id] = _push_item(downloaded[0].original_path)
+                # 引用图必须落到 novel 自己的目录（novel_{nid}/embed_pixivimage_*），
+                # 不能落到 cache_dir/{illust_id}/。否则 R2 LRU / cleanup.py 反向
+                # 映射看到首段是数字会失效 (pixiv/illust, illust_id)，而 novel
+                # 实际 cache 行是 (pixiv/novel, nid)——novel cache 永远逃过失效，
+                # 用户重提仍命中"图已 404"的旧 telegra.ph 链接。
+                # 见 pixivfeed/storage/cache_keymap.py 反向映射规则。
+                embed_path = await downloader.download_novel_embed(
+                    nid, f"pixivimage_{illust_id}", img_url,
+                )
+                pixivimage_idx_by_id[illust_id] = _push_item(embed_path)
             except Exception as e:
                 logger.warning(f"failed to embed pixivimage:{illust_id} in novel {nid}: {e}")
             done += 1
