@@ -1,9 +1,28 @@
 # Changelog
 
-## [Unreleased]
+## v0.10.1 — 2026-05-25
+
+修 v0.10.0 的 critical bug：cache 反向映射对 e-hentai / exhentai / nhentai 写错了，自动联动失效（R2 LRU + cache_dir cleanup）以及 `/cache invalidate` 命令对这三个 provider 全部失效。配套修一些 v0.10.0 引入的文案问题。
 
 ### Fixes
+- **`cache_keymap` 反向映射写错（critical）**。v0.10.0 引入的 [storage/cache_keymap.py:cache_keys_for_path_segment](pixivfeed/storage/cache_keymap.py) 对 eh/ex/nh 的目标 `(kind, pixiv_id)` 三处都对不上数据库实际写入：
+    - eh/ex 的 `cache_kind` 实际是 `f"{ref.provider}/gallery/{mode}"`，而 `ref.provider` 来自 `_EHFamilyProvider.HOST` —— 实际值带 `.org`（`e-hentai.org` / `exhentai.org`），不是简写的 `ehentai` / `exhentai`。
+    - eh/ex 的 `pixiv_id` 实际是 `f"{gid}/{token}"` 复合键（见 [provider/ehentai/__init__.py:251](pixivfeed/provider/ehentai/__init__.py)、[handlers.py:4234](pixivfeed/channel/telegram/handlers.py)），不是裸 `gid`。
+    - nhentai 走 [_send_via_telegraph_generic](pixivfeed/channel/telegram/handlers.py)，`cache_kind` 是 `f"{ref.provider}/{ref.kind}"` = `"nhentai/gallery"`（无 mode 后缀）。原代码返回 LIKE pattern `"nhentai/gallery/%"`，SQL `%` 必须匹配 ≥1 字符 → 永远匹配不到 `"nhentai/gallery"`。改为精确 `=`。
+
+  后果：v0.10.0 的 R2 LRU + cache_dir cleanup 联动失效**对 eh/ex/nh 全部不工作**，相当于该版本的主功能只对 pixiv 生效。本版修正后所有 4 类 provider 都能正确联动。**没有数据损坏风险**——错误的 SQL 永远删不到行，只是没起到该有的失效作用。
+
+- **`cache_keys_for_r2_key` prefix 规范化与 `R2Client` 不一致**。v0.10.0 只 `rstrip("/")` + 加尾，没去前导斜杠也没 strip 空白。如果 `r2_cfg.prefix` 配成 `"/feedbot"` / `" feedbot "` 这类合法但非规范化形式（[R2Client._normalize_prefix](pixivfeed/storage/r2.py) 接受），反向映射会拼出对不上的 prefix → `key.startswith()` 判断失败 → 整段 R2 key 进入路径段解析 → 静默失败。改为与 `_normalize_prefix` 完全对齐（`strip().lstrip("/")` + 加尾 `/`）。
+- **`cmd_cache` 文档/示例同步更新**。所有 `ehentai/gallery/% 3936793` 形式的示例改为 `e-hentai.org/gallery/% 3936793/d89fc4d30a` 真实可用格式。docstring 加一段解释 eh/ex 的 id 是 `{gid}/{token}` 复合键、nhentai 的 kind 没 mode 后缀。
 - **`/cache stats` 文案打磨**：[handlers.py:cmd_cache](pixivfeed/channel/telegram/handlers.py)。"legacy（升级前条目，状态未知）" 容易让人误读为"图坏了"，实际语义是 v0.8.2 schema 升级前的旧条目缺 `r2_image_count` 元数据；改为"升级前条目，元数据缺失"。"非 durable 非 legacy" 否定式拗口，改为"fallback（存于服务器中，到期失效）"。fallback 原因分布从裸 enum 名（`size_guard_skipped` / `r2_partial` 等）改为附中文一句话解释（`画廊 >1GB 跳过 R2` 等），新增 `_FALLBACK_REASON_ZH` 映射表对账 [publisher/_resolver.py:FallbackReason](pixivfeed/publisher/_resolver.py)。
+
+### 升级注意
+- 升级到 v0.10.1 后，**v0.10.0 期间 R2 LRU / cleanup.py 跑过的轮次没能联动失效的 cache 行依然在 DB 里**——这些是 v0.10.0 的 bug 留下的"应失效但没失效"残留。判断方法：用户报某 telegra.ph 页面坏了就 `/cache invalidate` 救一条；批量怀疑可以 `sqlite3 ... "DELETE FROM telegraph_cache WHERE durable = 0;"` 一次清掉所有 fallback 行（参见 v0.10.0 升级注意）。
+
+### 改动文件
+- `pixivfeed/storage/cache_keymap.py`：eh/ex `.org` 域名 + `gid/token` 复合键、nhentai 精确 `=`、prefix 规范化对齐 `R2Client`
+- `pixivfeed/channel/telegram/handlers.py`：`cmd_cache` docstring / `_cmd_cache_help` / 子命令用法示例、`/cache stats` 文案 + `_FALLBACK_REASON_ZH` 映射
+- `pyproject.toml`：version 0.10.0 → 0.10.1
 
 ## v0.10.0 — 2026-05-25
 
