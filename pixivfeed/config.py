@@ -455,7 +455,13 @@ class Config:
 
 
 def _coerce(raw: str, target_type: Any) -> Any:
-    """把字符串转成目标类型。target_type 可以是 type 对象或 typing 注解字符串。"""
+    """把字符串转成目标类型。target_type 可以是 type 对象或 typing 注解字符串。
+
+    解析失败统一抛 `ValueError`，message 是中文友好提示——`/setting set` handler
+    现有逻辑已经 `except ValueError as e: ... ⚠️ 值无效：{e}`，这里把裸 `int()` /
+    `float()` 抛出的 "invalid literal for int() with base 10: 'abc'" 这类对用户
+    不友好的英文消息包一层即可。
+    """
     # dataclass.fields() 返回的 type 可能是字符串（PEP 563 / from __future__ import annotations）
     if isinstance(target_type, str):
         type_str = target_type
@@ -468,11 +474,19 @@ def _coerce(raw: str, target_type: Any) -> Any:
             return True
         if v in ("0", "false", "no", "n", "off"):
             return False
-        raise ValueError(f"cannot parse {raw!r} as bool")
+        raise ValueError(
+            f"无法将 {raw!r} 解析为布尔值（用 true/false / yes/no / 1/0）"
+        )
     if type_str in ("int", "<class 'int'>"):
-        return int(raw.strip())
+        try:
+            return int(raw.strip())
+        except ValueError:
+            raise ValueError(f"无法将 {raw!r} 解析为整数") from None
     if type_str in ("float", "<class 'float'>"):
-        return float(raw.strip())
+        try:
+            return float(raw.strip())
+        except ValueError:
+            raise ValueError(f"无法将 {raw!r} 解析为浮点数") from None
     if type_str in ("str", "<class 'str'>"):
         return raw
     # list[int] / list[str] 等
@@ -480,7 +494,12 @@ def _coerce(raw: str, target_type: Any) -> Any:
         # 简化：CSV
         items = [x.strip() for x in raw.split(",") if x.strip()]
         if "int" in type_str:
-            return [int(x) for x in items]
+            try:
+                return [int(x) for x in items]
+            except ValueError as e:
+                raise ValueError(
+                    f"无法将 {raw!r} 解析为整数列表（用逗号分隔）：{e}"
+                ) from None
         return items
     # 兜底：原样
     return raw
