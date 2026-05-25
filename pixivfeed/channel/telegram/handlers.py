@@ -85,13 +85,14 @@ from ...storage import (
     AllowList,
     TelegraphCache,
 )
+from ...storage.cache import invalidate_for_r2_keys
 from ...storage.r2 import R2ListIncomplete, R2StatsSnapshot, lru_evict_to_target, stats_from_objects
 from ...utils import (
     check_disk_free,
     format_disk_full_message,
     logger,
 )
-from .auth import is_authorized
+from .auth import is_admin, is_authorized
 from .constants import (
     CANCEL_TOKEN_TTL,
     LOCAL_BOT_API_DOCUMENT_LIMIT,
@@ -865,6 +866,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /chatid                  查看当前 chat_id\n"
         "  /setting list            （仅 admin）查看运行时配置\n"
         "  /setting help            （仅 admin）查看 setting 命令帮助\n"
+        "  /cache help              （仅 admin）telegraph 缓存管理\n"
     )
 
 
@@ -1135,6 +1137,10 @@ async def _eh_run_with_mode(
         InlineKeyboardMarkup([extra_buttons]) if extra_buttons else None
     )
 
+    # cache_kind 是 telegraph_cache.kind 字段的实际值。新增 provider / 新 mode 时
+    # **必须**同步更新 pixivfeed/storage/cache_keymap.py 的反向映射规则，否则
+    # R2 LRU / cache_dir cleanup 清掉底层图片后无法联动失效该行 cache，导致用户
+    # 重提相同链接命中坏 URL。
     cache_kind = f"{ref.provider}/gallery/{mode.value}"
     cached = await tg_cache.get(cache_kind, ref.id)
     if cached is not None:
@@ -4568,6 +4574,113 @@ def _fmt_utc8(ts: _dt.datetime) -> str:
     return ts.astimezone(_TZ_UTC8).strftime("%Y-%m-%d %H:%M")
 
 
+async def cmd_cache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cache <子命令> —— admin only。telegraph_cache 表管理。
+
+    子命令：
+        /cache invalidate <kind> <id>   按精确 kind / SQL LIKE pattern 失效
+        /cache stats                    查看 cache 总览（durable 渗透率等）
+        /cache help                     本帮助
+
+    典型用例（用户报"页面打不开了"时）：
+        /cache invalidate pixiv/illust 12345
+        /cache invalidate ehentai/gallery/page_sample 3936793
+        /cache invalidate ehentai/gallery/% 3936793     ← 同 gid 全 mode 一起删
+        /cache invalidate exhentai/% 3936793
+        /cache invalidate pixiv/novel 67890
+
+    失效仅删一行 cache 索引，不删 telegra.ph 实际页面 / R2 / nginx 文件。
+    下次任何用户提交相同链接 → cache miss → 走完整下载发布流程拿新 URL。
+    """
+    config: Config = context.bot_data["config"]
+    allowlist: AllowList = context.bot_data["allowlist"]
+    if not is_admin(update, allowlist):
+        # 静默：避免暴露命令存在
+        return
+    await _track_user(update, context)
+
+    args = list(context.args or [])
+    if not args:
+        await _cmd_cache_help(update)
+        return
+
+    sub = args[0].lower()
+    tg_cache: TelegraphCache = context.bot_data["telegraph_cache"]
+
+    if sub in ("help", "?"):
+        await _cmd_cache_help(update)
+        return
+
+    if sub == "stats":
+        try:
+            cs = await tg_cache.stats()
+        except Exception as e:
+            logger.exception("/cache stats failed")
+            await update.message.reply_text(f"⚠️ 读取失败：{e}")
+            return
+        lines = [
+            "telegraph_cache 总览",
+            "─────────",
+            f"总条目：{cs.total}",
+            f"  durable（图在 R2，长期可用）：{cs.durable}",
+            f"  legacy（升级前条目，状态未知）：{cs.legacy}",
+            f"  非 durable 非 legacy：{cs.total - cs.durable - cs.legacy}",
+        ]
+        if cs.fallback_breakdown:
+            lines.append("\nfallback_reason 分布：")
+            for reason, cnt in sorted(cs.fallback_breakdown.items(), key=lambda x: -x[1]):
+                lines.append(f"  {reason}: {cnt}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if sub == "invalidate":
+        if len(args) < 3:
+            await update.message.reply_text(
+                "用法：/cache invalidate <kind> <id>\n"
+                "kind 支持 SQL LIKE 通配符 %，例：\n"
+                "  /cache invalidate pixiv/illust 12345\n"
+                "  /cache invalidate ehentai/gallery/page_sample 3936793\n"
+                "  /cache invalidate ehentai/gallery/% 3936793   ← 同 gid 全 mode 一起删\n"
+                "  /cache invalidate exhentai/% 3936793\n"
+                "  /cache invalidate pixiv/novel 67890"
+            )
+            return
+        kind_pattern = args[1]
+        pixiv_id = args[2]
+        try:
+            n = await tg_cache.invalidate_by_pattern(kind_pattern, pixiv_id)
+        except Exception as e:
+            logger.exception(f"/cache invalidate {kind_pattern} {pixiv_id} failed")
+            await update.message.reply_text(f"⚠️ 失效失败：{e}")
+            return
+        if n == 0:
+            await update.message.reply_text(
+                f"（没有匹配的 cache 行：kind={kind_pattern}, id={pixiv_id}）"
+            )
+        else:
+            await update.message.reply_text(
+                f"✓ 已失效 {n} 行 cache（kind={kind_pattern}, id={pixiv_id}）\n"
+                "下次用户提交相同链接时会重新发布。"
+            )
+        return
+
+    await update.message.reply_text(
+        f"未知子命令 {sub!r}。试试 /cache help"
+    )
+
+
+async def _cmd_cache_help(update: Update) -> None:
+    await update.message.reply_text(
+        "/cache invalidate <kind> <id>   失效一条/一组 cache（kind 支持 % 通配）\n"
+        "/cache stats                    查看 cache 总览（durable 渗透率）\n"
+        "/cache help                     本帮助\n\n"
+        "示例：\n"
+        "  /cache invalidate pixiv/illust 12345\n"
+        "  /cache invalidate ehentai/gallery/% 3936793\n\n"
+        "（注：R2 LRU 与 cache_dir 清理已自动联动失效，本命令仅做兜底）"
+    )
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """admin only。用法见上面注释。"""
     config: Config = context.bot_data["config"]
@@ -4737,7 +4850,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         try:
-            removed, freed = await lru_evict_to_target(
+            removed, freed, deleted_keys = await lru_evict_to_target(
                 r2_client,
                 high_watermark_bytes=high, low_watermark_bytes=low,
                 objects=objects,
@@ -4759,11 +4872,24 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 newest_at=snapshot_before.newest_at,
             )
             context.bot_data["r2_stats"] = patched
+            # 联动失效 telegraph_cache（与后台 _r2_lru_loop 一致；
+            # 这里复用 helper 保持行为一致）
+            tg_cache: TelegraphCache = context.bot_data["telegraph_cache"]
+            try:
+                inval_count = await invalidate_for_r2_keys(
+                    tg_cache, deleted_keys, r2_prefix=r2_cfg.prefix,
+                )
+            except Exception:
+                logger.exception(
+                    "/stats r2_evict: invalidate_for_r2_keys failed; cache may be stale"
+                )
+                inval_count = 0
             pct = (new_total / cap_bytes * 100) if cap_bytes > 0 else 0
             text = (
                 f"✅ LRU 清理完成\n"
                 f"删除对象：{removed:,}\n"
                 f"释放空间：{fmt_bytes(freed)}\n"
+                f"失效 telegraph cache 行：{inval_count}\n"
                 "─────────\n"
                 f"R2 当前占用：{fmt_bytes(new_total)} / {r2_cfg.capacity_gb} GB ({pct:.1f}%)\n"
                 f"R2 对象数：{new_count:,}"
@@ -4976,6 +5102,7 @@ __all__ = [
     "cmd_archive",
     "cmd_ehsearch",
     "cmd_zip2tph",
+    "cmd_cache",
     "cmd_stats",
     "handle_zip_document",
     "cmd_start",

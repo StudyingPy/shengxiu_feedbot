@@ -9,6 +9,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from ..utils import logger
+from .cache_keymap import cache_keys_for_r2_key
 from .db import Database
 
 
@@ -182,6 +184,21 @@ class TelegraphCache:
             )
             await self.db.conn.commit()
 
+    async def invalidate_by_pattern(self, kind_pattern: str, pixiv_id: str) -> int:
+        """按 SQL `LIKE` 模式删除 cache 行。返回删除的行数。
+
+        `kind_pattern` 含 `%` 是通配（例 `ehentai/gallery/%`），不含时与 `=` 等价。
+        给底层图片清理（R2 LRU / cache_dir cleanup）联动使用，参见
+        `pixivfeed/storage/cache_keymap.py`。
+        """
+        async with self.db.write_lock:
+            cur = await self.db.conn.execute(
+                "DELETE FROM telegraph_cache WHERE kind LIKE ? AND pixiv_id = ?",
+                (kind_pattern, pixiv_id),
+            )
+            await self.db.conn.commit()
+            return cur.rowcount or 0
+
     async def stats(self) -> "CacheStats":
         """聚合 durability 分布给 /stats 用。"""
         async with self.db.conn.execute(
@@ -234,7 +251,56 @@ class CacheStats:
     fallback_breakdown: dict[str, int]    # fallback_reason → count（非 durable 非 legacy）
 
 
-__all__ = ["AllowList", "AllowedEntry", "CacheEntry", "CacheStats", "TelegraphCache", "RuntimeSettings"]
+async def invalidate_for_r2_keys(
+    cache: TelegraphCache,
+    deleted_keys: list[str],
+    *,
+    r2_prefix: str = "",
+) -> int:
+    """对一批 R2 absolute key，查反向映射后批量失效 telegraph_cache。
+
+    返回失效的总行数（去重后实际 DELETE 命中的行数）。
+
+    一个画廊往往有多张图，LRU 通常按 LastModified 连续删掉同一画廊的多张图，
+    所以这里按 (kind_pattern, pixiv_id) 去重再 invalidate。任一映射失败 / SQL
+    失败都只 log，不影响整体——这是 best-effort 联动。
+    """
+    if not deleted_keys:
+        return 0
+    pairs: set[tuple[str, str]] = set()
+    unknown = 0
+    for key in deleted_keys:
+        mapped = cache_keys_for_r2_key(key, prefix=r2_prefix)
+        if not mapped:
+            unknown += 1
+            logger.debug(f"cache: no mapping for R2 key {key!r}; skipping invalidate")
+            continue
+        for pair in mapped:
+            pairs.add(pair)
+    if unknown:
+        logger.debug(
+            f"cache: {unknown}/{len(deleted_keys)} R2 keys had no mapping in cache_keymap"
+        )
+    total = 0
+    for kind_pattern, pixiv_id in pairs:
+        try:
+            n = await cache.invalidate_by_pattern(kind_pattern, pixiv_id)
+        except Exception as e:
+            logger.warning(
+                f"cache: invalidate_by_pattern({kind_pattern!r}, {pixiv_id!r}) "
+                f"failed: {e!r}"
+            )
+            continue
+        total += n
+    if total:
+        logger.info(
+            f"cache: invalidated {total} telegraph_cache row(s) "
+            f"across {len(pairs)} unique work(s) due to R2 deletion"
+        )
+    return total
+
+
+__all__ = ["AllowList", "AllowedEntry", "CacheEntry", "CacheStats", "TelegraphCache", "RuntimeSettings", "invalidate_for_r2_keys"]
 
 
 # ---------------------------------------------------------------------------

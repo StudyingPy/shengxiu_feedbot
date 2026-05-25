@@ -28,11 +28,13 @@ from ...provider import ProviderRegistry
 from ...provider.ehentai import EHTagDB
 from ...publisher import TelegraphPublisher
 from ...storage import AllowList, Database, R2Client, RuntimeSettings, TelegraphCache, UsageStore
+from ...storage.cache import invalidate_for_r2_keys
 from ...storage.r2 import R2ListIncomplete, R2StatsSnapshot, lru_evict_to_target, stats_from_objects
 from ...utils import logger
 from .auth import cmd_allow, cmd_chatid, cmd_deny, cmd_listallow
 from .handlers import (
     cmd_archive,
+    cmd_cache,
     cmd_ehsearch,
     cmd_help,
     cmd_pixiv_direct,
@@ -80,6 +82,7 @@ ADMIN_COMMANDS: list[BotCommand] = [
     BotCommand("listallow", "白名单：列出当前所有放行项"),
     BotCommand("setting", "运行时配置（仅私聊）"),
     BotCommand("stats", "用量统计（仅 admin）"),
+    BotCommand("cache", "telegraph 缓存管理（仅 admin）"),
 ]
 
 
@@ -190,6 +193,7 @@ def build_application(
     app.add_handler(CommandHandler("listallow", cmd_listallow))
     app.add_handler(CommandHandler("setting", cmd_setting))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("cache", cmd_cache))
 
     # 按钮回调
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -299,7 +303,7 @@ async def _r2_lru_loop(app: Application, r2_client: R2Client, config: Config) ->
                     f"{snapshot.total_bytes / 1_000_000_000:.2f} GB / {r2_cfg.capacity_gb} GB"
                 )
                 # 顺便看是否要清。lru_evict_to_target 接受预扫好的 objects 复用
-                removed, freed = await lru_evict_to_target(
+                removed, freed, deleted_keys = await lru_evict_to_target(
                     r2_client,
                     high_watermark_bytes=high, low_watermark_bytes=low,
                     objects=objects,
@@ -316,6 +320,18 @@ async def _r2_lru_loop(app: Application, r2_client: R2Client, config: Config) ->
                         oldest_at=snapshot.oldest_at,    # 不精确但够用
                         newest_at=snapshot.newest_at,
                     )
+                    # 联动失效 telegraph_cache：R2 里图没了，旧 telegra.ph URL
+                    # 里的 <img> 会 404，让 cache 失效以触发下次重发。
+                    tg_cache: TelegraphCache | None = app.bot_data.get("telegraph_cache")
+                    if tg_cache is not None:
+                        try:
+                            await invalidate_for_r2_keys(
+                                tg_cache, deleted_keys, r2_prefix=r2_cfg.prefix,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "R2 LRU: invalidate_for_r2_keys failed; cache may be stale"
+                            )
         except Exception:
             logger.exception("R2 LRU/stats iteration failed; will retry next interval")
         await asyncio.sleep(interval)

@@ -1,4 +1,5 @@
 from .cache import AllowedEntry, AllowList, CacheEntry, CacheStats, RuntimeSettings, TelegraphCache
+from .cache_keymap import cache_keys_for_path_segment, cache_keys_for_r2_key
 from .db import Database
 from .r2 import (
     R2Client,
@@ -33,6 +34,8 @@ __all__ = [
     "CacheStats",
     "TelegraphCache",
     "RuntimeSettings",
+    "cache_keys_for_path_segment",
+    "cache_keys_for_r2_key",
     "R2Client",
     "R2ListIncomplete",
     "R2Object",

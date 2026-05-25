@@ -451,10 +451,12 @@ async def lru_evict_to_target(
     high_watermark_bytes: int,
     low_watermark_bytes: int,
     objects: list[R2Object] | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, list[str]]:
     """如果当前用量 > high_watermark，按 LastModified 升序删到 <= low_watermark。
 
-    返回 (删除文件数, 释放字节数)。低于 high_watermark 时 (0, 0)。
+    返回 `(删除文件数, 释放字节数, 已删 absolute_key 列表)`。
+    低于 high_watermark 时 `(0, 0, [])`。
+    deleted_keys 用于联动失效 telegraph_cache（见 storage/cache_keymap.py）。
 
     扫描范围由 client.prefix 决定（构造时配置）；不再接受 prefix 参数避免与配置漂移。
     objects 已知时（调用方刚扫过）跳过 list_all 复用——LRU loop 本来就先扫
@@ -470,11 +472,12 @@ async def lru_evict_to_target(
         objects = await client.list_all()
     total = sum(o.size for o in objects)
     if total <= high_watermark_bytes:
-        return (0, 0)
+        return (0, 0, [])
 
     objects = sorted(objects, key=lambda o: o.last_modified)   # 最旧排前面（不破坏入参）
     removed_files = 0
     freed = 0
+    deleted_keys: list[str] = []
     for o in objects:
         if total <= low_watermark_bytes:
             break
@@ -484,9 +487,10 @@ async def lru_evict_to_target(
             removed_files += 1
             freed += o.size
             total -= o.size
+            deleted_keys.append(o.key)
         else:
             logger.warning(f"R2 LRU: failed to delete {o.key}; skipping")
-    return (removed_files, freed)
+    return (removed_files, freed, deleted_keys)
 
 
 @dataclass
