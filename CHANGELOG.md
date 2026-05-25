@@ -1,9 +1,35 @@
 # Changelog
 
-## [Unreleased]
+## v0.10.0 — 2026-05-25
+
+telegraph 缓存联动失效：底层图片（R2 对象 / cache_dir 文件）被清理时，对应 `telegraph_cache` 行自动失效，避免用户重提相同链接命中"图已 404 的旧 telegra.ph 链接"。同时新增 `/cache invalidate` admin 救济命令。
+
+### Features
+- **`/cache invalidate` admin 命令**：把 `TelegraphCache.invalidate_by_pattern()` 暴露给管理员私聊使用，用于救济"telegra.ph 页面里的图已失效但 cache 仍命中坏 URL"场景。kind 字段支持 SQL `LIKE` 通配符（例：`/cache invalidate ehentai/gallery/% 3936793` 一次失效该 gid 下全部 mode 的 cache 行）。同步加 `/cache stats` 复用现有 [TelegraphCache.stats()](pixivfeed/storage/cache.py)。
+- **R2 LRU 联动失效 telegraph_cache**：[bot.py:_r2_lru_loop](pixivfeed/channel/telegram/bot.py) 后台任务和 [/stats r2_evict](pixivfeed/channel/telegram/handlers.py) 手动入口，在 `lru_evict_to_target` 删完 R2 对象后，把对应 `telegraph_cache` 行也失效掉。原本 R2 LRU 删了某画廊的图后 cache 行还在，普通用户重提相同链接命中坏 URL 永远拿不到正常页面；现在自动失效，下次重提会触发完整重发拿到新链接。
+- **`deploy/cleanup.py` 联动失效 telegraph_cache**：cache_dir 顶层目录被完整 `rmdir` 时（即 cache_days 后某画廊全部文件已清理），同步删对应 `telegraph_cache` 行。R2 未启用部署的默认场景下，第 8 天起重提相同链接会自动重新发布而不是命中坏链接。
+- **新增 [pixivfeed/storage/cache_keymap.py](pixivfeed/storage/cache_keymap.py)** 反向映射：从 cache_dir 顶层目录名 / R2 absolute key 反推 (kind_pattern, pixiv_id)，给上面两条联动失效共享。R2 key 与 cache_dir 相对路径完全同源（v0.8.0 设计约束）所以一份规则两边都能用。**协作者警告写在文件顶部**：每加一个走 cache 的 provider，必须同步在这里加规则，否则该 provider 的图片清理后 cache 不会失效。
 
 ### Fixes
+- **`Config._coerce` 错误信息友好化**。[config.py:_coerce](pixivfeed/config.py) 此前 bool/int/float/list 解析失败时直接抛裸 `int("abc")` 这类英文 ValueError，`/setting set` handler 现有 `except ValueError` 显示给 admin 时是 "invalid literal for int() with base 10: 'abc'" 这种内部错误。改为统一中文友好提示，例如 "无法将 'abc' 解析为整数"。无行为变更（handler 端 catch 路径不变）。
 - **e-hentai 子页 `fullimg` 链接路径式 URL 兼容**。e-hentai 在 2025 前后把 "Download original" 链接从 `?query` 形式（`/fullimg.php?gid=X&page=Y&key=Z`）改成路径形式（`/fullimg/X/Y/Z/N.png`），老正则 `_EH_FULLIMG_RE` 只接受 `?query`，新页面上拿不到 fullimg → `_extract_page_image_urls` 静默回退到 sample，导致 `PAGE_ORIGINAL` 实际产出 = `PAGE_SAMPLE` 大小。正则改为 `<a[^>]*?href="(https?://[^"]+/fullimg(?:\.php\?[^"]+|/[^"]+?))"` 同时匹配两种形式。
+
+### Internal
+- **`TelegraphCache.invalidate_by_pattern(kind_pattern, pixiv_id) -> int`**：新增 SQL `LIKE` 版 invalidate，返回删除行数。原 `invalidate(kind, pixiv_id)` 保留。
+- **`pixivfeed.storage.cache.invalidate_for_r2_keys(cache, deleted_keys, *, r2_prefix)`**：共享 helper，给 `_r2_lru_loop` 和 `/stats r2_evict` 复用。负责"R2 keys → 反向映射 → 去重 → 批量 invalidate"完整流程。任何一步失败都只 log，不影响主流程（best-effort 联动）。
+- **`lru_evict_to_target` 返回签名 breaking change**：`tuple[int, int]` → `tuple[int, int, list[str]]`，第三项是已删 absolute_key 列表给联动失效用。两个调用点（[bot.py:_r2_lru_loop](pixivfeed/channel/telegram/bot.py)、[handlers.py /stats r2_evict](pixivfeed/channel/telegram/handlers.py)）已同步更新；外部无调用方。
+- **`_set_setting` / `handle_setting_edit_followup` / `handle_setting_callback` 路径不变**：[setting.py](pixivfeed/channel/telegram/setting.py) 现有 `except ValueError as e: ... ⚠️ 值无效：{e}` 直接显示新版 _coerce 的中文消息；不需要新增 try/except。
+- **handlers.py 第一个 cache_kind 拼接处加协作者注释**（[handlers.py:1140](pixivfeed/channel/telegram/handlers.py)）：提醒新增 provider / 新 mode 时同步更新 `cache_keymap.py`。
+
+### 改动文件
+- 新增：`pixivfeed/storage/cache_keymap.py`
+- `pixivfeed/storage/cache.py`：`invalidate_by_pattern` + `invalidate_for_r2_keys`
+- `pixivfeed/storage/__init__.py`：暴露反向映射 helper
+- `pixivfeed/storage/r2.py`：`lru_evict_to_target` 返回签名加 `deleted_keys`
+- `pixivfeed/channel/telegram/bot.py`：`_r2_lru_loop` 联动失效 + 注册 `/cache` 命令 + ADMIN_COMMANDS
+- `pixivfeed/channel/telegram/handlers.py`：`cmd_cache` admin 命令 + `/stats r2_evict` 联动失效 + cmd_start 帮助 + cache_kind 协作者注释
+- `pixivfeed/config.py`：`_coerce` 中文友好错误
+- `deploy/cleanup.py`：rmdir 后联动失效 telegraph_cache
 
 ## v0.9.0 — 2026-05-25
 
