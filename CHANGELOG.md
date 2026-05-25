@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.10.2 — 2026-05-25
+
+继续修 v0.10.0 引入的 cache 自动失效遗留 bug：novel 引用图位置错位、cleanup 误伤 durable cache。
+
+### Fixes
+- **novel `[pixivimage:N]` 引用图落到错误的目录**。[novel_publisher.py:143](pixivfeed/provider/pixiv/novel_publisher.py) 此前用通用的 `PixivDownloader.download_illust(illust_id, ...)` 把 novel 引用的另一份插画下到 `cache_dir/{illust_id}/original/p0.jpg`。这让 R2 LRU / cleanup.py 反向映射看到首段是数字时只会失效 `(pixiv/illust, illust_id)`，但 novel 自己的 cache 行实际是 `(pixiv/novel, nid)`——novel cache 永远逃过自动失效，用户重提小说仍命中坏链接（页面里 `<img src=R2 URL of {illust_id}/original/p0.jpg>` 已 404）。改为 `downloader.download_novel_embed(nid, f"pixivimage_{illust_id}", img_url)`，引用图落到 `novel_{nid}/embed_pixivimage_{illust_id}{ext}`，反向映射首段就是 `novel_{nid}` → 自动失效到正确的 novel cache 行。代价：多本 novel 引用同一插画时图会重复存储（小概率事件，单图几 MB，可接受）；收益：cache 失效行为完全对齐。
+- **`cleanup.py` 误删 durable cache**。[deploy/cleanup.py:39-46](deploy/cleanup.py) 的 `_invalidate_cache_rows_sync` SQL 没限定 `durable = 0`。`durable=1` 含义（见 [publisher/telegraph.py:55-58](pixivfeed/publisher/telegraph.py)）是 telegra.ph 页面 `<img>` 已经指向 R2 公开 URL，不依赖本地 `cache_dir` 文件——本地 7 天清理对页面无影响。但 cleanup 此前一律失效 → R2 部署下，全图上 R2 成功的长期缓存也会在本地缓存过期后被清掉，用户重提走完整重发，多消耗一次 R2 PUT + telegra.ph create_page，**削弱了 durable cache 的核心价值**（"图在 R2 + cache 永久"）。SQL 加 `AND durable = 0`：只失效 fallback / legacy 行（这两类都依赖 nginx），durable 行保留。R2 LRU 联动那条路径不动——R2 对象真没了无论 durable 与否页面都坏了。
+
+### 升级注意
+- **v0.10.0 / v0.10.1 期间发的 novel 引用图存在原 illust 目录里**，本版的修复**只对未来新发布生效**。已存在的旧 novel cache 行的引用图仍在 `cache_dir/{illust_id}/`，反向映射仍只会失效 illust cache 而非 novel cache。和 v0.10.0 升级注意里的处理一致——`sqlite3 ... "DELETE FROM telegraph_cache WHERE durable = 0;"` 一刀切清掉所有 fallback / legacy 行即可（durable 行不受影响，因为图在 R2）。
+
+### 改动文件
+- `pixivfeed/provider/pixiv/novel_publisher.py`：novel 引用图改用 `download_novel_embed` 落到 novel 自己目录
+- `deploy/cleanup.py`：`_invalidate_cache_rows_sync` SQL 加 `AND durable = 0`
+- `pyproject.toml`：version 0.10.1 → 0.10.2
+
 ## v0.10.1 — 2026-05-25
 
 修 v0.10.0 的 critical bug：cache 反向映射对 e-hentai / exhentai / nhentai 写错了，自动联动失效（R2 LRU + cache_dir cleanup）以及 `/cache invalidate` 命令对这三个 provider 全部失效。配套修一些 v0.10.0 引入的文案问题。
