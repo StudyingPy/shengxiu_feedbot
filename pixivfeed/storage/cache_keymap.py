@@ -48,15 +48,22 @@ def cache_keys_for_path_segment(seg: str) -> list[tuple[str, str]]:
       ─────────────────────────────────────────────────────────────────
       `12345`（纯数字）                     → ("pixiv/illust", "12345")
       `novel_67890`                         → ("pixiv/novel", "67890")
-      `eh_3936793_abc_page_sample`          → ("ehentai/gallery/page_sample", "3936793")
-      `eh_3936793_abc_archive_original`     → ("ehentai/gallery/archive_original", "3936793")
-      `ex_xxx_yyy_zzz`                      → ("exhentai/gallery/zzz", "xxx")
-      `nh_654321`                           → ("nhentai/gallery/%", "654321")
+      `eh_3936793_abc_page_sample`          → ("e-hentai.org/gallery/page_sample", "3936793/abc")
+      `eh_3936793_abc_archive_original`     → ("e-hentai.org/gallery/archive_original", "3936793/abc")
+      `ex_xxx_yyy_zzz`                      → ("exhentai.org/gallery/zzz", "xxx/yyy")
+      `nh_654321`                           → ("nhentai/gallery", "654321")
       `zip_xxx`                             → []（zip2tph 不入 cache）
       其他                                   → []（未识别，调用方应跳过 + 打 debug 日志）
 
-    nhentai 用 LIKE `nhentai/gallery/%` 是因为路径里看不出 mode（nhentai 工作目录
-    只是 `nh_{gid}`，没有 mode 后缀），保险起见删该 gid 下所有 mode 的 cache 行。
+    eh/ex 的 cache_kind 是 `f"{ref.provider}/gallery/{mode}"`，而 ref.provider
+    来自 `_EHFamilyProvider.HOST` —— 实际值就是带 `.org` 的域名（`e-hentai.org`
+    / `exhentai.org`）。pixiv_id 则是 `f"{gid}/{token}"` 的复合键（见
+    [provider/ehentai/__init__.py:251](../provider/ehentai/__init__.py)
+    与 [handlers.py:4234](../channel/telegram/handlers.py)）。
+
+    nhentai 走 [_send_via_telegraph_generic](../channel/telegram/handlers.py)，
+    cache_kind 是 `f"{ref.provider}/{ref.kind}"` = `"nhentai/gallery"`（没 mode 后缀）。
+    所以这里用精确 `=` 而不是 LIKE 通配——后者反而匹配不到。
     """
     if not seg:
         return []
@@ -71,26 +78,30 @@ def cache_keys_for_path_segment(seg: str) -> list[tuple[str, str]]:
         return [("pixiv/novel", nid)] if nid else []
 
     # e-hentai: `eh_{gid}_{token}_{mode}/...`
-    # cache_kind == f"ehentai/gallery/{mode.value}"
+    # cache_kind == f"e-hentai.org/gallery/{mode}"，pixiv_id == f"{gid}/{token}"
     if seg.startswith("eh_"):
         parts = seg.split("_", 3)
-        if len(parts) >= 4 and parts[1]:
-            gid, _token, mode = parts[1], parts[2], parts[3]
-            return [(f"ehentai/gallery/{mode}", gid)]
+        if len(parts) >= 4 and parts[1] and parts[2]:
+            gid, token, mode = parts[1], parts[2], parts[3]
+            return [(f"e-hentai.org/gallery/{mode}", f"{gid}/{token}")]
         return []
 
     # exhentai: `ex_{gid}_{token}_{mode}/...`
+    # cache_kind == f"exhentai.org/gallery/{mode}"，pixiv_id == f"{gid}/{token}"
     if seg.startswith("ex_"):
         parts = seg.split("_", 3)
-        if len(parts) >= 4 and parts[1]:
-            gid, _token, mode = parts[1], parts[2], parts[3]
-            return [(f"exhentai/gallery/{mode}", gid)]
+        if len(parts) >= 4 and parts[1] and parts[2]:
+            gid, token, mode = parts[1], parts[2], parts[3]
+            return [(f"exhentai.org/gallery/{mode}", f"{gid}/{token}")]
         return []
 
-    # nhentai: `nh_{gid}/...`，路径无 mode 后缀，用 LIKE 删该 gid 全 mode
+    # nhentai: `nh_{gid}/...`
+    # cache_kind == "nhentai/gallery"（nhentai 走 _send_via_telegraph_generic，
+    # 拼的是 f"{ref.provider}/{ref.kind}"，没有 mode 后缀）。精确 = 即可，
+    # 不能用 LIKE "nhentai/gallery/%"——后者反而匹配不到 "nhentai/gallery"。
     if seg.startswith("nh_"):
         gid = seg[len("nh_"):]
-        return [("nhentai/gallery/%", gid)] if gid else []
+        return [("nhentai/gallery", gid)] if gid else []
 
     # pixiv illust: `{pid}/...`（pid 是纯数字），cache_kind == "pixiv/illust"
     if seg.isdigit():
@@ -106,14 +117,16 @@ def cache_keys_for_r2_key(absolute_key: str, prefix: str = "") -> list[tuple[str
     R2 absolute key 形如 `feedbot/eh_xxx_yyy_page_sample/p0.jpg`（含 prefix）。
     剥掉 prefix 后取首段，转给 `cache_keys_for_path_segment`。
 
-    prefix 留空时按"key 第一段就是 provider 目录"处理（兼容无 prefix 部署）。
+    prefix 规范化与 `R2Client._normalize_prefix` 完全对齐：去首尾空白 + 去前导
+    斜杠 + 若非空强制以 "/" 结尾。这样调用方传原始 `r2_cfg.prefix` 都能正确
+    剥掉，包括 `"/feedbot"` / `" feedbot "` / `"feedbot/"` 等等价写法。
     """
     key = absolute_key
-    if prefix:
-        # prefix 形如 "feedbot" 或 "feedbot/"；归一化
-        p = prefix.rstrip("/") + "/"
-        if key.startswith(p):
-            key = key[len(p):]
+    p = (prefix or "").strip().lstrip("/")
+    if p and not p.endswith("/"):
+        p += "/"
+    if p and key.startswith(p):
+        key = key[len(p):]
     seg = key.split("/", 1)[0]
     return cache_keys_for_path_segment(seg)
 

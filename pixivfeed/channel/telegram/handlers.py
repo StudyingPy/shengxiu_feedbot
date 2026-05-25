@@ -4596,10 +4596,14 @@ async def cmd_cache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     典型用例（用户报"页面打不开了"时）：
         /cache invalidate pixiv/illust 12345
-        /cache invalidate ehentai/gallery/page_sample 3936793
-        /cache invalidate ehentai/gallery/% 3936793     ← 同 gid 全 mode 一起删
-        /cache invalidate exhentai/% 3936793
         /cache invalidate pixiv/novel 67890
+        /cache invalidate e-hentai.org/gallery/page_sample 3936793/d89fc4d30a
+        /cache invalidate e-hentai.org/gallery/% 3936793/d89fc4d30a   ← 同 gid+token 全 mode
+        /cache invalidate exhentai.org/gallery/% 3936793/d89fc4d30a
+        /cache invalidate nhentai/gallery 654321
+
+    注：eh/ex 的 id 是 `{gid}/{token}` 复合键（数据库里存的就是这个格式，不是裸 gid）。
+    nhentai 的 cache_kind 没有 mode 后缀，精确写 `nhentai/gallery` 即可。
 
     失效仅删一行 cache 索引，不删 telegra.ph 实际页面 / R2 / nginx 文件。
     下次任何用户提交相同链接 → cache miss → 走完整下载发布流程拿新 URL。
@@ -4653,10 +4657,12 @@ async def cmd_cache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "用法：/cache invalidate <kind> <id>\n"
                 "kind 支持 SQL LIKE 通配符 %，例：\n"
                 "  /cache invalidate pixiv/illust 12345\n"
-                "  /cache invalidate ehentai/gallery/page_sample 3936793\n"
-                "  /cache invalidate ehentai/gallery/% 3936793   ← 同 gid 全 mode 一起删\n"
-                "  /cache invalidate exhentai/% 3936793\n"
-                "  /cache invalidate pixiv/novel 67890"
+                "  /cache invalidate pixiv/novel 67890\n"
+                "  /cache invalidate e-hentai.org/gallery/page_sample 3936793/d89fc4d30a\n"
+                "  /cache invalidate e-hentai.org/gallery/% 3936793/d89fc4d30a   ← 同 gid+token 全 mode\n"
+                "  /cache invalidate exhentai.org/gallery/% 3936793/d89fc4d30a\n"
+                "  /cache invalidate nhentai/gallery 654321\n"
+                "（eh/ex 的 id 是 `{gid}/{token}` 复合键；nhentai 的 kind 没 mode 后缀）"
             )
             return
         kind_pattern = args[1]
@@ -4690,7 +4696,8 @@ async def _cmd_cache_help(update: Update) -> None:
         "/cache help                     本帮助\n\n"
         "示例：\n"
         "  /cache invalidate pixiv/illust 12345\n"
-        "  /cache invalidate ehentai/gallery/% 3936793\n\n"
+        "  /cache invalidate e-hentai.org/gallery/% 3936793/d89fc4d30a\n"
+        "  /cache invalidate nhentai/gallery 654321\n\n"
         "（注：R2 LRU 与 cache_dir 清理已自动联动失效，本命令仅做兜底）"
     )
 
