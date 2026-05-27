@@ -60,6 +60,13 @@ _ARCHIVE_LOCKED_RE = re.compile(
     r"This archive session has been used from too many different locations",
     re.IGNORECASE,
 )
+# archiver 中间页（chooser 页 + "successfully prepared" 页）共用的 CSS 路径，形如
+# https://exhentai.org/z/<archiveid>/x.css。用来识别"H@H 节点 session 未绑定时主站
+# 把临时 zip URL 重渲染成 archiver 页面"的窗口期 —— 见 _probe_zip 注释。
+_ARCHIVER_CSS_RE = re.compile(
+    r"/z/[0-9a-f]+/x\.css",
+    re.IGNORECASE,
+)
 # 解析 chooser 页面里的 "Estimated Size: <strong>1.77 GiB</strong>"，用来动态算超时。
 # 同时存在 org 与 res 两块，按 mode 取对应那块。
 _ESTIMATED_SIZE_RE = re.compile(
@@ -605,11 +612,39 @@ async def download_archive_with_timeout(
                 total = int(r.headers.get("content-length") or 0)
                 return total, False
 
-            # 不是 ZIP —— 当未知错误页报 preview
+            # 不是 ZIP —— 先看是不是 eh/ex 的 archiver 中间页（节点 session 尚未绑定
+            # 时偶发：主站会把临时 zip URL 重渲染成 archiver 页面，HTTP 200/206 + HTML
+            # body，让用户重新点 "Click Here To Start Downloading"）。命中后按"节点
+            # 启动中"等几秒重试即可；多数情况下下一次探测就能拿到 zip。
+            #
+            # 注意：必须用明确的中间页特征（<title>Archiver</title>、archiver 自身的
+            # CSS 路径 /z/.../x.css、"Click Here To Start Downloading" 文本）来识别，
+            # 不要泛匹配"任何 HTML"——否则登录页、Cloudflare 风控页、权限页也会被空
+            # 等 6 次，反而掩盖真实错误。
             try:
                 text = content.decode("utf-8", errors="replace")
             except Exception:
                 text = ""
+            text_lower = text.lower()
+            is_archiver_page = (
+                "<title>archiver</title>" in text_lower
+                or "click here to start downloading" in text_lower
+                or _ARCHIVER_CSS_RE.search(text) is not None
+            )
+            if is_archiver_page:
+                wait_s = min(5 + i * 2, 15)
+                logger.info(
+                    f"archive zip probe got archiver intermediate page "
+                    f"(HTTP {r.status_code}, attempt {i+1}/{max_attempts}); "
+                    f"H@H session likely binding, wait {wait_s}s"
+                )
+                await _emit_status(
+                    f"⏳ 等待 H@H 节点启动 (尝试 {i+1}/{max_attempts})..."
+                )
+                await asyncio.sleep(wait_s)
+                continue
+
+            # 真正的未知错误页 —— 报 preview 让上层定位
             preview = text.strip()[:200] if text.strip() else f"<{len(content)}B binary>"
             raise ArchiveError(
                 f"archive zip probe got non-zip body (HTTP {r.status_code}): {preview!r}"

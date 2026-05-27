@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.10.3 — 2026-05-27
+
+修一个偶发但难复现的 eh/ex archive 下载错误：探测临时 zip 链接时 H@H 节点尚未把 session 绑上来，主站会把请求重渲染成 archiver 中间页（HTTP 200/206 + HTML body），原先的 `_probe_zip()` 只对 4xx/5xx 重试，对这种"200/206 + HTML"直接抛 `ArchiveError`。
+
+### Fixes
+- **archive zip 探测命中 archiver 中间页时不再立即报错**。[_archive.py:_probe_zip](pixivfeed/provider/ehentai/_archive.py) 加一条分支：HTTP 200/206 但 body 是 archiver 中间页（特征：`<title>Archiver</title>` / `Click Here To Start Downloading` 文本 / `/z/<archiveid>/x.css` CSS 路径）时，按"H@H 节点启动中"处理 —— 等 `5 + i*2` 秒（封顶 15s）后用同一 URL 重试，最多 6 次。多数窗口期重试 1~2 次就能拿到 zip。
+
+  特意只匹配明确的中间页特征，不泛匹配"任何 HTML"——否则登录页、Cloudflare/风控页、权限页也会被空等 6 次，反而掩盖真实错误。命中 archiver 中间页时走和 H@H 节点 503 同款的 `_emit_status("⏳ 等待 H@H 节点启动 (尝试 N/6)...")`，用户侧看到的提示一致。
+
+  没有同时实现"从 archiver 中间页里再提取一次 Click Here 链接替换 fetch_url"，原因是 probe 只读 `Range: bytes=0-2047`，HTML 经常被截断在前 2KB 里看不到下载链接；单纯重试已足以覆盖大多数窗口期。如果将来发现重试 6 次仍不够，再补这层增强（注意：那种实现里 `fetch_url` 的赋值需要 `nonlocal fetch_url`）。
+
+### 改动文件
+- `pixivfeed/provider/ehentai/_archive.py`：`_probe_zip` 加 archiver 中间页识别 + 重试；新增 `_ARCHIVER_CSS_RE` 正则
+- `pyproject.toml`：version 0.10.2 → 0.10.3
+
 ## v0.10.2 — 2026-05-25
 
 继续修 v0.10.0 引入的 cache 自动失效遗留 bug：novel 引用图位置错位、cleanup 误伤 durable cache。
