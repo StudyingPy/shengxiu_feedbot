@@ -1,8 +1,9 @@
 """nhentai Provider。
 
-数据获取借鉴 DojinGo：
-- nhapi.cat42.uk 第三方 JSON API（nhentai.net 本身没开放 API，DojinGo 走的是社区镜像）
-- 图片 CDN 在 i1~i4.nhentai.net 之间随机分配，单个失败用其他几个 fallback
+数据获取参考 DojinGo（最新版本）：
+- 走 nhentai.net 官方 JSON API（`/api/v2/galleries/<id>` 和 `/api/v2/cdn`）。
+  历史上曾用 `nhapi.cat42.uk` 第三方镜像，2026 年那边 502 整站挂掉，已切回官方。
+- 图片 CDN 在 i1~i4.nhentai.net 之间随机分配，单个失败用其他几个 fallback。
 
 URL 形式：
     https://nhentai.net/g/{id}
@@ -29,16 +30,30 @@ from .._common import (
 
 _NHENTAI_RE = re.compile(r"https?://nhentai\.(?:net|to)/g/(\d+)", re.IGNORECASE)
 
-# 这些常量直接照搬 DojinGo（仍然是 2026 年现状）
-NHENTAI_API = "https://nhapi.cat42.uk/gallery/"
+# nhentai 官方公开 API。返回结构见 _fetch_album。
+NHENTAI_API = "https://nhentai.net/api/v2/galleries/"
+# CDN 列表保留 `/galleries` 后缀——下载 URL 用 `{base}/{media_id}/{idx}{ext}` 拼，
+# 跟官方 page.path（`galleries/{media_id}/{idx}.{ext}`）拼出来等价。
 NHENTAI_CDNS = [
     "https://i1.nhentai.net/galleries",
     "https://i2.nhentai.net/galleries",
     "https://i3.nhentai.net/galleries",
     "https://i4.nhentai.net/galleries",
 ]
-# 文件类型缩写 → 扩展名（DojinGo nhImage.t）
+# 文件类型缩写 → 扩展名（DojinGo nhImage.t 旧 schema）
 _TYPE_EXT = {"j": ".jpg", "p": ".png", "g": ".gif", "w": ".webp"}
+# 反向：扩展名 → 单字符 type code。官方 API 不再返回 t 字段，从 path 扩展名反推
+# 后填回 NHentaiAlbum.page_types，保持外部消费方（handlers.py 的 size prefetch）不变。
+_EXT_TYPE = {".jpg": "j", ".jpeg": "j", ".png": "p", ".gif": "g", ".webp": "w"}
+
+# nhentai.net 主站偶尔会对默认 httpx UA 触发风控，给一份普通浏览器 UA 兜底。
+_NH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
 
 
 class NHentaiError(Exception):
@@ -116,28 +131,74 @@ class NHentaiProvider(Provider):
         return await self._fetch_album(ref.id)
 
     async def _fetch_album(self, gallery_id: str) -> NHentaiAlbum:
+        """拉一个画廊的元数据。
+
+        新版 nhentai 官方 API 返回结构（节选）：
+            {
+              "id": 630134,
+              "media_id": "3790839",
+              "title": {"english": "...", "japanese": "...", "pretty": "..."},
+              "tags": [{"name": "...", ...}, ...],
+              "num_pages": 33,
+              "pages": [
+                {"number": 1, "path": "galleries/3790839/1.webp", ...},
+                ...
+              ]
+            }
+
+        和旧 cat42 镜像的差异：path 取代了 t（type code），扩展名直接读得到。
+        """
         url = NHENTAI_API + gallery_id
-        async with make_http_client(timeout=self._shared_cfg.timeout) as client:
+        last_exc: Exception | None = None
+        data: dict | None = None
+        async with make_http_client(
+            timeout=self._shared_cfg.timeout, headers=_NH_HEADERS,
+        ) as client:
             for attempt in range(5):
                 try:
                     resp = await client.get(url)
                     if resp.status_code == 200:
                         data = resp.json()
                         break
+                    if resp.status_code == 404:
+                        raise NHentaiError(f"nhentai gallery {gallery_id} not found (404)")
+                    last_exc = httpx.HTTPStatusError(
+                        f"HTTP {resp.status_code}", request=resp.request, response=resp,
+                    )
+                except NHentaiError:
+                    raise
                 except Exception as e:
-                    if attempt == 4:
-                        raise NHentaiError(f"fetch {url} failed: {e}") from e
-            else:
-                raise NHentaiError(f"fetch {url} returned non-200")
+                    last_exc = e
+                    logger.debug(
+                        f"nhentai api {url} attempt {attempt + 1}/5 failed: {e}"
+                    )
+            if data is None:
+                raise NHentaiError(
+                    f"fetch {url} failed after 5 attempts: {last_exc}"
+                ) from last_exc
 
         media_id = str(data.get("media_id") or "")
         if not media_id:
             raise NHentaiError(f"nhentai gallery {gallery_id}: missing media_id")
         title_dict = data.get("title") or {}
         title = _best_title(title_dict) or f"nhentai-{gallery_id}"
-        pages = (data.get("images") or {}).get("pages") or []
-        page_types = [(p.get("t") or "j") for p in pages]
+
+        # 兼容两种 schema：
+        # - 新（官方）：data["pages"] = [{number, path: "galleries/<mid>/<n>.<ext>", ...}]
+        # - 旧（cat42）：data["images"]["pages"] = [{t: "j"/"p"/...}, ...]
+        pages = data.get("pages") or (data.get("images") or {}).get("pages") or []
+        page_types: list[str] = []
+        for p in pages:
+            t = p.get("t")
+            if t:
+                page_types.append(t)
+                continue
+            path = p.get("path") or ""
+            ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ".jpg"
+            page_types.append(_EXT_TYPE.get(ext, "j"))
+
         tags = [t.get("name") for t in (data.get("tags") or []) if t.get("name")]
+        num_pages = int(data.get("num_pages") or len(pages))
 
         return NHentaiAlbum(
             gallery_id=gallery_id,
@@ -145,7 +206,7 @@ class NHentaiProvider(Provider):
             title=title,
             page_types=page_types,
             tags=tags,
-            num_pages=len(pages),
+            num_pages=num_pages,
         )
 
     async def fetch_and_download(
@@ -169,7 +230,9 @@ class NHentaiProvider(Provider):
                 [f"{base}/{album.media_id}/{idx}{ext}" for base in NHENTAI_CDNS]
             )
 
-        async with make_http_client(timeout=self._shared_cfg.timeout) as client:
+        async with make_http_client(
+            timeout=self._shared_cfg.timeout, headers=_NH_HEADERS,
+        ) as client:
             await self._download_with_cdn_fallback(
                 client, main_urls, all_dest, per_page_fallbacks,
                 on_progress=on_progress,
