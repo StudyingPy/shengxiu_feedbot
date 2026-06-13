@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.11.0 — 2026-06-13
+
+两件独立改动一起切。一是 nhentai 模块自从第三方镜像 `nhapi.cat42.uk` 整站 502 后整个 collector 不工作；二是新增 `/jm <禁漫号>` 命令，把禁漫号翻成 EH 关键词后直接进 `/ehsearch` 流程。
+
+### 修复
+- **nhentai 切回官方公开 API**。[provider/nhentai/__init__.py](pixivfeed/provider/nhentai/__init__.py) 的 `NHENTAI_API` 由 `https://nhapi.cat42.uk/gallery/` 改为 `https://nhentai.net/api/v2/galleries/`，参考 DojinGo 上游 [`internal/collector/nh.go`](https://github.com/Olivi-9/DojinGo/blob/main/internal/collector/nh.go) 的最新实现。返回结构从 `data.images.pages[].t` 改为顶层 `data.pages[].path`，从 path 扩展名反推单字符 type code 回填 `NHentaiAlbum.page_types`，让 `handlers.py` 那边的 size prefetch 完全不用动。同时保留对旧 schema 的 fallback 解析（万一以后再切回镜像）。
+
+  顺手修了 `_fetch_album` 重试循环里 `for/else` + `if attempt==4: raise` 互相打架的 bug：原来 5 次都返回非 200 时会从 `else` 抛 "returned non-200" 而 *不是* 抛具体的 HTTP 异常；现在改成显式记录 `last_exc` + 5 次后包成 `NHentaiError(... after 5 attempts: <last_exc>)` 抛出，404 直接当永久错误立即抛。
+
+  CDN 列表 `NHENTAI_CDNS` 与下载 URL 拼接逻辑没动（`{i1~i4.nhentai.net}/galleries/{media_id}/{idx}{ext}` 依然有效）。新增 `_NH_HEADERS` 给 API 与 CDN 客户端都加浏览器 UA：nhentai 主站偶尔对空 UA 触发风控。
+
+### 新增
+- **`/jm <禁漫号>` 命令**。[handlers.py:cmd_jm](pixivfeed/channel/telegram/handlers.py) 新增。流程：拉 JM 标题（[provider/jm/fetch_jm_title](pixivfeed/provider/jm/__init__.py)）→ `clean_jm_title` 清洗（去括号块 / 去汉化关键字 / 截断 80 char）→ 复用 `_run_ehsearch_landing` 渲染 ehsearch 同款列表。
+
+  把原 `cmd_ehsearch` 的尾段（搜索 → state → 渲染 → stats）抽成 `_run_ehsearch_landing`，让 `/jm` 与 `/ehsearch` 共享。`/jm` 走 stats 时把 ref_id 标成 `jm:<id>`，`/stats` 里能区分入口。
+
+  数据源选 jmcomic PyPI 库（`jmcomic>=2.5`）。库本身是同步 API，用 `asyncio.to_thread` + `wait_for(timeout=collectors.jm.timeout)` 包成 async。`MissingAlbumPhotoException` 单独映射成 `JMNotFoundError`，错误文案 "⚠️ 禁漫号 630134 不存在"。jmcomic 的 import 推迟到 `_sync_fetch_title` 内部，避免库本身的 import 副作用（loguru 配置等）影响 bot 启动。
+
+  刻意 *不* 实现 Provider 接口：本模块没有 fetch_and_download，只是个查询工具。JM 图片下载有反爬限制，且与 bot 主用途不契合。
+
+### 配置变更
+- 新增 `collectors.jm.enabled`（默认 false，runtime 可改）。
+- 新增 `collectors.jm.timeout`（默认 20s，runtime 可改）。
+- 部署侧：`pip install -e .` 会拉新增依赖 `jmcomic`。
+
+### 改动文件
+- `pixivfeed/provider/nhentai/__init__.py`：API 端点切换 + 新 schema 解析 + 重试 bug 修复 + UA
+- `pixivfeed/provider/jm/__init__.py`：新增，封装 jmcomic 查询
+- `pixivfeed/config.py`：新增 `JMCollectorConfig`，挂到 `CollectorsConfig.jm`，登记 `RUNTIME_KEYS`
+- `pixivfeed/channel/telegram/handlers.py`：新增 `cmd_jm`、`_run_ehsearch_landing`、`_JM_ID_RE`；`cmd_ehsearch` 尾段抽出复用
+- `pixivfeed/channel/telegram/bot.py`：注册 `/jm` handler 与 BotCommand
+- `pixivfeed/channel/telegram/setting.py`：`collectors.jm.enabled` 加切换按钮
+- `config.example.yaml`：新增 `collectors.jm` 段
+- `pyproject.toml`：版本 0.10.3 → 0.11.0，新增 `jmcomic>=2.5` 依赖
+- `README.md`：其它命令表加一行 `/jm`
+
 ## v0.10.3 — 2026-05-27
 
 修一个偶发但难复现的 eh/ex archive 下载错误：探测临时 zip 链接时 H@H 节点尚未把 session 绑上来，主站会把请求重渲染成 archiver 中间页（HTTP 200/206 + HTML body），原先的 `_probe_zip()` 只对 4xx/5xx 重试，对这种"200/206 + HTML"直接抛 `ArchiveError`。
