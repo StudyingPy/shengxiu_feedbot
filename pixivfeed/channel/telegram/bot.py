@@ -37,6 +37,7 @@ from .handlers import (
     cmd_cache,
     cmd_ehsearch,
     cmd_help,
+    cmd_jm,
     cmd_pixiv_direct,
     cmd_pixiv_telegraph,
     cmd_start,
@@ -71,6 +72,7 @@ PUBLIC_COMMANDS: list[BotCommand] = [
     BotCommand("pixiv_direct", "强制直接发图模式处理 pixiv 链接"),
     BotCommand("archive", "对链接产出压缩包（eh/ex 仍弹模式按钮）"),
     BotCommand("ehsearch", "关键词搜索 eh/ex 画廊"),
+    BotCommand("jm", "禁漫号 → 标题 → eh/ex 搜索"),
     BotCommand("zip2tph", "把 zip 图片包发布为 Telegra.ph"),
     BotCommand("wiki", "在中文维基百科中查词条"),
 ]
@@ -186,6 +188,7 @@ def build_application(
     app.add_handler(CommandHandler("pixiv_direct", cmd_pixiv_direct))
     app.add_handler(CommandHandler("archive", cmd_archive))
     app.add_handler(CommandHandler("ehsearch", cmd_ehsearch))
+    app.add_handler(CommandHandler("jm", cmd_jm))
     app.add_handler(CommandHandler("zip2tph", cmd_zip2tph))
     app.add_handler(CommandHandler("wiki", cmd_wiki))
     app.add_handler(CommandHandler("allow", cmd_allow))

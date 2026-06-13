@@ -82,12 +82,24 @@ class NHentaiCollectorConfig:
 
 
 @dataclass
+class JMCollectorConfig:
+    """禁漫天堂（jmcomic）—— 仅作"禁漫号 → 标题"查询给 /jm 命令用。
+
+    本项目 *不* 下载 JM 图片（站点反爬激进，且与本 bot 主用途——直接展示／发
+    Telegra.ph——不契合）。`enabled=False` 时 /jm 命令直接报"未启用"。
+    """
+    enabled: bool = False
+    timeout: int = 20         # fetch_jm_title 单次调用上限（秒）
+
+
+@dataclass
 class CollectorsConfig:
     timeout: int = 30
     download_concurrency: int = 4
     ehentai: EHentaiCollectorConfig = field(default_factory=EHentaiCollectorConfig)
     exhentai: ExHentaiCollectorConfig = field(default_factory=ExHentaiCollectorConfig)
     nhentai: NHentaiCollectorConfig = field(default_factory=NHentaiCollectorConfig)
+    jm: JMCollectorConfig = field(default_factory=JMCollectorConfig)
 
 
 @dataclass
@@ -538,6 +550,9 @@ RUNTIME_KEYS: set[str] = {
     "collectors.exhentai.igneous",
     # nhentai
     "collectors.nhentai.enabled",
+    # jm（禁漫天堂；仅 /jm 命令查询标题用）
+    "collectors.jm.enabled",
+    "collectors.jm.timeout",
     # publish
     "publish.direct_threshold",
     "publish.max_images_per_page",

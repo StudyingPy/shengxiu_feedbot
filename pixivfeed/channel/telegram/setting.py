@@ -34,6 +34,7 @@ TOGGLE_OPTIONS: dict[str, list[tuple[str, str]]] = {
     "collectors.ehentai.enabled":  [("true", "✅ 启用"), ("false", "❌ 关闭")],
     "collectors.exhentai.enabled": [("true", "✅ 启用"), ("false", "❌ 关闭")],
     "collectors.nhentai.enabled":  [("true", "✅ 启用"), ("false", "❌ 关闭")],
+    "collectors.jm.enabled":       [("true", "✅ 启用"), ("false", "❌ 关闭")],
     "collectors.ehentai.default_mode": [
         ("page_sample",      "网页 · 显示图"),
         ("page_original",    "网页 · 原图"),

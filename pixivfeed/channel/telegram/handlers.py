@@ -4080,29 +4080,25 @@ def _render_search_message(
     return text, InlineKeyboardMarkup(rows)
 
 
-async def cmd_ehsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """关键词搜索 eh/ex 画廊。
+async def _run_ehsearch_landing(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    placeholder,
+    keyword: str,
+    force_r2: bool,
+    log_keyword: str | None = None,
+) -> None:
+    """跑一次搜索 + 渲染列表 + 写 stats。/ehsearch 与 /jm 共用尾部。
 
-    admin 可加 `--r2` flag，让本次搜索后续点 [打开] 的发布强制走 R2（绕过
-    max_upload_size_gb 护栏）。
+    `placeholder` 是已经发出的占位消息（调用方各自决定首条文案，比如
+    /ehsearch 的"🔍 搜索 ..."或 /jm 的"🔍 解析禁漫号 ..."）。本函数只 edit
+    placeholder，不再发新消息。
+
+    `log_keyword` 用于 stats 入库的 ref_id；不传则用 keyword 本身。/jm 流程里
+    传禁漫号能让 /stats 直接看到原始入口而非清洗后的关键词。
     """
-    config, registry, _, _, allowlist = _ctx(context)
-    if not await is_authorized(update, allowlist):
-        return
-    await _track_user(update, context)
-
-    user_id = update.effective_user.id if update.effective_user else 0
-    raw_args = list(context.args or [])
-    args, force_r2 = _parse_r2_flag(raw_args, user_id, config.auth.admin_users)
-    keyword = " ".join(args).strip()
-    if not keyword:
-        await update.message.reply_text(
-            "用法：/ehsearch <关键词> [--r2]\n"
-            "示例：/ehsearch language:chinese translated"
-        )
-        return
-
-    placeholder = await update.message.reply_text(f"🔍 搜索 “{keyword}” ...")
+    _, registry, _, _, _ = _ctx(context)
 
     try:
         page = await _ehsearch_dispatch(registry, keyword)
@@ -4116,7 +4112,7 @@ async def cmd_ehsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await placeholder.edit_text(f"⚠️ 搜索失败：{e}")
         return
     except Exception as e:
-        logger.exception(f"/ehsearch {keyword!r} unexpected error")
+        logger.exception(f"ehsearch {keyword!r} unexpected error")
         await placeholder.edit_text(f"⚠️ 搜索失败：{e}")
         return
 
@@ -4150,7 +4146,127 @@ async def cmd_ehsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # 计入 stats（/stats 会自动出现一行 "eh/ex 搜索"）
     await _log_usage(
         context, update, kind=KIND_EH_SEARCH,
-        provider=page.host, ref_id=keyword[:64],
+        provider=page.host, ref_id=(log_keyword or keyword)[:64],
+    )
+
+
+async def cmd_ehsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """关键词搜索 eh/ex 画廊。
+
+    admin 可加 `--r2` flag，让本次搜索后续点 [打开] 的发布强制走 R2（绕过
+    max_upload_size_gb 护栏）。
+    """
+    config, _, _, _, allowlist = _ctx(context)
+    if not await is_authorized(update, allowlist):
+        return
+    await _track_user(update, context)
+
+    user_id = update.effective_user.id if update.effective_user else 0
+    raw_args = list(context.args or [])
+    args, force_r2 = _parse_r2_flag(raw_args, user_id, config.auth.admin_users)
+    keyword = " ".join(args).strip()
+    if not keyword:
+        await update.message.reply_text(
+            "用法：/ehsearch <关键词> [--r2]\n"
+            "示例：/ehsearch language:chinese translated"
+        )
+        return
+
+    placeholder = await update.message.reply_text(f"🔍 搜索 “{keyword}” ...")
+    await _run_ehsearch_landing(
+        update, context,
+        placeholder=placeholder,
+        keyword=keyword,
+        force_r2=force_r2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /jm —— 禁漫号 → 标题 → /ehsearch
+# ---------------------------------------------------------------------------
+#
+# 唯一动线：用户给一个禁漫号 → 拉 JM 标题 → 用 clean_jm_title 清洗 → 调 ehsearch
+# 复用同款列表 UI。本命令本身不下载、不发图，只是把"禁漫号"翻译成"EH 关键词"。
+#
+# 失败兜底：清洗后关键词为空时退回原标题；ehsearch 0 结果时尾部追加一行 hint
+# 提示用户用 /ehsearch 手动微调（在 _run_ehsearch_landing 里用 keyword 文案
+# 就够，hint 由 cmd_jm 自己接力一条消息——不强行塞 placeholder）。
+
+_JM_ID_RE = re.compile(r"^\d{1,8}$")
+
+
+async def cmd_jm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """禁漫号 → 标题 → /ehsearch。
+
+    用法：/jm <禁漫号> [--r2]
+    """
+    config, _, _, _, allowlist = _ctx(context)
+    if not await is_authorized(update, allowlist):
+        return
+    await _track_user(update, context)
+
+    if not config.collectors.jm.enabled:
+        await update.message.reply_text(
+            "⚠️ 禁漫查询未启用。\n"
+            "管理员可执行：/setting set collectors.jm.enabled true"
+        )
+        return
+
+    user_id = update.effective_user.id if update.effective_user else 0
+    raw_args = list(context.args or [])
+    args, force_r2 = _parse_r2_flag(raw_args, user_id, config.auth.admin_users)
+    if not args:
+        await update.message.reply_text(
+            "用法：/jm <禁漫号> [--r2]\n"
+            "示例：/jm 630134"
+        )
+        return
+    jm_id = args[0].strip()
+    if not _JM_ID_RE.match(jm_id):
+        await update.message.reply_text(
+            f"⚠️ 参数 “{jm_id}” 不像禁漫号。禁漫号是纯数字（≤ 8 位）。"
+        )
+        return
+
+    placeholder = await update.message.reply_text(f"🔍 解析禁漫号 {jm_id} ...")
+
+    # 延迟 import 避免在没启用 jm 时还要求装 jmcomic
+    from ...provider.jm import JMError, JMNotFoundError, clean_jm_title, fetch_jm_title
+
+    try:
+        raw_title = await fetch_jm_title(jm_id, timeout=float(config.collectors.jm.timeout))
+    except JMNotFoundError:
+        await placeholder.edit_text(f"⚠️ 禁漫号 {jm_id} 不存在")
+        return
+    except JMError as e:
+        await placeholder.edit_text(f"⚠️ 禁漫解析失败：{e}")
+        return
+    except Exception as e:
+        logger.exception(f"/jm {jm_id} unexpected error")
+        await placeholder.edit_text(f"⚠️ 禁漫解析失败：{e}")
+        return
+
+    cleaned = clean_jm_title(raw_title)
+    keyword = cleaned or raw_title  # 清洗结果空就退回原标题
+    if not keyword.strip():
+        await placeholder.edit_text(
+            f"⚠️ 禁漫号 {jm_id} 标题为空，无法搜索"
+        )
+        return
+
+    # 二段占位：让用户看到清洗后的关键词，方便排错
+    try:
+        await placeholder.edit_text(f"🔍 搜索 “{keyword}” ...")
+    except Exception:
+        # edit 失败（极端：消息被删等）走 landing 也能继续，不致命
+        logger.debug(f"/jm placeholder edit failed before search; continuing")
+
+    await _run_ehsearch_landing(
+        update, context,
+        placeholder=placeholder,
+        keyword=keyword,
+        force_r2=force_r2,
+        log_keyword=f"jm:{jm_id}",  # /stats 里能区分入口
     )
 
 
@@ -5122,6 +5238,7 @@ __all__ = [
     "cmd_pixiv_direct",
     "cmd_archive",
     "cmd_ehsearch",
+    "cmd_jm",
     "cmd_zip2tph",
     "cmd_cache",
     "cmd_stats",
