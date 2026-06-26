@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### 变更
+- **Telegra.ph 页的 eh 标签块改成引用格式**。把 v0.12.0 引入的标签块从「标题 + 每行一个 `<p>`」改成单个 `<blockquote>`，行间用 `<br>` 分隔，视觉上跟正文图片区隔更清楚。[handlers.py](pixivfeed/channel/telegram/handlers.py) 的 `_build_eh_tags_block_html` 输出改为 `<blockquote>语言: …<br>原作: …</blockquote>`；telegra.ph 支持 `blockquote`/`br`，但不认 TG 的 `expandable` 属性，故不带。
+
+### 改动文件
+- `pixivfeed/channel/telegram/handlers.py`：`_build_eh_tags_block_html` 输出 blockquote
+
 ## v0.12.0 — 2026-06-27
 
 eh/ex 画廊发到 Telegra.ph 的页面里现在带上中文标签翻译，格式跟 `/ehsearch` 详情卡一致（每个 namespace 一行多行展示）。之前 telegraph 页只有标题 + 页数，标签信息全丢了。

@@ -3940,7 +3940,8 @@ def _build_eh_tags_block_html(tags: list[str], ehtagdb) -> str:
     namespace 顺序沿用 _EH_NAMESPACE_ORDER，未在序里的排后面。
     tags 为空返回空串（publisher 据此跳过，不留空节点）。
 
-    返回的是 html_to_nodes 能解析的片段：标题 + 每行一个 <p>。
+    返回的是 html_to_nodes 能解析的片段：整块包进 <blockquote>，行间用
+    <br> 分隔（telegra.ph 支持 blockquote，但不认 TG 的 expandable 属性）。
     """
     if not tags:
         return ""
@@ -3964,7 +3965,7 @@ def _build_eh_tags_block_html(tags: list[str], ehtagdb) -> str:
         body = "、".join(_html_escape(v) for v in translated)
         if more > 0:
             body += f" <i>(+{more})</i>"
-        rows.append(f"<p><b>{_html_escape(ns_label)}</b>: {body}</p>")
+        rows.append(f"<b>{_html_escape(ns_label)}</b>: {body}")
 
     for ns in _EH_NAMESPACE_ORDER:
         _emit(ns)
@@ -3974,7 +3975,7 @@ def _build_eh_tags_block_html(tags: list[str], ehtagdb) -> str:
 
     if not rows:
         return ""
-    return "<p><b>标签</b></p>" + "".join(rows)
+    return "<blockquote>" + "<br>".join(rows) + "</blockquote>"
 
 
 def _inject_eh_tags_block(work: GalleryWork, context: ContextTypes.DEFAULT_TYPE) -> None:
