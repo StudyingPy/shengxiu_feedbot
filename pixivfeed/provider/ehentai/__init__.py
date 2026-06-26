@@ -334,6 +334,9 @@ class _EHFamilyProvider(Provider):
                 "token": token,
                 "host": self.HOST,
                 "mode": mode.value,
+                # 原始 tag 列表（["language:chinese", ...]）。翻译需要 ehtagdb
+                # （在 channel 层 bot_data），所以这里只透传原文，渲染留给 channel。
+                "eh_tag_list": list(gallery.tags),
             },
         )
 

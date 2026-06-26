@@ -322,6 +322,12 @@ class TelegraphPublisher:
                     }
                 )
             nodes.extend(html_to_nodes_safe(render_template(header_template, tvars)))
+            # eh/ex 专属：channel 层翻译好的多行中文 tag 块（其它 provider 无此键）。
+            # 放在 header 之后、图片之前，不经过 str.format（块本身已是成品 HTML，
+            # 含 telegra.ph 不认的花括号风险时也不会被模板渲染破坏）。
+            tags_block = (tvars or {}).get("eh_tags_block_html") or ""
+            if tags_block:
+                nodes.extend(html_to_nodes_safe(tags_block))
         else:
             nodes.append({"tag": "p", "children": [f"（续 {chunk_index + 1} / {total_chunks}）"]})
 

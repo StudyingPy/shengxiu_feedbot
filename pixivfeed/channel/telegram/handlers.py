@@ -1248,6 +1248,7 @@ async def _eh_run_with_mode(
 
     page_title, page_header, page_footer = _resolve_templates(config, ref.provider)
 
+    _inject_eh_tags_block(gallery, context)
     await _drop_cancel_button(placeholder)
     pub_hook = make_item_hook(p, "发布 Telegra.ph 页面")
     try:
@@ -2215,6 +2216,7 @@ async def _send_via_telegraph_generic(
 
     page_title, page_header, page_footer = _resolve_templates(config, ref.provider)
 
+    _inject_eh_tags_block(gallery, context)
     await _drop_cancel_button(placeholder)
     pub_hook = make_item_hook(p, "发布 Telegra.ph 页面")
     try:
@@ -3922,6 +3924,72 @@ def _render_eh_detail_card(
     if len(text) > 4000:
         text = text[:3950] + "\n<i>...(标签过多，已截断)</i>"
     return text
+
+
+# Telegra.ph 页里 tag 块每个 namespace 的 value 上限（页面没 4096 限制，可比
+# blockquote 宽松些，但仍防超长 tag 把页面撑爆）
+_EH_TPH_MAX_VALUES_PER_NS = 40
+
+
+def _build_eh_tags_block_html(tags: list[str], ehtagdb) -> str:
+    """把 eh 原始 tag 列表渲染成 Telegra.ph 用的多行中文 HTML 块。
+
+    格式参考 search / 详情卡的 blockquote：每个 namespace 一行
+        <b>语言</b>: 中文、翻译
+        <b>原作</b>: VOICEROID
+    namespace 顺序沿用 _EH_NAMESPACE_ORDER，未在序里的排后面。
+    tags 为空返回空串（publisher 据此跳过，不留空节点）。
+
+    返回的是 html_to_nodes 能解析的片段：标题 + 每行一个 <p>。
+    """
+    if not tags:
+        return ""
+
+    grouped = _group_tags(tags)
+    if not grouped:
+        return ""
+
+    rows: list[str] = []
+    seen: set[str] = set()
+
+    def _emit(ns: str) -> None:
+        values = grouped.get(ns)
+        if not values:
+            return
+        seen.add(ns)
+        truncated = values[:_EH_TPH_MAX_VALUES_PER_NS]
+        more = len(values) - len(truncated)
+        ns_label = _eh_translate_ns(ns, ehtagdb)
+        translated = [_eh_translate_value(ns, v, ehtagdb) for v in truncated]
+        body = "、".join(_html_escape(v) for v in translated)
+        if more > 0:
+            body += f" <i>(+{more})</i>"
+        rows.append(f"<p><b>{_html_escape(ns_label)}</b>: {body}</p>")
+
+    for ns in _EH_NAMESPACE_ORDER:
+        _emit(ns)
+    for ns in grouped:
+        if ns not in seen:
+            _emit(ns)
+
+    if not rows:
+        return ""
+    return "<p><b>标签</b></p>" + "".join(rows)
+
+
+def _inject_eh_tags_block(work: GalleryWork, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """给 eh/ex 的 GalleryWork 注入翻译后的 tag 块到 extra_vars['eh_tags_block_html']。
+
+    翻译依赖 ehtagdb（在 bot_data，provider 拿不到），所以渲染留在 channel 层。
+    publisher 的 _build_content 会在首页 header 后自动插入该块；其它 provider
+    （nh / pixiv）没有这个键，自动跳过。
+    """
+    raw = work.extra_vars.get("eh_tag_list")
+    if not raw:
+        return
+    block = _build_eh_tags_block_html(raw, _get_ehtagdb(context))
+    if block:
+        work.extra_vars["eh_tags_block_html"] = block
 
 
 def _eh_search_providers(registry: ProviderRegistry) -> tuple[EHFamilyBase | None, EHFamilyBase | None]:
