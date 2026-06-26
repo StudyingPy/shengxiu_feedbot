@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.12.0 — 2026-06-27
+
+eh/ex 画廊发到 Telegra.ph 的页面里现在带上中文标签翻译，格式跟 `/ehsearch` 详情卡一致（每个 namespace 一行多行展示）。之前 telegraph 页只有标题 + 页数，标签信息全丢了。
+
+### 新增
+- **Telegra.ph 页注入 eh 标签中文翻译**。eh/ex 画廊页在标题/页数下方多出一段多行标签块，例如 `语言: 中文、翻译` / `原作: VOICEROID`。namespace 顺序沿用详情卡的 `_EH_NAMESPACE_ORDER`，翻译复用 [ehtagdb](pixivfeed/provider/ehentai/_tagdb.py)（EhTagTranslation 数据库）。
+
+  翻译依赖 `ehtagdb`（只在 channel 层 `bot_data`，publisher 拿不到），所以拆成三段：
+  1. provider 侧 [ehentai/__init__.py](pixivfeed/provider/ehentai/__init__.py) 的 `GalleryWork.extra_vars` 透传原始 `eh_tag_list`（如 `["language:chinese", ...]`），不做翻译。
+  2. channel 侧 [handlers.py](pixivfeed/channel/telegram/handlers.py) 新增 `_build_eh_tags_block_html` + `_inject_eh_tags_block`，复用现成的 `_eh_translate_ns` / `_eh_translate_value` / `_group_tags` 渲染成多行 HTML，写进 `extra_vars["eh_tags_block_html"]`。每个 namespace 最多 40 个 value，超出显示 `(+N)`。
+  3. publisher 侧 [telegraph.py](pixivfeed/publisher/telegraph.py) 的 `_build_content` 在首页 header 后、图片前自动插入该块（仿照已有 `source_url` 处理）。其它 provider（nh/pixiv）无此键自动跳过；块本身是成品 HTML，不走 `str.format` 避免标签里花括号被破坏。
+
+  用户无需改 config 模板。
+
+### 改动文件
+- `pixivfeed/provider/ehentai/__init__.py`：`extra_vars` 透传 `eh_tag_list`
+- `pixivfeed/channel/telegram/handlers.py`：新增 `_build_eh_tags_block_html`、`_inject_eh_tags_block`、`_EH_TPH_MAX_VALUES_PER_NS`；两个 eh 发布点调用注入
+- `pixivfeed/publisher/telegraph.py`：`_build_content` 注入 `eh_tags_block_html`
+- `pyproject.toml`：版本 0.11.0 → 0.12.0
+
 ## v0.11.0 — 2026-06-13
 
 两件独立改动一起切。一是 nhentai 模块自从第三方镜像 `nhapi.cat42.uk` 整站 502 后整个 collector 不工作；二是新增 `/jm <禁漫号>` 命令，把禁漫号翻成 EH 关键词后直接进 `/ehsearch` 流程。
