@@ -306,7 +306,7 @@ journalctl -u pixiv-feed-bot-cleanup.service -n 20 --no-pager
 # 期望末行类似：cleanup done: removed N files (X.X MB), M empty dirs
 ```
 
-默认每天 04:00 触发（带 30 分钟抖动），运行 `deploy/cleanup.py` 删除 `storage.cache_dir` 下 mtime 超过 `cache_days` 天的文件。`telegra.ph_cache` 表中的永久映射不会被删除，避免旧链接失效。
+默认每天 04:00 触发（带 30 分钟抖动），运行 `deploy/cleanup.py` 删除 `storage.cache_dir` 下 mtime 超过 `cache_days` 天的文件。某个作品的本地目录被完整清空后，脚本会同步失效依赖本地 Nginx 图片的 `telegraph_cache` 映射；已完整上传 R2 的 durable 映射不受影响。清理服务因此需要同时写入 `/var/cache/pixiv-feed-bot` 和 `/var/lib/pixiv-feed-bot`，更新本仓库中的 service 文件后记得重新复制并执行 `systemctl daemon-reload`。
 
 ## Cloudflare R2 / S3 兼容对象存储（可选）
 

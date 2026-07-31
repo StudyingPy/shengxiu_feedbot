@@ -279,6 +279,7 @@ class Config:
             ehentai=EHentaiCollectorConfig(**(collectors_raw.get("ehentai") or {})),
             exhentai=ExHentaiCollectorConfig(**(collectors_raw.get("exhentai") or {})),
             nhentai=NHentaiCollectorConfig(**(collectors_raw.get("nhentai") or {})),
+            jm=JMCollectorConfig(**(collectors_raw.get("jm") or {})),
         )
 
         # storage 含嵌套 R2Config，需要单独构造（直接 **storage_raw 会把 r2 dict

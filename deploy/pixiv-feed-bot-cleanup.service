@@ -12,7 +12,8 @@ ExecStart=/opt/pixiv-feed-bot/.venv/bin/python -m deploy.cleanup /etc/pixiv-feed
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/cache/pixiv-feed-bot
+# cleanup.py 还会联动失效 SQLite 里的 telegraph_cache 行。
+ReadWritePaths=/var/cache/pixiv-feed-bot /var/lib/pixiv-feed-bot
 
 StandardOutput=journal
 StandardError=journal

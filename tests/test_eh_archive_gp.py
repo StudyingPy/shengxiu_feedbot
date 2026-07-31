@@ -3,11 +3,16 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import pixivfeed.provider.ehentai as eh_module
 from pixivfeed.provider.ehentai import EHArchiveError, EHentaiProvider, EHGallery
-from pixivfeed.provider.ehentai._archive import ArchiveError, parse_gp_cost
+from pixivfeed.provider.ehentai._archive import (
+    ArchiveError,
+    _fetch_probe_prefix,
+    parse_gp_cost,
+)
 from pixivfeed.provider.ehentai._modes import EHMode
 
 
@@ -67,9 +72,7 @@ def test_archive_pipeline_returns_chooser_gp(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.parametrize("failure_type", [ArchiveError, RuntimeError])
-def test_archive_pipeline_keeps_gp_when_download_fails(
-    monkeypatch, tmp_path, failure_type
-) -> None:
+def test_archive_pipeline_keeps_gp_when_download_fails(monkeypatch, tmp_path, failure_type) -> None:
     provider = _provider(tmp_path)
 
     async def fake_fetch_archiver_token(client, album_url):
@@ -120,9 +123,7 @@ def test_fetch_and_download_exposes_archive_gp(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(provider, "_archive_pipeline", fake_archive_pipeline)
 
     ref = SimpleNamespace(id="123/token")
-    work = asyncio.run(
-        provider.fetch_and_download_with_mode(ref, EHMode.ARCHIVE_ORG)
-    )
+    work = asyncio.run(provider.fetch_and_download_with_mode(ref, EHMode.ARCHIVE_ORG))
 
     assert work.extra_vars["archive_gp_cost"] == 47
 
@@ -135,3 +136,42 @@ def test_parse_gp_cost_keeps_free_archive_at_zero() -> None:
 
     assert parse_gp_cost(chooser_html, EHMode.ARCHIVE_ORG) == 53
     assert parse_gp_cost(chooser_html, EHMode.ARCHIVE_RES) == 0
+
+
+def test_archive_probe_stops_after_two_kib_when_range_is_ignored() -> None:
+    class GuardedStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.iterations = 0
+            self.closed = False
+
+        async def __aiter__(self):
+            self.iterations += 1
+            yield b"PK" + b"x" * 2046
+            self.iterations += 1
+            raise AssertionError("probe consumed response body beyond the 2 KiB prefix")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = GuardedStream()
+
+    async def run_probe():
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["Range"] == "bytes=0-2047"
+            return httpx.Response(
+                200,
+                headers={"Content-Length": str(4 * 1024**3)},
+                stream=stream,
+            )
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await _fetch_probe_prefix(client, "https://download.example/archive.zip")
+
+    status, headers, prefix = asyncio.run(run_probe())
+
+    assert status == 200
+    assert int(headers["Content-Length"]) == 4 * 1024**3
+    assert prefix == b"PK" + b"x" * 2046
+    assert stream.iterations == 1
+    assert stream.closed is True

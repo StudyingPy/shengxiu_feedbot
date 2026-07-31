@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -47,10 +48,13 @@ class EHTagDB:
         任何异常都吞掉只 log——加载失败不影响 bot 正常运行，只是没翻译而已。
         """
         try:
-            payload = self._read_cached_or_fetch()
+            # 本地 JSON 读取/解析和首次远端下载都是同步 I/O；即使 load() 由
+            # create_task 启动，直接调用也会阻塞 bot 的事件循环。统一扔到
+            # 线程池，确保首次启动或 30 天缓存刷新时仍能正常响应消息。
+            payload = await asyncio.to_thread(self._read_cached_or_fetch)
             if payload is None:
                 return
-            self._parse_into_dict(payload)
+            await asyncio.to_thread(self._parse_into_dict, payload)
             self._loaded = True
             logger.success(
                 f"ehtagdb loaded: {len(self._db)} tag entries, "

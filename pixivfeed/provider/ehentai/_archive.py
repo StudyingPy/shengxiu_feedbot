@@ -67,6 +67,9 @@ _ARCHIVER_CSS_RE = re.compile(
     r"/z/[0-9a-f]+/x\.css",
     re.IGNORECASE,
 )
+# Range 探测最多读取 2 KiB。服务端偶尔忽略 Range 并返回完整 GB 级 zip；
+# 必须用 streaming response 主动截断，不能让 httpx 的普通 GET 缓冲整个正文。
+_ARCHIVE_PROBE_BYTES = 2048
 # 解析 chooser 页面里的 "Estimated Size: <strong>1.77 GiB</strong>"，用来动态算超时。
 # 同时存在 org 与 res 两块，按 mode 取对应那块。
 _ESTIMATED_SIZE_RE = re.compile(
@@ -88,6 +91,32 @@ class ArchiveLockedError(ArchiveError):
     上层在抛出此异常前会自动 POST invalidate_sessions=1 清掉旧 session，
     用户下次发同一画廊时会拿到全新的 archive 链接。
     """
+
+
+async def _fetch_probe_prefix(
+    client: httpx.AsyncClient,
+    fetch_url: str,
+) -> tuple[int, httpx.Headers, bytes]:
+    """Range 探测并只读取响应前缀，返回 ``(status, headers, prefix)``。
+
+    H@H 节点可能忽略 ``Range: bytes=0-2047``，以 HTTP 200 返回完整归档。
+    ``AsyncClient.get`` 会先把整个响应读入内存；这里用 stream 并在拿满
+    ``_ARCHIVE_PROBE_BYTES`` 后立即关闭响应，内存占用与归档大小无关。
+    """
+    async with client.stream(
+        "GET",
+        fetch_url,
+        headers={**BASE_HEADERS, "Range": f"bytes=0-{_ARCHIVE_PROBE_BYTES - 1}"},
+    ) as response:
+        prefix = bytearray()
+        async for chunk in response.aiter_bytes(chunk_size=_ARCHIVE_PROBE_BYTES):
+            if not chunk:
+                continue
+            remaining = _ARCHIVE_PROBE_BYTES - len(prefix)
+            prefix.extend(chunk[:remaining])
+            if len(prefix) >= _ARCHIVE_PROBE_BYTES:
+                break
+        return response.status_code, response.headers, bytes(prefix)
 
 
 @dataclass
@@ -555,9 +584,8 @@ async def download_archive_with_timeout(
         max_attempts = 6
         for i in range(max_attempts):
             try:
-                r = await client.get(
-                    fetch_url,
-                    headers={**BASE_HEADERS, "Range": "bytes=0-2047"},
+                status_code, response_headers, content = await _fetch_probe_prefix(
+                    client, fetch_url,
                 )
             except Exception as e:
                 logger.warning(f"archive zip probe attempt {i+1}/{max_attempts} errored: {e}")
@@ -567,7 +595,6 @@ async def download_archive_with_timeout(
             # 先读 body —— eh/ex 在 session 锁定时会用 HTTP 404 + 纯文本 body
             # 返回 "This archive session has been used from too many different
             # locations."，必须看 body 才能区分"节点启动中"和"已被锁"。
-            content = r.content
             try:
                 text_lower = content.decode("utf-8", errors="replace").lower()
             except Exception:
@@ -575,16 +602,16 @@ async def download_archive_with_timeout(
             if "too many different locations" in text_lower:
                 logger.warning(
                     f"archive zip probe got 'too many different locations' "
-                    f"(HTTP {r.status_code}); session locked"
+                    f"(HTTP {status_code}); session locked"
                 )
                 raise ArchiveLockedError(
                     "archive session locked (too many different locations)"
                 )
 
-            if r.status_code in (404, 503, 502, 504):
+            if status_code in (404, 503, 502, 504):
                 wait_s = min(5 + i * 2, 15)
                 logger.info(
-                    f"archive zip probe got HTTP {r.status_code} (attempt {i+1}/{max_attempts}); "
+                    f"archive zip probe got HTTP {status_code} (attempt {i+1}/{max_attempts}); "
                     f"H@H node likely starting, wait {wait_s}s"
                 )
                 await _emit_status(
@@ -593,13 +620,13 @@ async def download_archive_with_timeout(
                 await asyncio.sleep(wait_s)
                 continue
 
-            if r.status_code not in (200, 206):
-                raise ArchiveError(f"archive zip probe HTTP {r.status_code}")
+            if status_code not in (200, 206):
+                raise ArchiveError(f"archive zip probe HTTP {status_code}")
 
             # 嗅探 ZIP 头：PK\x03\x04 (本地文件头) 或 PK\x05\x06 (空 zip 中央目录)
             if content[:2] == b"PK":
-                if r.status_code == 206:
-                    cr = r.headers.get("content-range") or ""
+                if status_code == 206:
+                    cr = response_headers.get("content-range") or ""
                     if "/" in cr:
                         try:
                             total = int(cr.rsplit("/", 1)[-1])
@@ -609,7 +636,10 @@ async def download_archive_with_timeout(
                         total = 0
                     return total, True
                 # 200：服务端忽略了 Range（有些节点这样），不支持并发
-                total = int(r.headers.get("content-length") or 0)
+                try:
+                    total = int(response_headers.get("content-length") or 0)
+                except ValueError:
+                    total = 0
                 return total, False
 
             # 不是 ZIP —— 先看是不是 eh/ex 的 archiver 中间页（节点 session 尚未绑定
@@ -635,7 +665,7 @@ async def download_archive_with_timeout(
                 wait_s = min(5 + i * 2, 15)
                 logger.info(
                     f"archive zip probe got archiver intermediate page "
-                    f"(HTTP {r.status_code}, attempt {i+1}/{max_attempts}); "
+                    f"(HTTP {status_code}, attempt {i+1}/{max_attempts}); "
                     f"H@H session likely binding, wait {wait_s}s"
                 )
                 await _emit_status(
@@ -647,7 +677,7 @@ async def download_archive_with_timeout(
             # 真正的未知错误页 —— 报 preview 让上层定位
             preview = text.strip()[:200] if text.strip() else f"<{len(content)}B binary>"
             raise ArchiveError(
-                f"archive zip probe got non-zip body (HTTP {r.status_code}): {preview!r}"
+                f"archive zip probe got non-zip body (HTTP {status_code}): {preview!r}"
             )
 
         raise ArchiveError(f"archive zip not ready after {max_attempts} probe attempts")
