@@ -1,12 +1,19 @@
 # Changelog
 
-## Unreleased
+## v0.12.1 — 2026-08-01
+
+### 修复
+- **归档 GP 用量不再始终记为 0**。常规 eh/ex `archive_*` → Telegra.ph 路径此前在 [`_archive_pipeline`](pixivfeed/provider/ehentai/__init__.py) 中接收 `request_archive` 返回的 GP 后立即丢弃，最终 [`_eh_run_with_mode`](pixivfeed/channel/telegram/handlers.py) 只能按默认值 0 写入 `usage_log`。现在将 chooser 明确显示的 GP 随下载结果传回并写入成功记录；archive 申请成功后的下载、解压、发布或发送失败也保留该值。`Free!` 仍记 0，网页逐页原图的 GP/Credits 不纳入本统计口径。
+- **`/stats` 明确显示“归档 GP 消耗”**，避免被理解为包含网页逐页原图等无法可靠归因的 GP/Credits 总额。新增 [`test_eh_archive_gp.py`](tests/test_eh_archive_gp.py) 覆盖非零 GP 传播、失败保留与 `Free!` 零值。
 
 ### 变更
 - **Telegra.ph 页的 eh 标签块改成引用格式**。把 v0.12.0 引入的标签块从「标题 + 每行一个 `<p>`」改成单个 `<blockquote>`，行间用 `<br>` 分隔，视觉上跟正文图片区隔更清楚。[handlers.py](pixivfeed/channel/telegram/handlers.py) 的 `_build_eh_tags_block_html` 输出改为 `<blockquote>语言: …<br>原作: …</blockquote>`；telegra.ph 支持 `blockquote`/`br`，但不认 TG 的 `expandable` 属性，故不带。
 
 ### 改动文件
-- `pixivfeed/channel/telegram/handlers.py`：`_build_eh_tags_block_html` 输出 blockquote
+- `pixivfeed/channel/telegram/handlers.py`：归档 GP 写入与 `/stats` 口径文案；`_build_eh_tags_block_html` 输出 blockquote
+- `pixivfeed/provider/ehentai/__init__.py`：透传 chooser 显示的归档 GP，并在申请成功后的失败路径保留
+- `tests/test_eh_archive_gp.py`：归档 GP 解析与传播回归测试
+- `pyproject.toml`：版本 0.12.0 → 0.12.1
 
 ## v0.12.0 — 2026-06-27
 
