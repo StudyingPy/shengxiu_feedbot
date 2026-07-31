@@ -55,6 +55,14 @@ class EHError(Exception):
     """e-hentai/exhentai 解析或下载失败的统一类型。"""
 
 
+class EHArchiveError(EHError):
+    """archive 申请后发生的失败，保留 chooser 显示的 GP 消耗。"""
+
+    def __init__(self, message: str, *, gp_cost: int = 0):
+        super().__init__(message)
+        self.gp_cost = max(0, int(gp_cost))
+
+
 class EHGalleryUnavailable(EHError):
     """画廊在当前 host 上不可用（404、被搬到 ex、需要更高权限等）。
 
@@ -290,6 +298,7 @@ class _EHFamilyProvider(Provider):
         # 针对每个 mode 单独建子目录，避免不同分辨率串图
         work_dir = self.cache_dir / f"{self._cache_prefix()}_{gid}_{token}_{mode.value}"
         work_dir.mkdir(parents=True, exist_ok=True)
+        archive_gp_cost = 0
 
         async with self._make_client(mode) as client:
             if mode == EHMode.PAGE_SAMPLE:
@@ -307,7 +316,7 @@ class _EHFamilyProvider(Provider):
                     client, image_urls, work_dir, on_progress=on_progress,
                 )
             else:  # archive
-                local_paths = await self._archive_pipeline(
+                local_paths, archive_gp_cost = await self._archive_pipeline(
                     client, gallery, mode, work_dir,
                     on_progress=on_progress, on_status=on_status,
                 )
@@ -334,6 +343,8 @@ class _EHFamilyProvider(Provider):
                 "token": token,
                 "host": self.HOST,
                 "mode": mode.value,
+                # 只记录 archiver chooser 明确展示的 GP；网页逐页原图不纳入。
+                "archive_gp_cost": archive_gp_cost,
                 # 原始 tag 列表（["language:chinese", ...]）。翻译需要 ehtagdb
                 # （在 channel 层 bot_data），所以这里只透传原文，渲染留给 channel。
                 "eh_tag_list": list(gallery.tags),
@@ -529,18 +540,20 @@ class _EHFamilyProvider(Provider):
         *,
         on_progress: ProgressHook = None,
         on_status: StatusUpdater = None,
-    ) -> list[Path]:
+    ) -> tuple[list[Path], int]:
         """走 archiver.php 拿 zip → 解压。
 
         - 用 `request_archive` 返回的预估字节数计算动态超时（5min + 5s/MB，封顶 1h），
           避免大画廊（>500MB）固定 300s timeout 死循环；config 的 archive_timeout
           作为下限，用户调高也尊重。
         - on_status / on_progress 透传给 `download_archive_with_timeout`。
+        - 返回图片路径和 chooser 显示的 GP；失败时由 EHArchiveError 保留已知 GP。
         """
         album_url = f"https://{self.HOST}/g/{gallery.gallery_id}/{gallery.token}"
+        gp_cost = 0
         try:
             archiver_token = await fetch_archiver_token(client, album_url)
-            zip_url, estimated, _gp = await request_archive(
+            zip_url, estimated, gp_cost = await request_archive(
                 client,
                 self.HOST,
                 gallery.gallery_id,
@@ -573,16 +586,25 @@ class _EHFamilyProvider(Provider):
             except OSError:
                 pass
 
-            return extract.image_paths
+            return extract.image_paths, gp_cost
         except ArchiveLockedError as e:
             # session 已被锁；底层已自动 invalidate，让消息流上层用户看到提示而不是
             # "archive download failed" 的笼统错误。
-            raise EHError(
+            raise EHArchiveError(
                 "archive session 已被锁定（多 IP 滥用风控），"
-                "已自动取消旧链接，请稍后重新提交本画廊"
+                "已自动取消旧链接，请稍后重新提交本画廊",
+                gp_cost=gp_cost,
             ) from e
         except ArchiveError as e:
-            raise EHError(f"archive download failed: {e}") from e
+            raise EHArchiveError(
+                f"archive download failed: {e}",
+                gp_cost=gp_cost,
+            ) from e
+        except Exception as e:
+            raise EHArchiveError(
+                f"archive pipeline failed: {e}",
+                gp_cost=gp_cost,
+            ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +653,7 @@ __all__ = [
     "ExHentaiProvider",
     "EHGallery",
     "EHError",
+    "EHArchiveError",
     "EHGalleryUnavailable",
     "EHMode",
     "EHSearchAuthError",

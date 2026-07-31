@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
-from collections import deque
 import re
 import shutil
 import tempfile
 import time
 import uuid
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,15 +42,19 @@ from telegram.ext import ContextTypes
 
 from ...config import Config
 from ...provider import GalleryImage, GalleryWork, ParsedRef, ProviderRegistry, StatusUpdater
-from ...provider.ehentai import EHError, EHGalleryUnavailable, EHMode
-from ...provider.ehentai import _EHFamilyProvider as EHFamilyBase
+from ...provider._size_prefetch import estimate_total_bytes
 from ...provider.ehentai import (
+    EHArchiveError,
+    EHError,
+    EHGalleryUnavailable,
+    EHMode,
     EHSearchAuthError,
     EHSearchBlockedError,
     EHSearchError,
     SearchResultPage,
     search_eh,
 )
+from ...provider.ehentai import _EHFamilyProvider as EHFamilyBase
 from ...provider.ehentai._archive import (
     ArchiveError,
     ArchiveLockedError,
@@ -62,7 +66,6 @@ from ...provider.ehentai._archive import (
     request_archive,
 )
 from ...provider.ehentai._modes import BASE_HEADERS as EH_BASE_HEADERS
-from ...provider._size_prefetch import estimate_total_bytes
 from ...provider.nhentai import NHENTAI_CDNS, NHentaiAlbum, NHentaiError, NHentaiProvider
 from ...provider.pixiv import (
     PixivAPIError,
@@ -109,7 +112,6 @@ from .progress import (
     fmt_duration,
     make_item_hook,
 )
-
 
 # ---------------------------------------------------------------------------
 # 共享上下文
@@ -1132,6 +1134,7 @@ async def _eh_run_with_mode(
 
     if mode is None:
         mode = provider.default_mode
+    usage_kind = KIND_EH_ARCHIVE if mode.is_archive else KIND_EH_PAGE
 
     extras_markup = (
         InlineKeyboardMarkup([extra_buttons]) if extra_buttons else None
@@ -1228,6 +1231,14 @@ async def _eh_run_with_mode(
                 gallery = await provider.fetch_and_download_with_mode(
                     ref, mode, on_progress=dl_hook, on_status=dl_status,
                 )
+            except EHArchiveError as e2:
+                await placeholder.edit_text(f"⚠️ ExHentai（{mode.label_zh}）失败：{e2}")
+                await _log_usage(
+                    context, update_or_query,
+                    kind=usage_kind, provider=ref.provider, ref_id=ref.id,
+                    gp_cost=e2.gp_cost, status="failed",
+                )
+                return
             except EHError as e2:
                 await placeholder.edit_text(f"⚠️ ExHentai（{mode.label_zh}）失败：{e2}")
                 return
@@ -1238,6 +1249,14 @@ async def _eh_run_with_mode(
         else:
             await placeholder.edit_text(f"⚠️ {ref.provider}（{mode.label_zh}）失败：{e}")
             return
+    except EHArchiveError as e:
+        await placeholder.edit_text(f"⚠️ {ref.provider}（{mode.label_zh}）失败：{e}")
+        await _log_usage(
+            context, update_or_query,
+            kind=usage_kind, provider=ref.provider, ref_id=ref.id,
+            gp_cost=e.gp_cost, status="failed",
+        )
+        return
     except EHError as e:
         await placeholder.edit_text(f"⚠️ {ref.provider}（{mode.label_zh}）失败：{e}")
         return
@@ -1246,6 +1265,10 @@ async def _eh_run_with_mode(
         await placeholder.edit_text(f"⚠️ {ref.provider}（{mode.label_zh}）失败：{e}")
         return
 
+    archive_gp_cost = (
+        max(0, int(gallery.extra_vars.get("archive_gp_cost", 0)))
+        if mode.is_archive else 0
+    )
     page_title, page_header, page_footer = _resolve_templates(config, ref.provider)
 
     _inject_eh_tags_block(gallery, context)
@@ -1266,8 +1289,8 @@ async def _eh_run_with_mode(
         await placeholder.edit_text(f"⚠️ 发布失败：{e}")
         await _log_usage(
             context, update_or_query,
-            kind=KIND_EH_PAGE if not (mode and mode.is_archive) else KIND_EH_ARCHIVE,
-            provider=ref.provider, ref_id=ref.id, status="failed",
+            kind=usage_kind, provider=ref.provider, ref_id=ref.id,
+            gp_cost=archive_gp_cost, status="failed",
         )
         return
 
@@ -1295,8 +1318,9 @@ async def _eh_run_with_mode(
             pass
     await _log_usage(
         context, update_or_query,
-        kind=KIND_EH_PAGE if not (mode and mode.is_archive) else KIND_EH_ARCHIVE,
+        kind=usage_kind,
         provider=ref.provider, ref_id=ref.id,
+        gp_cost=archive_gp_cost,
         bytes_in=total_bytes,
     )
 
@@ -3234,6 +3258,7 @@ async def _eh_archive_with_mode(
     _attach_progress_markup(progress, placeholder)
     gid, token = ref.id.split("/", 1)
     host = provider.HOST
+    gp_cost = 0
 
     try:
         if mode.is_archive:
@@ -3416,17 +3441,17 @@ async def _eh_archive_with_mode(
             "⚠️ archive session 已被锁定（多 IP 滥用风控）。\n"
             "已自动取消旧的下载链接，请稍后重新提交本画廊以获取新链接。"
         )
-        await _emit_usage(status="failed")
+        await _emit_usage(status="failed", gp=gp_cost)
     except ArchiveError as e:
         await progress.finish(f"⚠️ archive 失败：{e}")
-        await _emit_usage(status="failed")
+        await _emit_usage(status="failed", gp=gp_cost)
     except EHError as e:
         await progress.finish(f"⚠️ {e}")
-        await _emit_usage(status="failed")
+        await _emit_usage(status="failed", gp=gp_cost)
     except Exception as e:
         logger.exception(f"/archive eh {ref.id} mode={mode} failed")
         await progress.finish(f"⚠️ 处理失败：{e}")
-        await _emit_usage(status="failed")
+        await _emit_usage(status="failed", gp=gp_cost)
 
 
 def _safe_zip_name(s: str) -> str:
@@ -5140,7 +5165,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             tail = f" / {id_show}" + (f" / {uname_part}" if uname_part else "")
             lines.append(head + tail)
             lines.append(
-                f"   {c.tasks} 任务 · {c.gp_cost} GP · "
+                f"   {c.tasks} 任务 · 归档 GP {c.gp_cost} · "
                 f"↓{fmt_bytes(c.bytes_in)} / ↑{fmt_bytes(c.bytes_out)}"
             )
         await update.message.reply_text("\n".join(lines))
@@ -5223,7 +5248,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"  窗口：最近 {win_label}",
             "─" * 24,
             f"任务总数：{s['total']}（成功 {s['ok']} / 失败 {s['failed']} / 取消 {s['cancelled']}）",
-            f"GP 消耗：{s['gp_cost']}",
+            f"归档 GP 消耗：{s['gp_cost']}",
             f"下载流量：{fmt_bytes(s['bytes_in'])}",
             f"上传流量：{fmt_bytes(s['bytes_out'])}",
         ]
@@ -5232,7 +5257,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append("按类别：")
             for kind, count, gp in breakdown:
                 kname = KIND_ZH.get(kind, kind)
-                lines.append(f"  {kname}: {count} 次" + (f"，{gp} GP" if gp else ""))
+                lines.append(f"  {kname}: {count} 次" + (f"，归档 GP {gp}" if gp else ""))
         await update.message.reply_text("\n".join(lines))
         return
 
@@ -5250,7 +5275,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{title}（最近 {win_label}）",
         "─" * 24,
         f"任务总数：{s['total']}（成功 {s['ok']} / 失败 {s['failed']} / 取消 {s['cancelled']}）",
-        f"GP 消耗：{s['gp_cost']}",
+        f"归档 GP 消耗：{s['gp_cost']}",
         f"下载流量：{fmt_bytes(s['bytes_in'])}",
         f"上传流量：{fmt_bytes(s['bytes_out'])}",
     ]
@@ -5259,7 +5284,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("按类别：")
         for kind, count, gp in breakdown:
             kname = KIND_ZH.get(kind, kind)
-            lines.append(f"  {kname}: {count} 次" + (f"，{gp} GP" if gp else ""))
+            lines.append(f"  {kname}: {count} 次" + (f"，归档 GP {gp}" if gp else ""))
     if per_user:
         lines.append("")
         lines.append("按用户排行（前 10）：")
@@ -5267,7 +5292,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             uname_part = f"@{u.username}" if u.username else "(no username)"
             lines.append(
                 f"{i}. {u.display}  {uname_part} / {u.user_id}\n"
-                f"   {u.tasks} 任务 · {u.gp_cost} GP · ↓{fmt_bytes(u.bytes_in)} / ↑{fmt_bytes(u.bytes_out)}"
+                f"   {u.tasks} 任务 · 归档 GP {u.gp_cost} · ↓{fmt_bytes(u.bytes_in)} / ↑{fmt_bytes(u.bytes_out)}"
             )
 
     # 全局总览（未限定 chat）再补一段"按群组排行"
@@ -5281,7 +5306,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 uname_part = f" / @{c.username}" if c.username else ""
                 lines.append(
                     f"{i}. {c.display}  {id_show}{uname_part}\n"
-                    f"   {c.tasks} 任务 · {c.gp_cost} GP · ↓{fmt_bytes(c.bytes_in)} / ↑{fmt_bytes(c.bytes_out)}"
+                    f"   {c.tasks} 任务 · 归档 GP {c.gp_cost} · ↓{fmt_bytes(c.bytes_in)} / ↑{fmt_bytes(c.bytes_out)}"
                 )
 
     await update.message.reply_text("\n".join(lines))
