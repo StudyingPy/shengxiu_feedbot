@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.12.2 — 2026-08-08
+
+### 修复
+- **R2 大文件上传改为恒定内存的分块流**。为保留严格 SigV4 payload hash，上传前先按 1 MiB 分块计算 SHA-256，再进行第二遍分块发送；两遍都校验实际长度，文件中途变化或空文件会安全失败。批量上传同时按最大文件与 128 MiB 源文件预算动态收紧并发，小文件仍保留原有吞吐。
+- **自动更新重启时统一收尾后台任务**。停止接收更新后依次关闭 Application、JobQueue，取消并等待 TagDB、R2 LRU、详情卡预取和延迟删除等自建任务，最后才关闭 SQLite 与 R2，避免任务继续访问已释放资源。
+- **archive 多线程下载严格验证每个分段**。每段必须返回精确的 `206`、`Content-Range` 与正文长度；任一分段失败会先取消并等待其它写入者，再安全回退单流下载，避免残留任务竞写 `.part`。
+- **`/setting` 增加范围与枚举校验，并修正写库失败时的内存状态**。`storage.cache_days` 现在只允许 `1..3650`，超时、并发、页面数、EH 模式等字段也有明确边界；配置先校验、再写 SQLite、成功后才修改内存。cleanup 读取 runtime override 时复用相同约束，不再接受会清空全部缓存的非正天数。
+- **`logging.level` 真正即时生效**。启动加载 SQLite override 和运行时修改后都会重新配置 Loguru；重配 sink 失败会明确记录，但不会误报成数据库写入失败。
+- **Telegra.ph token 写回不再静默失败**。支持配置中缺少 `telegraph_token` 键及 `publish:` 带行尾注释的情况；失败日志不包含 token。主服务 unit 只额外放行具体的 `/etc/pixiv-feed-bot/config.yaml`，部署文档同时补齐文件 owner/mode 要求。
+- **补入 v0.12.1 之后尚未发 tag 的维护修复**：archive Range 探测限制为 2 KiB 流式读取，避免节点忽略 Range 时缓冲整个归档；补齐 JM 配置加载；EH 标签库解析移出事件循环；cleanup unit 获得 SQLite 写权限。
+
+### 改动文件
+- `pixivfeed/storage/r2.py`、`pixivfeed/lifecycle.py`、`pixivfeed/__main__.py`
+- `pixivfeed/channel/telegram/bot.py`、`pixivfeed/channel/telegram/handlers.py`
+- `pixivfeed/config.py`、`pixivfeed/publisher/telegraph.py`
+- `pixivfeed/provider/ehentai/_archive.py`、`pixivfeed/provider/ehentai/_tagdb.py`
+- `deploy/pixiv-feed-bot.service`、`deploy/pixiv-feed-bot-cleanup.service`
+- `README.md`、`docs/DEPLOY.md`、`config.example.yaml`
+- `tests/test_r2_streaming.py`、`tests/test_runtime_config_and_telegraph_token.py`、`tests/test_shutdown_and_archive_ranges.py`
+- `tests/test_config_and_background_io.py`、`tests/test_eh_archive_gp.py`
+- `pyproject.toml`：版本 0.12.1 → 0.12.2
+
 ## v0.12.1 — 2026-08-01
 
 ### 修复
