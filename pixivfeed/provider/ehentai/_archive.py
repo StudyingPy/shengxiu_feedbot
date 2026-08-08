@@ -70,6 +70,10 @@ _ARCHIVER_CSS_RE = re.compile(
 # Range 探测最多读取 2 KiB。服务端偶尔忽略 Range 并返回完整 GB 级 zip；
 # 必须用 streaming response 主动截断，不能让 httpx 的普通 GET 缓冲整个正文。
 _ARCHIVE_PROBE_BYTES = 2048
+_CONTENT_RANGE_RE = re.compile(
+    r"bytes\s+(\d+)-(\d+)/(\d+)",
+    re.IGNORECASE,
+)
 # 解析 chooser 页面里的 "Estimated Size: <strong>1.77 GiB</strong>"，用来动态算超时。
 # 同时存在 org 与 res 两块，按 mode 取对应那块。
 _ESTIMATED_SIZE_RE = re.compile(
@@ -733,15 +737,40 @@ async def download_archive_with_timeout(
         async def _one(idx: int, start: int, end: int) -> None:
             nonlocal last_emit
             headers = {**BASE_HEADERS, "Range": f"bytes={start}-{end}"}
+            expected_bytes = end - start + 1
             with tmp.open("r+b") as f:
                 f.seek(start)
                 async with client.stream("GET", fetch_url, headers=headers) as resp:
-                    if resp.status_code not in (200, 206):
-                        raise ArchiveError(f"range GET HTTP {resp.status_code}")
+                    if resp.status_code != 206:
+                        raise ArchiveError(
+                            f"range GET expected HTTP 206, got {resp.status_code} "
+                            f"for bytes={start}-{end}"
+                        )
+                    content_range = resp.headers.get("content-range", "").strip()
+                    match = _CONTENT_RANGE_RE.fullmatch(content_range)
+                    if match is None:
+                        raise ArchiveError(
+                            f"range GET invalid Content-Range {content_range!r} "
+                            f"for bytes={start}-{end}"
+                        )
+                    actual_start, actual_end, actual_total = map(int, match.groups())
+                    if (actual_start, actual_end, actual_total) != (start, end, total):
+                        raise ArchiveError(
+                            f"range GET Content-Range mismatch: {content_range!r}, "
+                            f"expected 'bytes {start}-{end}/{total}'"
+                        )
+
+                    received = 0
                     async for chunk in resp.aiter_bytes(64 * 1024):
                         if not chunk:
                             continue
+                        if received + len(chunk) > expected_bytes:
+                            raise ArchiveError(
+                                f"range GET returned more than {expected_bytes} bytes "
+                                f"for bytes={start}-{end}"
+                            )
                         f.write(chunk)
+                        received += len(chunk)
                         async with wrote_lock:
                             tracker.add(len(chunk))
                             now = time.monotonic()
@@ -752,7 +781,26 @@ async def download_archive_with_timeout(
                                 )
                                 await _emit_progress(tracker.done, total)
 
-        await asyncio.gather(*(_one(*r) for r in ranges))
+                    if received != expected_bytes:
+                        raise ArchiveError(
+                            f"range GET returned {received} bytes, expected {expected_bytes} "
+                            f"for bytes={start}-{end}"
+                        )
+
+        tasks = [
+            asyncio.create_task(_one(*range_spec))
+            for range_spec in ranges
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            # gather 遇到首个异常时不会自动等待其余分段结束。必须显式取消并
+            # 等待，否则 fallback 删除 .part 后，残留任务仍可能继续写这个文件。
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         # 终态
         await _emit_status(tracker.format("下载 zip", suffix=suffix))
         await _emit_progress(total, total)

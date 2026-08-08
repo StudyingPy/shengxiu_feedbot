@@ -38,7 +38,14 @@ chown -R pixivbot:pixivbot /opt/pixiv-feed-bot
 systemctl start pixiv-feed-bot
 ```
 
-`config.yaml` 存放在 `/etc/pixiv-feed-bot/`，不在仓库内，git 操作不会影响它。
+`config.yaml` 存放在 `/etc/pixiv-feed-bot/`，不在仓库内，git 操作不会影响它。首次启动需要把自动创建的 Telegra.ph token 写回该文件；若 token 尚未手工填写，请确保 bot 用户拥有文件且组内只读：
+
+```bash
+chown pixivbot:pixivbot /etc/pixiv-feed-bot/config.yaml
+chmod 0640 /etc/pixiv-feed-bot/config.yaml
+```
+
+systemd 的 `ReadWritePaths` 与这里的普通 UNIX owner/mode 是两层独立限制，两者都允许写入才会成功。写回失败时 bot 仍能在当前进程使用新 token，但日志会明确告警，且下次重启会重新创建账号。
 
 ### 日常更新
 
@@ -123,10 +130,10 @@ chown deploy:deploy /etc/feed-bot-webhook
 chmod 0750 /etc/feed-bot-webhook
 ```
 
-部署脚本默认会从 `/etc/pixiv-feed-bot/config.yaml` 读取 `telegram.token`、`auth.admin_users[0]` 与 `telegram.base_url`，使部署通知与 bot 本身使用同一个 Telegram 账号。因此默认情况下无需额外配置，只需让 deploy 用户能读取 `config.yaml`：
+部署脚本默认会从 `/etc/pixiv-feed-bot/config.yaml` 读取 `telegram.token`、`auth.admin_users[0]` 与 `telegram.base_url`，使部署通知与 bot 本身使用同一个 Telegram 账号。因此默认情况下无需额外配置，只需让 bot 用户拥有文件、再让 deploy 用户通过 `pixivbot` 组读取：
 
 ```bash
-chgrp pixivbot /etc/pixiv-feed-bot/config.yaml
+chown pixivbot:pixivbot /etc/pixiv-feed-bot/config.yaml
 chmod 0640 /etc/pixiv-feed-bot/config.yaml
 usermod -aG pixivbot deploy
 # 让组成员身份生效
@@ -286,6 +293,18 @@ systemctl stop feed-bot-webhook
 ## systemd 服务
 
 主服务示例见 [deploy/pixiv-feed-bot.service](../deploy/pixiv-feed-bot.service)；定时清理服务见 [deploy/pixiv-feed-bot-cleanup.service](../deploy/pixiv-feed-bot-cleanup.service) 与 [deploy/pixiv-feed-bot-cleanup.timer](../deploy/pixiv-feed-bot-cleanup.timer)。
+
+### 安装或更新主服务 unit
+
+```bash
+cp deploy/pixiv-feed-bot.service /etc/systemd/system/
+chown pixivbot:pixivbot /etc/pixiv-feed-bot/config.yaml
+chmod 0640 /etc/pixiv-feed-bot/config.yaml
+systemctl daemon-reload
+systemctl restart pixiv-feed-bot
+```
+
+主服务使用 `ProtectSystem=strict`，只额外放行具体的 `/etc/pixiv-feed-bot/config.yaml` 供首次 Telegra.ph token 写回，不开放整个 `/etc/pixiv-feed-bot` 目录。仓库里的 unit 有更新时，单纯 `git pull` 不会更新 `/etc/systemd/system/` 下的副本，需要重新复制并执行 `systemctl daemon-reload`。
 
 ### 启用缓存清理 timer
 

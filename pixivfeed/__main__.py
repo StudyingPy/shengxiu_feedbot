@@ -29,6 +29,7 @@ from telegram import Update
 
 from .channel.telegram.bot import init_bot_async, install_commands
 from .config import Config
+from .lifecycle import shutdown_bot_background_tasks
 from .provider import ProviderRegistry
 from .provider.ehentai import EHentaiProvider, ExHentaiProvider
 from .provider.nhentai import NHentaiProvider
@@ -177,17 +178,30 @@ async def async_main(config_path: Path) -> None:
         try:
             if app.updater and app.updater.running:
                 await app.updater.stop()
+        except Exception:
+            logger.exception("error while stopping Telegram updater")
+        try:
             if app.running:
                 await app.stop()
+        except Exception:
+            logger.exception("error while stopping Telegram application")
+        try:
+            await shutdown_bot_background_tasks(app)
+        except Exception:
+            logger.exception("error while stopping bot background tasks")
+        try:
             await app.shutdown()
         except Exception:
-            logger.exception("error during shutdown")
-        await db.close()
+            logger.exception("error while shutting down Telegram application")
+        try:
+            await db.close()
+        except Exception:
+            logger.exception("error while closing database")
         if r2_client is not None:
             try:
                 await r2_client.aclose()
             except Exception:
-                pass
+                logger.exception("error while closing R2 client")
         logger.info("Bye.")
 
 

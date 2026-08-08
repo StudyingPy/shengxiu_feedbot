@@ -44,7 +44,7 @@ cp config.example.yaml config.yaml
 python -m pixivfeed
 ```
 
-首次启动会自动创建 Telegra.ph 账号并将 token 写回 `config.yaml`。
+首次启动会自动创建 Telegra.ph 账号并将 token 写回 `config.yaml`。systemd 部署时需让 `pixivbot` 用户拥有该文件，并安装仓库提供的主服务 unit；具体权限与更新命令见[部署指南](docs/DEPLOY.md#安装或更新主服务-unit)。写回失败不会泄露 token，日志会提示权限问题。
 
 完整的 Nginx 配置、systemd 服务、自动部署、R2 对象存储、本地 Bot API 搭建等详见 **[部署指南](docs/DEPLOY.md)**。
 

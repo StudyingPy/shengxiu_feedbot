@@ -24,6 +24,7 @@ from telegram.ext import (
 )
 
 from ...config import Config
+from ...lifecycle import start_background_task
 from ...provider import ProviderRegistry
 from ...provider.ehentai import EHTagDB
 from ...publisher import TelegraphPublisher
@@ -51,7 +52,6 @@ from .inline import handle_inline
 from .jobqueue import JobQueueManager
 from .setting import cmd_setting
 from .wiki import cmd_wiki
-
 
 # ---------------------------------------------------------------------------
 # 命令菜单
@@ -238,13 +238,17 @@ async def init_bot_async(
     # 几十毫秒就解析完；首次拉远端可能要几秒。加载完成前 translate() 安全降级
     # 返回原文。失败也只 log，不影响 bot 运行。
     tagdb: EHTagDB = app.bot_data["ehtagdb"]
-    asyncio.create_task(tagdb.load())
+    start_background_task(app, tagdb.load(), name="ehtagdb-load")
 
     # R2 LRU + stats 后台 task：仅 R2 启用 + capacity_gb > 0 才挂。每轮跑
     # list_all → 把 stats 塞 bot_data["r2_stats"] 给 /stats system 用 → 超阈值
     # 时顺便清理。开机 30 秒后跑一次保证 admin 能立刻 /stats 看到数据。
     if r2_client is not None and config.storage.r2.capacity_gb > 0:
-        asyncio.create_task(_r2_lru_loop(app, r2_client, config))
+        start_background_task(
+            app,
+            _r2_lru_loop(app, r2_client, config),
+            name="r2-lru-loop",
+        )
 
     return app
 

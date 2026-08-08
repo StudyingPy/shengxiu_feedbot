@@ -79,7 +79,9 @@ def _sign_request(
     cred: _R2Cred, *,
     method: str,
     key: str,                           # 不带 bucket 前缀的 object key
-    payload: bytes,
+    payload: bytes | None = None,
+    payload_hash: str | None = None,
+    content_length: int | None = None,
     content_type: str | None = None,
     query: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, str]]:
@@ -91,13 +93,22 @@ def _sign_request(
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = now.strftime("%Y%m%d")
 
-    payload_hash = _sha256_hex(payload)
+    if payload_hash is None:
+        if payload is None:
+            raise ValueError("payload or payload_hash is required")
+        payload_hash = _sha256_hex(payload)
+    elif payload is not None:
+        raise ValueError("payload and payload_hash are mutually exclusive")
 
     headers: dict[str, str] = {
         "host": host,
         "x-amz-content-sha256": payload_hash,
         "x-amz-date": amz_date,
     }
+    if content_length is not None:
+        if content_length < 0:
+            raise ValueError("content_length must be >= 0")
+        headers["content-length"] = str(content_length)
     if content_type:
         headers["content-type"] = content_type
 
@@ -152,6 +163,75 @@ _CONTENT_TYPE_BY_EXT = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
 }
+
+# 文件 PUT 不再整体 read_bytes：第一遍分块计算 SigV4 要求的严格 payload hash，
+# 第二遍以固定块异步发送。因此单个上传的 Python 峰值缓冲与文件大小无关。
+_UPLOAD_STREAM_CHUNK_BYTES = 1024 * 1024
+
+# 即使已改为流式上传，大文件同时 PUT 过多仍会放大磁盘、TLS 和网络压力。
+# 把“同时处理的源文件大小”控制在约 128 MiB；小图仍可用默认 8 并发。
+_UPLOAD_CONCURRENT_SOURCE_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+def _sha256_file_hex(local_path: Path, expected_size: int) -> str:
+    """分块计算文件 SHA-256，并确认读到的长度与 stat 一致。"""
+    digest = hashlib.sha256()
+    bytes_read = 0
+    with local_path.open("rb") as file_obj:
+        while chunk := file_obj.read(_UPLOAD_STREAM_CHUNK_BYTES):
+            bytes_read += len(chunk)
+            if bytes_read > expected_size:
+                raise OSError(
+                    f"file size changed while hashing: expected {expected_size}, read >{expected_size}"
+                )
+            digest.update(chunk)
+    if bytes_read != expected_size:
+        raise OSError(
+            f"file size changed while hashing: expected {expected_size}, read {bytes_read}"
+        )
+    return digest.hexdigest()
+
+
+class _FileByteStream(httpx.AsyncByteStream):
+    """从本地文件分块发送，并对第二遍实际上传长度做严格校验。"""
+
+    def __init__(self, local_path: Path, expected_size: int):
+        self._local_path = local_path
+        self._expected_size = expected_size
+
+    async def __aiter__(self):
+        file_obj = await asyncio.to_thread(self._local_path.open, "rb")
+        bytes_sent = 0
+        try:
+            while True:
+                chunk = await asyncio.to_thread(file_obj.read, _UPLOAD_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                bytes_sent += len(chunk)
+                if bytes_sent > self._expected_size:
+                    raise OSError(
+                        "file size changed while uploading: "
+                        f"expected {self._expected_size}, sent >{self._expected_size}"
+                    )
+                yield chunk
+            if bytes_sent != self._expected_size:
+                raise OSError(
+                    "file size changed while uploading: "
+                    f"expected {self._expected_size}, sent {bytes_sent}"
+                )
+        finally:
+            file_obj.close()
+
+
+def _effective_upload_concurrency(file_sizes: list[int], requested: int) -> int:
+    """按批次最大文件收紧并发，保留小文件的吞吐。"""
+    if requested < 1:
+        raise ValueError("concurrency must be >= 1")
+    largest = max(file_sizes, default=0)
+    if largest <= 0:
+        return requested
+    size_limited = max(1, _UPLOAD_CONCURRENT_SOURCE_BUDGET_BYTES // largest)
+    return min(requested, size_limited)
 
 
 def _guess_content_type(key: str) -> str:
@@ -259,14 +339,49 @@ class R2Client:
         return None
 
     async def put_file(self, relative_key: str, local_path: Path) -> bool:
-        """把本地文件 PUT 到 R2。返回是否成功。"""
+        """把本地文件流式 PUT 到 R2。返回是否成功。
+
+        SigV4 不能在发送前省略 payload hash，所以必须两遍读取：
+        第一遍在 worker thread 分块计算 SHA-256，第二遍才流式发送。
+        两遍都核对 stat 得到的长度，文件在上传中变化时会失败而不是静默上传截断内容。
+        """
         try:
-            data = local_path.read_bytes()
+            expected_size = local_path.stat().st_size
+            if expected_size <= 0:
+                raise OSError(f"file is empty: {expected_size} bytes")
+            payload_hash = await asyncio.to_thread(
+                _sha256_file_hex,
+                local_path,
+                expected_size,
+            )
+            if local_path.stat().st_size != expected_size:
+                raise OSError("file size changed after hashing")
         except OSError as e:
             logger.warning(f"R2 put_file: cannot read {local_path}: {e}")
             return False
         absolute = self._normalize_key(relative_key)
-        return await self._put_bytes_absolute(absolute, data, _guess_content_type(absolute))
+        url, headers = _sign_request(
+            self._cred,
+            method="PUT",
+            key=absolute,
+            payload_hash=payload_hash,
+            content_length=expected_size,
+            content_type=_guess_content_type(absolute),
+        )
+        client = await self._get_client()
+        try:
+            resp = await client.put(
+                url,
+                headers=headers,
+                content=_FileByteStream(local_path, expected_size),
+            )
+        except Exception as e:
+            logger.warning(f"R2 PUT {absolute} failed: {e}")
+            return False
+        if 200 <= resp.status_code < 300:
+            return True
+        logger.warning(f"R2 PUT {absolute} → HTTP {resp.status_code}: {resp.text[:200]}")
+        return False
 
     async def put_bytes(
         self, relative_key: str, data: bytes, content_type: str | None = None,
@@ -422,7 +537,25 @@ async def upload_files_concurrent(
     单个失败不抛——调用方按 dict 决定 fallback 策略。
     on_progress(done, total) 每完成一个文件触发一次（done 含失败的，反映总进度）。
     """
-    sem = asyncio.Semaphore(concurrency)
+    file_sizes: list[int] = []
+    for _, path in items:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            # put_file 会对该项记录准确错误并返回 False。
+            continue
+        if size >= 0:
+            file_sizes.append(size)
+    effective_concurrency = _effective_upload_concurrency(file_sizes, concurrency)
+    if effective_concurrency < concurrency:
+        largest = max(file_sizes, default=0)
+        logger.info(
+            "R2 upload concurrency reduced from "
+            f"{concurrency} to {effective_concurrency} for largest file "
+            f"{largest / 1024**2:.1f} MiB"
+        )
+
+    sem = asyncio.Semaphore(effective_concurrency)
     results: dict[str, bool] = {}
     total = len(items)
     done_lock = asyncio.Lock()

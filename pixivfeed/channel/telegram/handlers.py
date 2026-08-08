@@ -41,6 +41,7 @@ from telegram.error import TimedOut as TGTimedOut
 from telegram.ext import ContextTypes
 
 from ...config import Config
+from ...lifecycle import start_background_task
 from ...provider import GalleryImage, GalleryWork, ParsedRef, ProviderRegistry, StatusUpdater
 from ...provider._size_prefetch import estimate_total_bytes
 from ...provider.ehentai import (
@@ -779,7 +780,11 @@ def _schedule_eh_size_prefetch(
         await _safe_update_buttons(placeholder, token, new_markup)
 
     # fire-and-forget：详情卡 UI 不等 prefetch
-    asyncio.create_task(_run())
+    start_background_task(
+        context.application,
+        _run(),
+        name=f"eh-size-prefetch-{ref.id}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1424,13 +1429,17 @@ def _schedule_delete_after_cancel(
     user_msg_id = getattr(user_msg, "message_id", None) if user_msg is not None else None
     if user_msg_id is None:
         return  # 没有原始触发消息可以一起删，按"全有或全无"放弃
-    asyncio.create_task(_delete_pair_after_cancel(
-        context,
-        chat_id=chat.id,
-        chat_type=getattr(chat, "type", "") or "",
-        bot_msg_id=bot_message.message_id,
-        user_msg_id=user_msg_id,
-    ))
+    start_background_task(
+        context.application,
+        _delete_pair_after_cancel(
+            context,
+            chat_id=chat.id,
+            chat_type=getattr(chat, "type", "") or "",
+            bot_msg_id=bot_message.message_id,
+            user_msg_id=user_msg_id,
+        ),
+        name=f"cancel-delete-{chat.id}-{bot_message.message_id}",
+    )
 
 
 async def _delete_pair_after_cancel(
@@ -1805,7 +1814,11 @@ def _schedule_pixiv_size_prefetch(
         new_markup = _make_pixiv_keyboard(token, work, config)
         await _safe_update_card(placeholder, token, new_text, new_markup)
 
-    asyncio.create_task(_run())
+    start_background_task(
+        context.application,
+        _run(),
+        name=f"pixiv-size-prefetch-{work.pid}",
+    )
 
 
 async def _pixiv_offer_modes(
@@ -2060,7 +2073,11 @@ def _schedule_nhentai_size_prefetch(
         new_markup = _make_nhentai_keyboard(token)
         await _safe_update_card(placeholder, token, new_text, new_markup)
 
-    asyncio.create_task(_run())
+    start_background_task(
+        context.application,
+        _run(),
+        name=f"nhentai-size-prefetch-{album.gallery_id}",
+    )
 
 
 async def _nhentai_offer_modes(

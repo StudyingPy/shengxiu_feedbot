@@ -129,11 +129,20 @@ class TelegraphPublisher:
             author_url=self.config.publish.telegraph_author_url or None,
         )
         token = result["access_token"]
-        self.config.save_telegraph_token(token)
+        token_persisted = self.config.save_telegraph_token(token)
         # save_telegraph_token 已更新 self.config.publish.telegraph_token，
         # 但 Telegraph 客户端持有的 token 是构造时绑定的，需要重新初始化
         self._tg = Telegraph(access_token=token)
-        logger.success(f"Telegra.ph account created: short_name={result.get('short_name')}")
+        if token_persisted:
+            logger.success(
+                f"Telegra.ph account created and token persisted: "
+                f"short_name={result.get('short_name')}"
+            )
+        else:
+            logger.warning(
+                "Telegra.ph account created, but its token is only available in memory; "
+                "the next restart will create another account unless config permissions are fixed"
+            )
 
     @property
     def tg(self) -> Telegraph:

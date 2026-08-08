@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -25,7 +26,6 @@ from typing import Any
 import yaml
 
 from .utils import logger
-
 
 # ---------------------------------------------------------------------------
 # 子配置 dataclass
@@ -62,7 +62,7 @@ class PixivConfig:
 @dataclass
 class EHentaiCollectorConfig:
     enabled: bool = False
-    default_mode: str = "page_sample"   # page_sample / page_original / archive_resample / archive_original
+    default_mode: str = "page_sample"  # page_sample / page_original / archive_resample / archive_original
     archive_timeout: int = 300
 
 
@@ -88,8 +88,9 @@ class JMCollectorConfig:
     本项目 *不* 下载 JM 图片（站点反爬激进，且与本 bot 主用途——直接展示／发
     Telegra.ph——不契合）。`enabled=False` 时 /jm 命令直接报"未启用"。
     """
+
     enabled: bool = False
-    timeout: int = 20         # fetch_jm_title 单次调用上限（秒）
+    timeout: int = 20  # fetch_jm_title 单次调用上限（秒）
 
 
 @dataclass
@@ -115,22 +116,23 @@ class R2Config:
     capacity_gb：bot 内置 LRU 自动清理的容量阈值。超过 capacity_gb × 0.9 触发清理，
     清到 capacity_gb × 0.7 停手。设 0 关闭自动清理（让 bot 不管，靠你或 R2 lifecycle）。
     """
+
     enabled: bool = False
-    endpoint: str = ""              # https://<account>.r2.cloudflarestorage.com
-    region: str = "auto"            # R2 一律用 "auto"
+    endpoint: str = ""  # https://<account>.r2.cloudflarestorage.com
+    region: str = "auto"  # R2 一律用 "auto"
     bucket: str = ""
     access_key_id: str = ""
     secret_access_key: str = ""
-    custom_domain: str = ""         # https://r2.your-domain.com（自定义域名 base，不含尾斜杠）
+    custom_domain: str = ""  # https://r2.your-domain.com（自定义域名 base，不含尾斜杠）
     # bucket 内的统一前缀。配置后所有 upload/public_url/list/delete/LRU 都局限在这个前缀下，
     # 避免共用 bucket 时误删其他项目对象。默认空（兼容存量部署），但**强烈建议配置**。
     # 形如 "pixivfeed/" 或 "staging-bot/"；尾斜杠自动补全，首斜杠自动剥掉。
     prefix: str = ""
-    capacity_gb: int = 80           # 容量阈值（GB），<= 0 关闭自动 LRU
+    capacity_gb: int = 80  # 容量阈值（GB），<= 0 关闭自动 LRU
     # 单次发布总字节超过此阈值（GB）时，跳过 R2 走 nginx 本地缓存（7 天 TTL）。
     # 用户/管理员可在命令上加 --r2 强制覆盖，让大体积也上 R2。设 0.0 关闭护栏（全部上传）。
     max_upload_size_gb: float = 1.0
-    lru_check_interval_minutes: int = 60   # bot 内多久跑一次 LRU 扫描（仅 R2 用量超阈值时才删）
+    lru_check_interval_minutes: int = 60  # bot 内多久跑一次 LRU 扫描（仅 R2 用量超阈值时才删）
 
 
 @dataclass
@@ -200,6 +202,7 @@ class LoggingConfig:
 @dataclass
 class JobQueueConfig:
     """各类任务 worker 池的并发上限。重活留少、轻活给多——按机器内存/带宽调。"""
+
     archive_zip: int = 1
     zip2tph: int = 1
     direct_image: int = 2
@@ -217,10 +220,10 @@ class SizePrefetchConfig:
     """
 
     enabled: bool = True
-    sample_count: int = 3        # Pixiv / nhentai HEAD 采样数
-    timeout: int = 5             # 单请求超时秒；总 prefetch 超时 ≈ timeout
+    sample_count: int = 3  # Pixiv / nhentai HEAD 采样数
+    timeout: int = 5  # 单请求超时秒；总 prefetch 超时 ≈ timeout
     # 各 provider 子开关：某个 provider 频繁失败时可单独关，不影响其他
-    eh_archive: bool = True      # eh/ex 归档（chooser 解析）
+    eh_archive: bool = True  # eh/ex 归档（chooser 解析）
     pixiv: bool = True
     nhentai: bool = True
 
@@ -319,16 +322,16 @@ class Config:
             self.publish.base_url = self.publish.base_url.rstrip("/")
         if not self.auth.admin_users:
             errors.append("auth.admin_users must contain at least one user id")
-        if self.publish.direct_threshold < 0:
-            errors.append("publish.direct_threshold must be >= 0")
-        if self.publish.max_images_per_page <= 0 or self.publish.max_images_per_page > 300:
-            errors.append("publish.max_images_per_page must be in (0, 300]")
-
-        valid_modes = {"page_sample", "page_original", "archive_resample", "archive_original"}
-        if self.collectors.ehentai.default_mode not in valid_modes:
-            errors.append(f"collectors.ehentai.default_mode must be one of {valid_modes}")
-        if self.collectors.exhentai.default_mode not in valid_modes:
-            errors.append(f"collectors.exhentai.default_mode must be one of {valid_modes}")
+        # 与 /setting 共用同一组范围/枚举约束，避免 YAML 能启动但 runtime 不能设，
+        # 或 runtime 脏值在重启后悄悄覆盖成危险值。
+        for key in _RUNTIME_CONSTRAINED_KEYS:
+            try:
+                normalized = _validate_runtime_value(key, self.get_field(key))
+            except ValueError as e:
+                errors.append(f"{key}: {e}")
+            else:
+                if normalized != self.get_field(key):
+                    self._set_typed_field(key, normalized)
 
         for name, val in (
             ("archive_zip", self.job_queue.archive_zip),
@@ -361,6 +364,7 @@ class Config:
                 # 不拒绝启动（兼容 v0.8.1 存量部署），但显式提醒共用 bucket 风险。
                 # 后续 minor 版本可能改为默认必填。
                 import warnings as _warnings
+
                 _warnings.warn(
                     "storage.r2.prefix is empty — list/LRU/delete will operate on the entire "
                     "bucket. If this bucket is shared with other services, set storage.r2.prefix "
@@ -371,32 +375,68 @@ class Config:
         if errors:
             raise ValueError("Invalid config:\n  - " + "\n  - ".join(errors))
 
-    def save_telegraph_token(self, token: str) -> None:
-        """运行时把新生成的 Telegra.ph token 写回 YAML，不动其他字段。"""
+    def save_telegraph_token(self, token: str) -> bool:
+        """运行时把新生成的 Telegra.ph token 写回 YAML，不动其他字段。
+
+        无论持久化是否成功，当前进程都会使用新 token；返回值只表示 YAML 是否
+        已成功落盘。日志只记录路径与错误，不得包含 token 本身。
+        """
         self.publish.telegraph_token = token
         if self._source_path is None:
-            return
+            logger.error("Telegra.ph token was created but not persisted: config source path is unavailable")
+            return False
         try:
             content = self._source_path.read_text(encoding="utf-8")
-            new_lines = []
+            lines = content.splitlines()
+            new_lines: list[str] = []
             replaced = False
             in_publish_block = False
-            for line in content.splitlines():
+            publish_insert_at: int | None = None
+            publish_indent = "  "
+            encoded_token = json.dumps(token, ensure_ascii=False)
+            for line in lines:
                 stripped = line.lstrip()
-                if stripped.startswith("publish:"):
+                is_top_level = bool(
+                    line and not line.startswith((" ", "\t")) and stripped and not stripped.startswith("#")
+                )
+                publish_key = stripped.partition("#")[0].rstrip()
+                if is_top_level and publish_key == "publish:":
                     in_publish_block = True
-                elif line and not line.startswith((" ", "\t")) and stripped and not stripped.startswith("#"):
+                    publish_insert_at = len(new_lines) + 1
+                elif is_top_level:
                     in_publish_block = False
-                if in_publish_block and stripped.startswith("telegraph_token:") and not replaced:
-                    indent = line[: len(line) - len(stripped)]
-                    new_lines.append(f'{indent}telegraph_token: "{token}"')
-                    replaced = True
+                if in_publish_block and stripped.startswith("telegraph_token:"):
+                    if not replaced:
+                        indent = line[: len(line) - len(stripped)]
+                        new_lines.append(f"{indent}telegraph_token: {encoded_token}")
+                        replaced = True
                 else:
                     new_lines.append(line)
-            if replaced:
-                self._source_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-        except OSError:
-            pass
+
+                if in_publish_block and stripped and not stripped.startswith("#"):
+                    indent = line[: len(line) - len(stripped)]
+                    if indent:
+                        publish_indent = indent
+
+            if not replaced and publish_insert_at is not None:
+                new_lines.insert(
+                    publish_insert_at,
+                    f"{publish_indent}telegraph_token: {encoded_token}",
+                )
+                replaced = True
+
+            if not replaced:
+                logger.error(
+                    f"Telegra.ph token was created but not persisted: "
+                    f"publish section is missing in {self._source_path}"
+                )
+                return False
+
+            self._source_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+            return True
+        except OSError as e:
+            logger.error(f"Telegra.ph token was created but not persisted to {self._source_path}: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # 运行时覆盖
@@ -409,23 +449,34 @@ class Config:
         之后 /setting set 命令会调 set_runtime() 同时改 db 和 dataclass。
         """
         self._runtime = runtime_settings
+        logging_level_applied = False
         for key, value in runtime_settings.all().items():
+            if key not in RUNTIME_KEYS:
+                logger.warning(f"unsupported runtime setting {key!r} ignored")
+                continue
             try:
                 self._set_field(key, value)
+                logging_level_applied = logging_level_applied or key == "logging.level"
             except Exception as e:
-                from .utils import logger
                 logger.warning(f"runtime setting {key}={value!r} ignored: {e}")
 
+        if logging_level_applied:
+            self._reconfigure_logging()
+
     async def set_runtime(self, key: str, value: str, updated_by: int | None = None) -> None:
-        """admin 通过 /setting set 调用。先尝试转类型并赋值，成功后才写 db。"""
+        """admin 通过 /setting set 调用。先校验，再写 DB，最后修改当前进程。"""
         if self._runtime is None:
             raise RuntimeError("Config.bind_runtime() must be called before set_runtime")
         if key not in RUNTIME_KEYS:
             raise KeyError(f"key {key!r} is not runtime-mutable; see /setting list")
-        # 先在 dataclass 上验证 + 赋值（失败抛异常）
-        self._set_field(key, value)
-        # 再写 db
+
+        # 解析与范围校验不修改 dataclass；SQLite 失败时当前进程仍保持旧值。
+        obj, leaf, coerced = self._prepare_field(key, value)
         await self._runtime.set(key, value, updated_by=updated_by)
+        setattr(obj, leaf, coerced)
+
+        if key == "logging.level":
+            self._reconfigure_logging()
 
     async def unset_runtime(self, key: str) -> bool:
         """删除 runtime 覆盖。dataclass 字段不会自动回到 yaml 值——需要重启进程。
@@ -434,8 +485,8 @@ class Config:
             raise RuntimeError("Config.bind_runtime() must be called before unset_runtime")
         return await self._runtime.unset(key)
 
-    def _set_field(self, key: str, raw_value: str) -> None:
-        """按 key 路径定位到 dataclass 字段并赋值，类型自动从字段标注推断。"""
+    def _prepare_field(self, key: str, raw_value: str) -> tuple[Any, str, Any]:
+        """定位字段并完成类型转换/运行时范围校验，但不修改配置。"""
         parts = key.split(".")
         obj: Any = self
         for p in parts[:-1]:
@@ -456,7 +507,39 @@ class Config:
         if target_type is None:
             raise KeyError(f"unknown field {leaf!r} at {key!r}")
         coerced = _coerce(raw_value, target_type)
+        coerced = _validate_runtime_value(key, coerced)
+        return obj, leaf, coerced
+
+    def _set_field(self, key: str, raw_value: str) -> None:
+        """按 key 路径定位到 dataclass 字段并赋值，类型自动从字段标注推断。"""
+        obj, leaf, coerced = self._prepare_field(key, raw_value)
         setattr(obj, leaf, coerced)
+
+    def _set_typed_field(self, key: str, value: Any) -> None:
+        """给已经完成类型检查的字段赋值，供启动校验规范化字符串值。"""
+        parts = key.split(".")
+        obj: Any = self
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        setattr(obj, parts[-1], value)
+
+    def _reconfigure_logging(self) -> None:
+        """让 logging.level 的 runtime 覆盖立即影响已有 Loguru handlers。"""
+        from .utils import setup_logging
+
+        try:
+            setup_logging(
+                level=self.logging.level,
+                to_file=self.logging.to_file,
+                file_path=self.logging.file_path,
+            )
+            logger.info(f"logging level changed to {self.logging.level}")
+        except Exception:
+            # set_runtime 到这里时 SQLite 已提交，不能再向 /setting 报“写入失败”；
+            # 严格 level 白名单使此分支通常只可能来自 sink/file 的环境错误。
+            logger.exception(
+                "logging.level was saved, but live logger reconfiguration failed; " "restart the service to retry"
+            )
 
     def get_field(self, key: str) -> Any:
         """读单个字段值，用于 /setting list 显示。"""
@@ -487,9 +570,7 @@ def _coerce(raw: str, target_type: Any) -> Any:
             return True
         if v in ("0", "false", "no", "n", "off"):
             return False
-        raise ValueError(
-            f"无法将 {raw!r} 解析为布尔值（用 true/false / yes/no / 1/0）"
-        )
+        raise ValueError(f"无法将 {raw!r} 解析为布尔值（用 true/false / yes/no / 1/0）")
     if type_str in ("int", "<class 'int'>"):
         try:
             return int(raw.strip())
@@ -510,12 +591,62 @@ def _coerce(raw: str, target_type: Any) -> Any:
             try:
                 return [int(x) for x in items]
             except ValueError as e:
-                raise ValueError(
-                    f"无法将 {raw!r} 解析为整数列表（用逗号分隔）：{e}"
-                ) from None
+                raise ValueError(f"无法将 {raw!r} 解析为整数列表（用逗号分隔）：{e}") from None
         return items
     # 兜底：原样
     return raw
+
+
+# /setting 数字范围同时用于 YAML 启动校验与 SQLite runtime overlay。
+# 上限不是业务配额，而是防止手滑把超时/并发设成会长期卡死或压垮进程的数量级。
+_RUNTIME_NUMBER_RANGES: dict[str, tuple[int, int]] = {
+    "pixiv.timeout": (1, 600),
+    "pixiv.download_concurrency": (1, 32),
+    "collectors.timeout": (1, 600),
+    "collectors.download_concurrency": (1, 32),
+    "collectors.ehentai.archive_timeout": (1, 3600),
+    "collectors.exhentai.archive_timeout": (1, 3600),
+    "collectors.jm.timeout": (1, 300),
+    "publish.direct_threshold": (0, 10),
+    "publish.max_images_per_page": (1, 300),
+    "storage.cache_days": (1, 3650),
+    "size_prefetch.sample_count": (1, 20),
+    "size_prefetch.timeout": (1, 60),
+}
+
+_ARCHIVE_MODES = frozenset({"page_sample", "page_original", "archive_resample", "archive_original"})
+_RUNTIME_ENUM_VALUES: dict[str, frozenset[str]] = {
+    "collectors.ehentai.default_mode": _ARCHIVE_MODES,
+    "collectors.exhentai.default_mode": _ARCHIVE_MODES,
+}
+_LOG_LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})
+_RUNTIME_CONSTRAINED_KEYS = frozenset({*_RUNTIME_NUMBER_RANGES, *_RUNTIME_ENUM_VALUES, "logging.level"})
+
+
+def _validate_runtime_value(key: str, value: Any) -> Any:
+    """校验并规范化一个已经完成类型转换的 runtime 值。"""
+    if key in _RUNTIME_NUMBER_RANGES:
+        minimum, maximum = _RUNTIME_NUMBER_RANGES[key]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("必须是整数")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"必须在 {minimum} 到 {maximum} 之间")
+        return value
+
+    if key in _RUNTIME_ENUM_VALUES:
+        normalized = str(value).strip().lower()
+        allowed = _RUNTIME_ENUM_VALUES[key]
+        if normalized not in allowed:
+            raise ValueError(f"必须是以下值之一：{', '.join(sorted(allowed))}")
+        return normalized
+
+    if key == "logging.level":
+        normalized = str(value).strip().upper()
+        if normalized not in _LOG_LEVELS:
+            raise ValueError(f"必须是以下级别之一：{', '.join(sorted(_LOG_LEVELS))}")
+        return normalized
+
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -638,9 +769,7 @@ def apply_runtime_overrides(cfg: Config, db_path: str | Path) -> Config:
     try:
         conn.execute("PRAGMA query_only=1")
         try:
-            rows = conn.execute(
-                "SELECT key, value FROM runtime_settings"
-            ).fetchall()
+            rows = conn.execute("SELECT key, value FROM runtime_settings").fetchall()
         except sqlite3.OperationalError:
             # 表不存在 = 全新部署，正常降级
             return cfg
@@ -651,10 +780,7 @@ def apply_runtime_overrides(cfg: Config, db_path: str | Path) -> Config:
             try:
                 _apply_one_override(cfg, key, value)
             except (ValueError, TypeError, AttributeError) as e:
-                logger.warning(
-                    f"runtime overlay: cannot apply {key}={value!r}: {e}; "
-                    f"falling back to YAML value"
-                )
+                logger.warning(f"runtime overlay: cannot apply {key}={value!r}: {e}; " f"falling back to YAML value")
     finally:
         conn.close()
 
@@ -664,42 +790,6 @@ def apply_runtime_overrides(cfg: Config, db_path: str | Path) -> Config:
 def _apply_one_override(cfg: Config, key: str, raw_value: str) -> None:
     """把 'storage.cache_days' = '30' 写到 cfg.storage.cache_days = 30。
 
-    类型转换：从目标 dataclass 字段的 type 注解推断（int / float / bool / str）。
+    复用 /setting 的类型转换与范围校验，避免 cleanup.py 接受 bot 本身会拒绝的脏值。
     """
-    import dataclasses
-
-    parts = key.split(".")
-    target = cfg
-    for p in parts[:-1]:
-        target = getattr(target, p)
-    leaf = parts[-1]
-
-    # 目标字段类型：通过 dataclasses.fields 查
-    fields = {f.name: f for f in dataclasses.fields(target)}
-    if leaf not in fields:
-        raise AttributeError(f"no field {leaf} on {type(target).__name__}")
-
-    field_type = fields[leaf].type
-    if isinstance(field_type, str):
-        # PEP 563 / __future__.annotations 下 type 是 str；做一个最小映射
-        type_map = {"int": int, "float": float, "bool": bool, "str": str}
-        field_type = type_map.get(field_type, str)
-
-    if field_type is bool:
-        v = raw_value.strip().lower()
-        # 严格白名单：true/false 之外（包括 "abc" 这种脏值）都视为非法，
-        # 让外层 warning 路径把它当解析失败上报，不要静默归零。
-        if v in ("1", "true", "yes", "on"):
-            coerced = True
-        elif v in ("0", "false", "no", "off", ""):
-            coerced = False
-        else:
-            raise ValueError(f"cannot coerce {raw_value!r} to bool")
-    elif field_type is int:
-        coerced = int(raw_value)
-    elif field_type is float:
-        coerced = float(raw_value)
-    else:
-        coerced = raw_value
-
-    setattr(target, leaf, coerced)
+    cfg._set_field(key, raw_value)
