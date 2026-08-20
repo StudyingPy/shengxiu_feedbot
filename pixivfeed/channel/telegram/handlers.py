@@ -1038,6 +1038,7 @@ async def _eh_offer_modes(
     text = _render_eh_detail_card(
         title=gallery.title,
         host=ref.provider,
+        source_url=_source_url_for_ref(ref),
         category=gallery.category,
         pages=gallery.page_count,
         tags=gallery.tags,
@@ -3118,7 +3119,8 @@ async def _archive_one_ref_run(
             update, context, progress,
             files=local_paths,
             stem=_safe_zip_name(title) or _safe_zip_name(f"{ref.provider}_{ref.id}"),
-            caption=f"{title}\n来源：{ref.provider} {ref.id}",
+            caption=_archive_caption(title, ref),
+            caption_parse_mode=ParseMode.HTML,
         )
         if not delivered:
             await _log_usage(context, update, kind=KIND_ARCHIVE_CMD,
@@ -3209,6 +3211,7 @@ async def _eh_offer_archive_modes_on_placeholder(
     text = _render_eh_detail_card(
         title=gallery.title,
         host=ref.provider,
+        source_url=_source_url_for_ref(ref),
         category=gallery.category,
         pages=gallery.page_count,
         tags=gallery.tags,
@@ -3405,9 +3408,12 @@ async def _eh_archive_with_mode(
                             raise last_err
                 delivered = await _send_zip_file(
                     context, placeholder.chat.id, zip_path, progress,
-                    caption=f"{gallery_meta.title}\n来源：{ref.provider} {ref.id}\n模式：{mode.label_zh}",
+                    caption=_archive_caption(
+                        gallery_meta.title, ref, mode_label=mode.label_zh,
+                    ),
                     reply_to=reply_to_message_id or placeholder.message_id,
                     cleanup_progress=reply_to_message_id is not None,
+                    caption_parse_mode=ParseMode.HTML,
                 )
                 if not delivered:
                     await _emit_usage(status="failed", gp=gp_cost)
@@ -3437,9 +3443,12 @@ async def _eh_archive_with_mode(
                 files=local_paths,
                 stem=_safe_zip_name(f"{gallery.title}_{mode.value}")
                     or f"{ref.provider}_{gid}_{token}_{mode.value}",
-                caption=f"{gallery.title}\n来源：{ref.provider} {ref.id}\n模式：{mode.label_zh}",
+                caption=_archive_caption(
+                    gallery.title, ref, mode_label=mode.label_zh,
+                ),
                 reply_to=reply_to_message_id or placeholder.message_id,
                 cleanup_progress=reply_to_message_id is not None,
+                caption_parse_mode=ParseMode.HTML,
             )
             if not delivered:
                 await _emit_usage(status="failed", gp=gp_cost)
@@ -3500,6 +3509,7 @@ async def _zip_and_send(
     files: list[Path],
     stem: str,
     caption: str,
+    caption_parse_mode: str | None = None,
 ) -> bool:
     chat_id = update.effective_chat.id
     reply_to = update.effective_message.message_id
@@ -3507,6 +3517,7 @@ async def _zip_and_send(
         context, chat_id, progress,
         files=files, stem=stem, caption=caption, reply_to=reply_to,
         cleanup_progress=True,
+        caption_parse_mode=caption_parse_mode,
     )
 
 
@@ -3520,6 +3531,7 @@ async def _zip_and_send_to_chat(
     caption: str,
     reply_to: int | None,
     cleanup_progress: bool = False,
+    caption_parse_mode: str | None = None,
 ) -> bool:
     """把 files 打成临时 zip 并发回给 chat。"""
     tmpdir = Path(tempfile.mkdtemp(prefix="archive_zip_"))
@@ -3538,6 +3550,7 @@ async def _zip_and_send_to_chat(
             context, chat_id, zip_path, progress,
             caption=caption, reply_to=reply_to,
             cleanup_progress=cleanup_progress,
+            caption_parse_mode=caption_parse_mode,
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -3552,6 +3565,7 @@ async def _send_zip_file(
     caption: str,
     reply_to: int | None,
     cleanup_progress: bool = False,
+    caption_parse_mode: str | None = None,
 ) -> bool:
     size = zip_path.stat().st_size
     config: Config = context.bot_data["config"]
@@ -3598,6 +3612,7 @@ async def _send_zip_file(
                     document=f,
                     filename=zip_path.name,
                     caption=caption[:1024] if caption else None,
+                    parse_mode=caption_parse_mode,
                     reply_to_message_id=reply_to,
                     # 大文件：HTTP 层不应该在传输中超时（数据本身在本机走 local_mode）。
                     # 用极大 read_timeout 让 telegram-bot-api 自然完成传输到 TG 主网。
@@ -3927,6 +3942,7 @@ def _render_eh_detail_card(
     *,
     title: str,
     host: str,
+    source_url: str | None,
     category: str,
     pages: int,
     tags: list[str],
@@ -3937,7 +3953,7 @@ def _render_eh_detail_card(
 
     布局：
         📖 <b>标题</b>
-        🌐 host · <i>类型: X · 语言: Y · N 页</i>
+        🌐 <a href="source_url">host</a> · <i>类型: X · 语言: Y · N 页</i>
 
         <blockquote expandable>
         <b>语言</b>: chinese、translated
@@ -3952,10 +3968,11 @@ def _render_eh_detail_card(
     lang = _extract_language(tags)
     lang_zh = _eh_translate_value("language", lang, ehtagdb)
     cat_zh = _eh_translate_category(category)
+    host_label = _html_link(host, source_url) if source_url else _html_escape(host)
 
     lines = [
         f"📖 <b>{_html_escape(title)}</b>",
-        f"🌐 {host} · <i>类型: {_html_escape(cat_zh)} · "
+        f"🌐 {host_label} · <i>类型: {_html_escape(cat_zh)} · "
         f"语言: {_html_escape(lang_zh)} · {pages} 页</i>",
     ]
 
@@ -4162,6 +4179,56 @@ def _html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _html_attr_escape(s: str) -> str:
+    """转义 Telegram HTML 属性值；与正文相比还需处理引号。"""
+    return _html_escape(s).replace('"', "&quot;").replace("'", "&#x27;")
+
+
+def _html_link(label: str, url: str) -> str:
+    """生成显示文字不变的安全超链接；非 HTTP(S) 地址退回纯文本。"""
+    if not url.lower().startswith(("https://", "http://")):
+        return _html_escape(label)
+    return f'<a href="{_html_attr_escape(url)}">{_html_escape(label)}</a>'
+
+
+def _source_url_for_ref(ref: ParsedRef) -> str | None:
+    """把已解析 ref 映射为用户可访问的规范原作地址。"""
+    if ref.provider == "pixiv" and ref.id.isdigit():
+        if ref.kind == "novel":
+            return f"https://www.pixiv.net/novel/show.php?id={ref.id}"
+        if ref.kind == "illust":
+            return f"https://www.pixiv.net/artworks/{ref.id}"
+    if ref.provider == "nhentai" and ref.id.isdigit():
+        return f"https://nhentai.net/g/{ref.id}/"
+    if ref.provider in ("e-hentai.org", "exhentai.org"):
+        try:
+            gid, token = ref.id.split("/", 1)
+        except ValueError:
+            return None
+        if gid.isdigit() and re.fullmatch(r"[0-9a-fA-F]+", token):
+            return f"https://{ref.provider}/g/{gid}/{token}/"
+    return None
+
+
+def _archive_caption(
+    title: str,
+    ref: ParsedRef,
+    *,
+    mode_label: str | None = None,
+) -> str:
+    """生成归档文件 caption：视觉文案不变，来源文字指向真实原作。"""
+    source_label = f"{ref.provider} {ref.id}"
+    source_url = _source_url_for_ref(ref)
+    source = (
+        _html_link(source_label, source_url)
+        if source_url else _html_escape(source_label)
+    )
+    lines = [_html_escape(title), f"来源：{source}"]
+    if mode_label:
+        lines.append(f"模式：{_html_escape(mode_label)}")
+    return "\n".join(lines)
+
+
 def _ellipsize(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
@@ -4178,7 +4245,7 @@ def _render_search_message(
         _EHSEARCH_MAX_VISIBLE if state.expanded else _EHSEARCH_DEFAULT_VISIBLE
     )
     items = state.page.items[:visible]
-    host_label = state.host
+    host_label = _html_link(state.host, f"https://{state.host}/")
 
     head = (
         f"🔍 <b>{_html_escape(state.keyword)}</b> · {host_label}\n"
@@ -4186,7 +4253,7 @@ def _render_search_message(
     )
     lines = [head]
     for i, it in enumerate(items, 1):
-        title_safe = _html_escape(_ellipsize(it.title, 90))
+        title_link = _html_link(_ellipsize(it.title, 90), it.url)
         lang_raw = _extract_language(it.tags)
         lang_zh = _eh_translate_value("language", lang_raw, ehtagdb)
         cat_zh = _eh_translate_category(it.category)
@@ -4201,7 +4268,10 @@ def _render_search_message(
         meta_bits = [cat_zh, lang_zh, f"{it.pages} 页"]
         if tags_disp:
             meta_bits.append(_html_escape(tags_disp))
-        lines.append(f"\n<b>{i}.</b> {title_safe}\n   <i>{' · '.join(meta_bits)}</i>")
+        lines.append(
+            f"\n<b>{i}.</b> <b>{title_link}</b>\n"
+            f"   <i>{' · '.join(meta_bits)}</i>"
+        )
     text = "".join(lines)
 
     rows: list[list[InlineKeyboardButton]] = []
@@ -4431,6 +4501,7 @@ def _render_detail_card(
     text = _render_eh_detail_card(
         title=it.title,
         host=state.host,
+        source_url=it.url,
         category=it.category,
         pages=it.pages,
         tags=it.tags,
@@ -4456,6 +4527,7 @@ def _render_archive_menu(
     text = _render_eh_detail_card(
         title=it.title,
         host=state.host,
+        source_url=it.url,
         category=it.category,
         pages=it.pages,
         tags=it.tags,

@@ -5,7 +5,11 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
+from telegram.constants import ParseMode
+
 from pixivfeed.channel.telegram import handlers
+from pixivfeed.provider import ParsedRef
+from pixivfeed.provider.ehentai import SearchResultItem, SearchResultPage
 
 
 class _Message:
@@ -69,13 +73,15 @@ def test_send_zip_replies_to_original_and_removes_progress(tmp_path: Path) -> No
         42,
         zip_path,
         progress,
-        caption="caption",
+        caption='<a href="https://example.com/">caption</a>',
         reply_to=123,
         cleanup_progress=True,
+        caption_parse_mode=ParseMode.HTML,
     ))
 
     assert delivered is True
     assert bot.calls[0]["reply_to_message_id"] == 123
+    assert bot.calls[0]["parse_mode"] == ParseMode.HTML
     assert progress._msg.deleted is True
     assert progress.finishes == []
 
@@ -143,3 +149,91 @@ def test_zip_build_runs_each_file_off_event_loop(
     assert delivered is True
     assert offloaded == ["1.jpg", "2.png"]
     assert archived == {"1.jpg": b"first", "2.png": b"second"}
+
+
+def test_source_url_mapping_uses_canonical_work_addresses() -> None:
+    refs = [
+        (
+            ParsedRef("pixiv", "illust", "123", "ignored"),
+            "https://www.pixiv.net/artworks/123",
+        ),
+        (
+            ParsedRef("pixiv", "novel", "456", "ignored"),
+            "https://www.pixiv.net/novel/show.php?id=456",
+        ),
+        (
+            ParsedRef("nhentai", "gallery", "789", "ignored"),
+            "https://nhentai.net/g/789/",
+        ),
+        (
+            ParsedRef("e-hentai.org", "gallery", "10/abcdef", "ignored"),
+            "https://e-hentai.org/g/10/abcdef/",
+        ),
+        (
+            ParsedRef("exhentai.org", "gallery", "11/123abc", "ignored"),
+            "https://exhentai.org/g/11/123abc/",
+        ),
+    ]
+
+    for ref, expected in refs:
+        assert handlers._source_url_for_ref(ref) == expected
+
+
+def test_archive_caption_keeps_label_and_escapes_html() -> None:
+    ref = ParsedRef("e-hentai.org", "gallery", "10/abcdef", "ignored")
+
+    caption = handlers._archive_caption(
+        'A&B <gallery>', ref, mode_label="归档 · 原图",
+    )
+
+    assert caption.startswith("A&amp;B &lt;gallery&gt;\n")
+    assert (
+        '来源：<a href="https://e-hentai.org/g/10/abcdef/">'
+        "e-hentai.org 10/abcdef</a>"
+    ) in caption
+    assert caption.endswith("模式：归档 · 原图")
+
+
+def test_eh_cards_and_search_results_link_visible_source_labels() -> None:
+    url = "https://e-hentai.org/g/10/abcdef/"
+    detail = handlers._render_eh_detail_card(
+        title="Gallery",
+        host="e-hentai.org",
+        source_url=url,
+        category="Manga",
+        pages=12,
+        tags=[],
+        ehtagdb=None,
+    )
+    assert f'<a href="{url}">e-hentai.org</a>' in detail
+
+    item = SearchResultItem(
+        gid=10,
+        token="abcdef",
+        url=url,
+        title="A&B Gallery",
+        category="Manga",
+        pages=12,
+    )
+    state = handlers._SearchState(
+        host="e-hentai.org",
+        keyword="query",
+        page=SearchResultPage(
+            items=[item],
+            total_count=1,
+            next_url=None,
+            prev_url=None,
+            host="e-hentai.org",
+            keyword="query",
+        ),
+        chat_id=1,
+        msg_id=2,
+        user_id=3,
+        expanded=False,
+        created_at=0,
+    )
+
+    search_text, _ = handlers._render_search_message("token", state)
+
+    assert '<a href="https://e-hentai.org/">e-hentai.org</a>' in search_text
+    assert f'<a href="{url}">A&amp;B Gallery</a>' in search_text
