@@ -9,8 +9,11 @@ eh 没有官方搜索 API（api.e-hentai.org/api.php 只接 gid+token 数组返 
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from dataclasses import dataclass, field
+from weakref import WeakKeyDictionary
 
 from bs4 import BeautifulSoup, Tag
 
@@ -70,6 +73,35 @@ _GALLERY_URL_RE = re.compile(
 )
 _PAGES_RE = re.compile(r"(\d+)\s*pages?", re.IGNORECASE)
 _BANNED_RE = re.compile(r"temporarily banned", re.IGNORECASE)
+
+# EHWiki 的 Gallery Searching 明确限制搜索请求至少间隔 3 秒，未声明 EH/Ex
+# 额度独立，因此同一事件循环内全家族共享一个节流槽，覆盖 /ehsearch、/jm、
+# 翻页、Ex→EH 认证回退与并发用户。WeakKeyDictionary 避免测试创建的临时 loop 泄漏。
+_SEARCH_MIN_INTERVAL_SECONDS = 3.05
+
+
+@dataclass
+class _SearchRateState:
+    lock: asyncio.Lock
+    last_started: float = 0.0
+
+
+_SEARCH_RATE_STATES: WeakKeyDictionary = WeakKeyDictionary()
+
+
+async def _wait_for_search_slot() -> None:
+    loop = asyncio.get_running_loop()
+    state = _SEARCH_RATE_STATES.get(loop)
+    if state is None:
+        state = _SearchRateState(lock=asyncio.Lock())
+        _SEARCH_RATE_STATES[loop] = state
+
+    async with state.lock:
+        elapsed = time.monotonic() - state.last_started
+        delay = _SEARCH_MIN_INTERVAL_SECONDS - elapsed
+        if delay > 0:
+            await asyncio.sleep(delay)
+        state.last_started = time.monotonic()
 
 
 def _parse_item(tr: Tag) -> SearchResultItem | None:
@@ -210,6 +242,7 @@ async def search_eh(
     elif prev_param is not None:
         params["prev"] = prev_param
 
+    await _wait_for_search_slot()
     async with provider._make_client() as client:
         try:
             resp = await client.get(url, params=params)

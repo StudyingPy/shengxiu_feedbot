@@ -23,6 +23,7 @@ import re
 import shutil
 import tempfile
 import time
+import unicodedata
 import uuid
 import zipfile
 from collections import deque
@@ -579,6 +580,7 @@ class _SearchState:
     expanded: bool                   # False=10 条，True=全部 25 条
     created_at: float
     force_r2: bool = False           # admin --r2 创建时携带，回调点开/打开时透传到 _eh_run_with_mode
+    creator_match: str | None = None  # /jm 命中 EH artist/group 时展示的校验线索
     # 当前消息正显示的 ptoken（仅 L2/L3 有），切层/翻页时必须失效掉，
     # 防止晚到的 size prefetch 把按钮覆盖回旧详情卡。
     # see _search_invalidate_active_ptoken / _make_pending_for_item
@@ -4247,8 +4249,13 @@ def _render_search_message(
     items = state.page.items[:visible]
     host_label = _html_link(state.host, f"https://{state.host}/")
 
+    validation = (
+        f"✅ 作者/社团匹配：{_html_escape(state.creator_match)}\n"
+        if state.creator_match else ""
+    )
     head = (
         f"🔍 <b>{_html_escape(state.keyword)}</b> · {host_label}\n"
+        f"{validation}"
         f"共 {state.page.total_count:,} 条，本页显示 {len(items)} / {len(state.page.items)}\n"
     )
     lines = [head]
@@ -4292,6 +4299,57 @@ def _render_search_message(
     return text, InlineKeyboardMarkup(rows)
 
 
+def _creator_key(value: str) -> str:
+    """把 JM/EH 创作者名规整成可比对 key；保留 CJK，只折叠宽度、标点和空白。"""
+    value = unicodedata.normalize("NFKC", value).casefold()
+    return re.sub(r"[\W_]+", "", value)
+
+
+def _creator_names_match(left: str, right: str) -> bool:
+    left_key = _creator_key(left)
+    right_key = _creator_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    # 允许 `circle name` / `circle-name doujin` 这类附加说明，但太短的名字只做
+    # 精确匹配，避免 `ai`、`mei` 等常见短串造成大量误判。
+    return min(len(left_key), len(right_key)) >= 4 and (
+        left_key in right_key or right_key in left_key
+    )
+
+
+def _prioritize_creator_matches(
+    page: SearchResultPage, creator_hints: list[str],
+) -> str | None:
+    """把 JM 作者/社团命中的 EH 结果前置，并返回首个命中线索。"""
+    matched: list = []
+    unmatched: list = []
+    first_match: str | None = None
+    for item in page.items:
+        item_match: str | None = None
+        for tag in item.tags:
+            if ":" not in tag:
+                continue
+            namespace, value = tag.split(":", 1)
+            if namespace not in ("artist", "group"):
+                continue
+            for hint in creator_hints:
+                if _creator_names_match(hint, value):
+                    item_match = hint
+                    break
+            if item_match:
+                break
+        if item_match:
+            matched.append(item)
+            first_match = first_match or item_match
+        else:
+            unmatched.append(item)
+    if matched:
+        page.items[:] = [*matched, *unmatched]
+    return first_match
+
+
 async def _run_ehsearch_landing(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -4300,6 +4358,8 @@ async def _run_ehsearch_landing(
     keyword: str,
     force_r2: bool,
     log_keyword: str | None = None,
+    fallback_keywords: list[str] | None = None,
+    creator_hints: list[str] | None = None,
 ) -> None:
     """跑一次搜索 + 渲染列表 + 写 stats。/ehsearch 与 /jm 共用尾部。
 
@@ -4309,27 +4369,81 @@ async def _run_ehsearch_landing(
 
     `log_keyword` 用于 stats 入库的 ref_id；不传则用 keyword 本身。/jm 流程里
     传禁漫号能让 /stats 直接看到原始入口而非清洗后的关键词。
+
+    `fallback_keywords` 仅在前一个关键词零结果时逐个尝试；普通 `/ehsearch`
+    不传，因此仍然只有一次请求。命中后 state 保存实际命中的关键词，翻页继续
+    沿用它，不会重新跑候选链。
+
+    `creator_hints` 来自 JM 作者字段及标题社团前缀。有线索时，未匹配 EH
+    `artist:` / `group:` 的非空结果先暂存，并继续尝试下一标题候选；全部候选
+    都未校验成功时仍回退到第一组非空结果，避免元数据缺失造成误杀。
     """
     _, registry, _, _, _ = _ctx(context)
 
-    try:
-        page = await _ehsearch_dispatch(registry, keyword)
-    except EHSearchAuthError as e:
-        await placeholder.edit_text(f"⚠️ 搜索失败（认证）：{e}")
-        return
-    except EHSearchBlockedError as e:
-        await placeholder.edit_text(f"⚠️ {e}\n稍后再试。")
-        return
-    except EHSearchError as e:
-        await placeholder.edit_text(f"⚠️ 搜索失败：{e}")
-        return
-    except Exception as e:
-        logger.exception(f"ehsearch {keyword!r} unexpected error")
-        await placeholder.edit_text(f"⚠️ 搜索失败：{e}")
-        return
+    requested_keyword = keyword
+    search_keywords = list(dict.fromkeys([keyword, *(fallback_keywords or [])]))
+    page: SearchResultPage | None = None
+    creator_match: str | None = None
+    first_unverified: tuple[SearchResultPage, str] | None = None
+    for attempt, candidate in enumerate(search_keywords):
+        if attempt:
+            try:
+                lead = "完整标题未命中，尝试" if attempt == 1 else "继续尝试"
+                await placeholder.edit_text(
+                    f"🔍 {lead} “{candidate}” ..."
+                )
+            except Exception:
+                logger.debug("ehsearch fallback placeholder edit failed; continuing")
+        try:
+            page = await _ehsearch_dispatch(registry, candidate)
+        except EHSearchAuthError as e:
+            if first_unverified is not None:
+                page, keyword = first_unverified
+                creator_match = None
+                break
+            await placeholder.edit_text(f"⚠️ 搜索失败（认证）：{e}")
+            return
+        except EHSearchBlockedError as e:
+            if first_unverified is not None:
+                page, keyword = first_unverified
+                creator_match = None
+                break
+            await placeholder.edit_text(f"⚠️ {e}\n稍后再试。")
+            return
+        except EHSearchError as e:
+            if first_unverified is not None:
+                page, keyword = first_unverified
+                creator_match = None
+                break
+            await placeholder.edit_text(f"⚠️ 搜索失败：{e}")
+            return
+        except Exception as e:
+            logger.exception(f"ehsearch {candidate!r} unexpected error")
+            if first_unverified is not None:
+                page, keyword = first_unverified
+                creator_match = None
+                break
+            await placeholder.edit_text(f"⚠️ 搜索失败：{e}")
+            return
+        if not page.items:
+            continue
+        creator_match = _prioritize_creator_matches(page, creator_hints or [])
+        if not creator_hints or creator_match:
+            keyword = candidate
+            break
+        if first_unverified is None:
+            first_unverified = (page, candidate)
+        page = None
 
-    if not page.items:
-        await placeholder.edit_text(f"🔍 “{keyword}” 未找到结果")
+    if (page is None or not page.items) and first_unverified is not None:
+        page, keyword = first_unverified
+
+    if page is None or not page.items:
+        tried = search_keywords[1:]
+        suffix = f"\n已尝试拆分：{' / '.join(tried)}" if tried else ""
+        await placeholder.edit_text(
+            f"🔍 “{requested_keyword}” 未找到结果{suffix}"
+        )
         return
 
     _gc_pending()
@@ -4344,6 +4458,7 @@ async def _run_ehsearch_landing(
         expanded=False,
         created_at=time.time(),
         force_r2=force_r2,
+        creator_match=creator_match,
     )
     _SEARCH_STATES[seid] = state
 
@@ -4397,12 +4512,11 @@ async def cmd_ehsearch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # /jm —— 禁漫号 → 标题 → /ehsearch
 # ---------------------------------------------------------------------------
 #
-# 唯一动线：用户给一个禁漫号 → 拉 JM 标题 → 用 clean_jm_title 清洗 → 调 ehsearch
+# 唯一动线：用户给一个禁漫号 → 拉 JM 标题 → 生成由完整到分段的搜索词 → 调 ehsearch
 # 复用同款列表 UI。本命令本身不下载、不发图，只是把"禁漫号"翻译成"EH 关键词"。
 #
-# 失败兜底：清洗后关键词为空时退回原标题；ehsearch 0 结果时尾部追加一行 hint
-# 提示用户用 /ehsearch 手动微调（在 _run_ehsearch_landing 里用 keyword 文案
-# 就够，hint 由 cmd_jm 自己接力一条消息——不强行塞 placeholder）。
+# 搜索回退：先搜清洗后的完整标题；零结果或作者/社团未匹配时，再尝试副标题
+# 和稳定短锚点；所有校验都失败时仍保留第一组非空结果。
 
 _JM_ID_RE = re.compile(r"^\d{1,8}$")
 
@@ -4443,10 +4557,18 @@ async def cmd_jm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     placeholder = await update.message.reply_text(f"🔍 解析禁漫号 {jm_id} ...")
 
     # 延迟 import 避免在没启用 jm 时还要求装 jmcomic
-    from ...provider.jm import JMError, JMNotFoundError, clean_jm_title, fetch_jm_title
+    from ...provider.jm import (
+        JMError,
+        JMNotFoundError,
+        fetch_jm_metadata,
+        jm_creator_hints,
+        jm_search_candidates,
+    )
 
     try:
-        raw_title = await fetch_jm_title(jm_id, timeout=float(config.collectors.jm.timeout))
+        metadata = await fetch_jm_metadata(
+            jm_id, timeout=float(config.collectors.jm.timeout),
+        )
     except JMNotFoundError:
         await placeholder.edit_text(f"⚠️ 禁漫号 {jm_id} 不存在")
         return
@@ -4458,20 +4580,21 @@ async def cmd_jm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await placeholder.edit_text(f"⚠️ 禁漫解析失败：{e}")
         return
 
-    cleaned = clean_jm_title(raw_title)
-    keyword = cleaned or raw_title  # 清洗结果空就退回原标题
-    if not keyword.strip():
+    raw_title = metadata.title
+    search_keywords = jm_search_candidates(raw_title)
+    if not search_keywords:
         await placeholder.edit_text(
             f"⚠️ 禁漫号 {jm_id} 标题为空，无法搜索"
         )
         return
+    keyword = search_keywords[0]
 
     # 二段占位：让用户看到清洗后的关键词，方便排错
     try:
         await placeholder.edit_text(f"🔍 搜索 “{keyword}” ...")
     except Exception:
         # edit 失败（极端：消息被删等）走 landing 也能继续，不致命
-        logger.debug(f"/jm placeholder edit failed before search; continuing")
+        logger.debug("/jm placeholder edit failed before search; continuing")
 
     await _run_ehsearch_landing(
         update, context,
@@ -4479,6 +4602,8 @@ async def cmd_jm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyword=keyword,
         force_r2=force_r2,
         log_keyword=f"jm:{jm_id}",  # /stats 里能区分入口
+        fallback_keywords=search_keywords[1:],
+        creator_hints=jm_creator_hints(raw_title, metadata.authors),
     )
 
 

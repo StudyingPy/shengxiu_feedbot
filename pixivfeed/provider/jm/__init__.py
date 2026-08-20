@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import dataclass
+
+from pykakasi import kakasi
 
 from ...utils import logger
 
@@ -22,6 +25,14 @@ class JMError(Exception):
 
 class JMNotFoundError(JMError):
     """禁漫号不存在（404 / 已删除 / 已下架）。"""
+
+
+@dataclass(frozen=True)
+class JMAlbumMetadata:
+    """`/jm` 搜索所需的最小专辑元数据。"""
+
+    title: str
+    authors: tuple[str, ...]
 
 
 # 可调阈值：clean_jm_title 截断长度。EH 搜索框对超长 query 命中率会变差。
@@ -35,6 +46,16 @@ _TITLE_NOISE = (
     "汉化版", "漢化版", "中文", "中國翻譯", "中国翻译",
 )
 
+# 适合把作品名和副标题拆开的装饰分隔符。它们在日文标题中常用于
+# `主标题 ～副标题～`，比普通空格更能稳定地表示语义边界。
+_TITLE_SECTION_RE = re.compile(r"[~～〜|｜]+")
+
+# 副标题中常用的强分隔符。JM 与 EH 的标题可能在它们后方出现假名、异体字或
+# 录入差异；保留分隔符前的短语通常更适合作为最后一级搜索锚点。
+_TITLE_ANCHOR_RE = re.compile(r"[○●◎◇◆・:：]")
+_JAPANESE_NAME_RE = re.compile(r"[ぁ-んァ-ヶ一-龯々國]")
+_KAKASI = kakasi()
+
 
 async def fetch_jm_title(jm_id: str, *, timeout: float = 20.0) -> str:
     """异步拉一个禁漫号对应作品的原始标题。
@@ -47,16 +68,23 @@ async def fetch_jm_title(jm_id: str, *, timeout: float = 20.0) -> str:
     - 网络重试全失败 / 其它库内异常 → `JMError`
     - asyncio.TimeoutError → `JMError("请求超时")`
     """
+    return (await fetch_jm_metadata(jm_id, timeout=timeout)).title
+
+
+async def fetch_jm_metadata(
+    jm_id: str, *, timeout: float = 20.0,
+) -> JMAlbumMetadata:
+    """异步拉取标题与作者列表；超时及异常语义与 `fetch_jm_title` 一致。"""
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_sync_fetch_title, jm_id),
+            asyncio.to_thread(_sync_fetch_metadata, jm_id),
             timeout=timeout,
         )
     except asyncio.TimeoutError as e:
         raise JMError(f"jm 请求超时（>{timeout:.0f}s）") from e
 
 
-def _sync_fetch_title(jm_id: str) -> str:
+def _sync_fetch_metadata(jm_id: str) -> JMAlbumMetadata:
     """同步实现，跑在 to_thread 里。jmcomic 的 import 也放在这里——
     库本身有 import 副作用（loguru 配置等），延后到第一次调用避免影响 bot 启动。
     """
@@ -84,7 +112,12 @@ def _sync_fetch_title(jm_id: str) -> str:
     title = (getattr(album, "title", "") or "").strip()
     if not title:
         raise JMError(f"禁漫号 {jm_id} 返回了空标题")
-    return title
+    authors = tuple(
+        value
+        for author in (getattr(album, "authors", None) or [])
+        if (value := str(author).strip())
+    )
+    return JMAlbumMetadata(title=title, authors=authors)
 
 
 def clean_jm_title(title: str, *, max_len: int = _TITLE_MAX_LEN) -> str:
@@ -121,6 +154,12 @@ def clean_jm_title(title: str, *, max_len: int = _TITLE_MAX_LEN) -> str:
         if s == before:
             break
 
+    # JM 偶尔会返回被截断的元数据尾缀（例如 `[中國翻譯`）。成对括号已经在
+    # 上面移除；这里仅清掉从最后一个未闭合左括号开始的尾部，避免留下孤立 `[`。
+    orphan_suffix = re.search(r"\s*[\[【(（〈《][^\]】)）〉》]*$", s)
+    if orphan_suffix and orphan_suffix.start() > 0:
+        s = s[:orphan_suffix.start()]
+
     # 2. 噪声关键词
     for kw in _TITLE_NOISE:
         s = s.replace(kw, " ")
@@ -134,9 +173,93 @@ def clean_jm_title(title: str, *, max_len: int = _TITLE_MAX_LEN) -> str:
     return s
 
 
+def jm_search_candidates(title: str, *, max_len: int = _TITLE_MAX_LEN) -> list[str]:
+    """生成由精确到宽松的 EH 搜索词，供 `/jm` 零结果时逐级回退。
+
+    顺序为：清洗后的完整标题、按标题装饰符切出的较长片段、片段中强分隔符
+    前的稳定锚点。候选会去重且最多返回 4 个，避免一个 JM 查询产生过多站点请求。
+    """
+    cleaned = clean_jm_title(title, max_len=max_len)
+    if not cleaned:
+        cleaned = re.sub(r"\s+", " ", title).strip()[:max_len].rstrip()
+    if not cleaned:
+        return []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str, *, primary: bool = False) -> None:
+        value = value.strip(" \t\r\n-—–_~～〜|｜[]【】()（）〈〉《》")
+        value = re.sub(r"\s+", " ", value).strip()
+        key = re.sub(r"[\W_]+", "", value.casefold())
+        min_len = 2 if primary else 4
+        if (
+            len(key) < min_len
+            or key.isdecimal()
+            or key in seen
+            or len(candidates) >= 4
+        ):
+            return
+        seen.add(key)
+        candidates.append(value[:max_len].rstrip())
+
+    _add(cleaned, primary=True)
+    sections = [part.strip() for part in _TITLE_SECTION_RE.split(cleaned)]
+    # 较长片段往往是有辨识度的副标题；逐片段紧跟它的短锚点，能尽早命中。
+    for section in sorted(sections, key=len, reverse=True):
+        _add(section)
+        anchor = _TITLE_ANCHOR_RE.split(section, maxsplit=1)[0]
+        if anchor != section:
+            _add(anchor)
+
+    return candidates
+
+
+def jm_creator_hints(title: str, authors: tuple[str, ...] = ()) -> list[str]:
+    """合并 JM 作者字段与标题开头的 `[社团 (作者)]` 线索。
+
+    JM 没有独立的社团字段，且 `authors` 偶尔不完整；标题前缀只作为补充线索，
+    不承担硬过滤。返回值保持原文显示、按规范化后的大小写和标点去重。
+    """
+    values = [*authors]
+    if match := re.match(r"^\s*[\[【]([^\]】]+)[\]】]", title):
+        prefix = match.group(1).strip()
+        nested = re.findall(r"[（(]([^）)]+)[）)]", prefix)
+        outer = re.sub(r"[（(][^）)]*[）)]", " ", prefix)
+        values.extend([outer, *nested])
+
+    hints: list[str] = []
+    seen: set[str] = set()
+
+    def _add_hint(value: str) -> None:
+        key = re.sub(r"[\W_]+", "", value.casefold())
+        if len(key) < 2 or key in seen:
+            return
+        seen.add(key)
+        hints.append(value)
+
+    for value in values:
+        for part in re.split(r"\s*(?:/|／|,|，|&|＆|×)\s*", value):
+            part = re.sub(r"\s+", " ", part).strip()
+            _add_hint(part)
+            if _JAPANESE_NAME_RE.search(part):
+                romanized = "".join(
+                    token["hepburn"] for token in _KAKASI.convert(part)
+                ).casefold()
+                # EH 新标签仅接受 ASCII 字母、数字、连字符、句点与空格。
+                romanized = re.sub(r"[^a-z0-9. -]+", "", romanized)
+                romanized = re.sub(r"\s+", " ", romanized).strip()
+                _add_hint(romanized)
+    return hints
+
+
 __all__ = [
     "JMError",
     "JMNotFoundError",
+    "JMAlbumMetadata",
     "fetch_jm_title",
+    "fetch_jm_metadata",
     "clean_jm_title",
+    "jm_search_candidates",
+    "jm_creator_hints",
 ]
