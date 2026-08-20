@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.12.3 — 2026-08-21
 
 ### 优化
+- **指示性来源文字现在可以直接打开真实原作**。EH/ExHentai 详情卡中的站点名、`/ehsearch` 的站点名与每条作品标题，以及 Pixiv、nhentai、EH/ExHentai 归档 ZIP caption 中原有的 `provider id` 显示文字均改为 Telegram HTML 超链接；视觉文案保持不变，点击会进入规范作品地址。Telegra.ph 最终 URL 继续明文显示，下载进度和内部临时地址不加链接。来源地址与 HTML 属性转义集中到共享 helper，避免标题中的 `&`、`<` 或引号破坏整条消息。
 - **`/archive` 的文件交付与直发图片流程对齐**。EH/ExHentai 从按钮进入后，zip 现在回复用户原始命令，而不是回复 bot 自己的进度消息；发送成功后清理临时进度消息，减少一条无意义的“已发送”残留。`/ehsearch` 没有独立原始消息的场景仍保留完成态，避免删掉搜索卡片。
 - **本地打包不再阻塞事件循环**。逐文件写入 zip 改到工作线程执行，GB 级图片写入期间 bot 仍能处理其它按钮、任务与进度心跳。归档选单同时说明“网页模式本地打包 / 归档模式直取站点 ZIP”，让四种来源的差别更明确。
 
@@ -12,6 +13,8 @@
 ### 改动文件
 - `pixivfeed/channel/telegram/handlers.py`
 - `tests/test_archive_delivery.py`
+- `AGENTS.md`
+- `pyproject.toml`：版本 0.12.2 → 0.12.3
 
 ## v0.12.2 — 2026-08-08
 
