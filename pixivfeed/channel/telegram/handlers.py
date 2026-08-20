@@ -3114,12 +3114,16 @@ async def _archive_one_ref_run(
                              provider=ref.provider, ref_id=ref.id, status="failed")
             return
 
-        await _zip_and_send(
+        delivered = await _zip_and_send(
             update, context, progress,
             files=local_paths,
             stem=_safe_zip_name(title) or _safe_zip_name(f"{ref.provider}_{ref.id}"),
             caption=f"{title}\n来源：{ref.provider} {ref.id}",
         )
+        if not delivered:
+            await _log_usage(context, update, kind=KIND_ARCHIVE_CMD,
+                             provider=ref.provider, ref_id=ref.id, status="failed")
+            return
         total_bytes = 0
         for p in local_paths:
             try:
@@ -3209,7 +3213,7 @@ async def _eh_offer_archive_modes_on_placeholder(
         pages=gallery.page_count,
         tags=gallery.tags,
         ehtagdb=_get_ehtagdb(context),
-        footer_prompt="选择下载模式（产出压缩包）：",
+        footer_prompt="选择压缩包来源（网页模式会本地打包，归档模式直接下载站点 ZIP）：",
     )
     # 用 eha: 前缀区分回调
     keyboard = _make_eh_keyboard(token, prefix="eha")
@@ -3232,6 +3236,7 @@ async def _eh_archive_with_mode(
     placeholder,
     user_id: int,
     chat_id: int | None = None,
+    reply_to_message_id: int | None = None,
 ) -> None:
     """eh/ex 选定模式后产出 zip：
     - archive_* 模式：直接走 archiver.php 拿 zip 直链下载并送回
@@ -3398,11 +3403,15 @@ async def _eh_archive_with_mode(
                         else:
                             assert last_err is not None
                             raise last_err
-                await _send_zip_file(
+                delivered = await _send_zip_file(
                     context, placeholder.chat.id, zip_path, progress,
                     caption=f"{gallery_meta.title}\n来源：{ref.provider} {ref.id}\n模式：{mode.label_zh}",
-                    reply_to=placeholder.message_id,
+                    reply_to=reply_to_message_id or placeholder.message_id,
+                    cleanup_progress=reply_to_message_id is not None,
                 )
+                if not delivered:
+                    await _emit_usage(status="failed", gp=gp_cost)
+                    return
                 # 成功：记录 GP + 实际 zip 大小
                 try:
                     actual_size = zip_path.stat().st_size
@@ -3423,14 +3432,18 @@ async def _eh_archive_with_mode(
                 await progress.finish("⚠️ 没有可打包的图片")
                 await _emit_usage(status="failed")
                 return
-            await _zip_and_send_to_chat(
+            delivered = await _zip_and_send_to_chat(
                 context, placeholder.chat.id, progress,
                 files=local_paths,
                 stem=_safe_zip_name(f"{gallery.title}_{mode.value}")
                     or f"{ref.provider}_{gid}_{token}_{mode.value}",
                 caption=f"{gallery.title}\n来源：{ref.provider} {ref.id}\n模式：{mode.label_zh}",
-                reply_to=placeholder.message_id,
+                reply_to=reply_to_message_id or placeholder.message_id,
+                cleanup_progress=reply_to_message_id is not None,
             )
+            if not delivered:
+                await _emit_usage(status="failed", gp=gp_cost)
+                return
             total_bytes = 0
             for p in local_paths:
                 try:
@@ -3487,12 +3500,13 @@ async def _zip_and_send(
     files: list[Path],
     stem: str,
     caption: str,
-) -> None:
+) -> bool:
     chat_id = update.effective_chat.id
     reply_to = update.effective_message.message_id
-    await _zip_and_send_to_chat(
+    return await _zip_and_send_to_chat(
         context, chat_id, progress,
         files=files, stem=stem, caption=caption, reply_to=reply_to,
+        cleanup_progress=True,
     )
 
 
@@ -3505,7 +3519,8 @@ async def _zip_and_send_to_chat(
     stem: str,
     caption: str,
     reply_to: int | None,
-) -> None:
+    cleanup_progress: bool = False,
+) -> bool:
     """把 files 打成临时 zip 并发回给 chat。"""
     tmpdir = Path(tempfile.mkdtemp(prefix="archive_zip_"))
     zip_path = tmpdir / f"{stem}.zip"
@@ -3515,11 +3530,14 @@ async def _zip_and_send_to_chat(
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
             for src in files:
                 arcname = src.name
-                zf.write(src, arcname=arcname)
+                # 大图写入 zip 可能持续数秒；移出事件循环，避免期间 bot 的其它
+                # callback / progress 心跳一起卡住。逐文件 await 仍保留取消点和计数。
+                await asyncio.to_thread(zf.write, src, arcname=arcname)
                 await ctr.tick()
-        await _send_zip_file(
+        return await _send_zip_file(
             context, chat_id, zip_path, progress,
             caption=caption, reply_to=reply_to,
+            cleanup_progress=cleanup_progress,
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -3533,7 +3551,8 @@ async def _send_zip_file(
     *,
     caption: str,
     reply_to: int | None,
-) -> None:
+    cleanup_progress: bool = False,
+) -> bool:
     size = zip_path.stat().st_size
     config: Config = context.bot_data["config"]
     using_local = bool(config.telegram.base_url) and config.telegram.local_mode
@@ -3544,7 +3563,7 @@ async def _send_zip_file(
             + ("（已配置本地 Bot API + local_mode）" if using_local
                else "（未启用本地 Bot API local_mode；上限 50MB）")
         )
-        return
+        return False
 
     await progress.status(f"⏳ 上传 zip ({fmt_bytes(size)})...")
     # 进入上传阶段：按你的要求，上传过程不可取消（PTB 把 fd 交给 httpx 后 cancel
@@ -3601,7 +3620,7 @@ async def _send_zip_file(
                     f"⚠️ 上传 zip 被 TG 限频（已重试 {upload_attempts} 次）：{e}\n"
                     "请稍后手动重发。"
                 )
-                return
+                return False
             logger.warning(
                 f"send_document hit RetryAfter (attempt {upload_attempts}): "
                 f"waiting {wait_s}s for {zip_path.name}"
@@ -3625,10 +3644,10 @@ async def _send_zip_file(
                     f"⏳ 上传超时（{fmt_bytes(size)}）。本地 Bot API 仍在向 TG 主网传输，"
                     "请稍候 1-2 分钟查看是否已收到文件；如未收到再重试。"
                 )
-                return
+                return False
             logger.exception("send_document failed")
             await progress.finish(f"⚠️ 发送 zip 失败：{e}")
-            return
+            return False
         finally:
             stop_heartbeat.set()
             try:
@@ -3636,10 +3655,18 @@ async def _send_zip_file(
             except Exception:
                 pass
 
+    if cleanup_progress:
+        try:
+            await progress._msg.delete()
+            return True
+        except Exception:
+            # 删除失败不影响交付；退回完成态，避免占位消息永远停在“上传中”。
+            pass
     try:
         await progress.finish(f"✅ 已发送 {zip_path.name} ({fmt_bytes(size)})")
     except Exception:
         pass
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -3697,6 +3724,10 @@ async def handle_callback_archive(update: Update, context: ContextTypes.DEFAULT_
         await _eh_archive_with_mode(
             context, pending.ref, mode=mode, placeholder=placeholder,
             user_id=pending.user_id, chat_id=pending.chat_id,
+            reply_to_message_id=(
+                pending.orig_msg_id
+                if pending.orig_chat_id == pending.chat_id else None
+            ),
         )
 
     await _enqueue(
@@ -4429,7 +4460,7 @@ def _render_archive_menu(
         pages=it.pages,
         tags=it.tags,
         ehtagdb=ehtagdb,
-        footer_prompt="选择下载模式（产出压缩包）：",
+        footer_prompt="选择压缩包来源（网页模式会本地打包，归档模式直接下载站点 ZIP）：",
     )
     rows = _eh_mode_buttons(ptoken, prefix="eha", sizes=sizes)
     rows.append([InlineKeyboardButton("⬅ 返回详情", callback_data=f"ehs_back2det:{seid}:{idx}")])

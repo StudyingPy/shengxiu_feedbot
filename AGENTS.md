@@ -146,6 +146,13 @@ subject：
 
 新增异常或新增 `except` 块前花 30 秒 grep 一下，能避免一整轮"用户测试失败 → 你查 log → 发现是异常被吞了"的循环。
 
+## Telegram 文件交付约束
+
+- 按钮回调里的 `update.effective_message` 是 bot 的详情卡/进度消息，不是用户原消息。文件或图片要优先 reply `_Pending.orig_msg_id`（且确认 `orig_chat_id` 与目标 chat 一致）；否则清理 placeholder 后会留下悬空回复，或让产物缩进到 bot 自己的消息下。
+- 发送 helper 必须显式返回交付是否成功；上层只有收到成功结果后才能写 `usage_log status=ok`。超过大小上限、上传超时、TG 限频耗尽和 API 异常都不能只 edit 错误文案后静默返回 `None`。
+- 产物已回复用户原消息时，成功后可删除临时进度消息；搜索卡片等没有独立原始消息的入口应保留完成态，不能把导航上下文一起删掉。
+- GB 级文件的 zip/复制/哈希等同步文件 I/O 要移到 `asyncio.to_thread`，不要在事件循环里直接执行。
+
 ## 何时主动建议切版本
 
 主动开口的几个时机：
