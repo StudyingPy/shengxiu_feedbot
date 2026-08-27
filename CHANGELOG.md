@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.13.1 — 2026-08-27
+
+### 新增
+- **`/archive` 支持 Pixiv 小说链接**。发送单个 UTF-8 Markdown 文件，包含小说元数据、简介和正文；`[chapter:]`、`[newpage]`、`[[jumpuri:]]` 及图片标记会转换为 Markdown。
+
+### 改动文件
+- `pixivfeed/channel/telegram/handlers.py`
+- `pixivfeed/provider/pixiv/novel_publisher.py`
+- `tests/test_archive_delivery.py`
+- `pyproject.toml`
+
 ## v0.13.0 — 2026-08-21
 
 ### 新增

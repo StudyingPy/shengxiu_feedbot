@@ -238,6 +238,77 @@ async def publish_novel(
     )
 
 
+async def fetch_novel_markdown(provider, nid: str) -> tuple[NovelWork, str]:
+    """拉取 Pixiv novel 并转换为可直接保存的 Markdown 文本。
+
+    归档下载不经过 Telegra.ph，也不下载图片；小说正文里的 Pixiv 图片标记
+    会转换成远程图片链接（或对应作品链接），便于用户在本地 Markdown 阅读器中
+    继续查看正文。
+    """
+    async with PixivAPI(provider.phpsessid, provider.timeout) as api:
+        body = await api.fetch_novel(nid)
+    novel = parse_novel_meta(body)
+    embedded_urls: dict[str, str] = {}
+    for image_id, info in (body.get("textEmbeddedImages") or {}).items():
+        urls = info.get("urls") or {}
+        url = urls.get("original") or urls.get("1200x1200")
+        if url:
+            embedded_urls[str(image_id)] = str(url)
+    return novel, novel_to_markdown(novel, embedded_urls)
+
+
+def novel_to_markdown(
+    novel: NovelWork,
+    embedded_image_urls: dict[str, str] | None = None,
+) -> str:
+    """把 Pixiv 小说元数据和正文标记转换为 UTF-8 Markdown 文本。"""
+    embedded_image_urls = embedded_image_urls or {}
+    lines = [
+        f"# {novel.title or f'Pixiv novel {novel.nid}'}",
+        "",
+        f"- 作者：{novel.author or '未知'}",
+        f"- 原作：[Pixiv 小说](https://www.pixiv.net/novel/show.php?id={novel.nid})",
+    ]
+    if novel.create_date:
+        lines.append(f"- 发布日期：{novel.create_date}")
+    if novel.tags:
+        lines.append(f"- 标签：{' '.join(f'`{tag}`' for tag in novel.tags)}")
+    if novel.series_title:
+        lines.append(f"- 系列：{novel.series_title}")
+    if novel.description:
+        lines.extend(["", "## 简介", "", novel.description])
+    lines.extend(["", "## 正文", ""])
+
+    text = novel.content or ""
+    text = re.sub(
+        r"\[chapter:([^\]\n]+)\]",
+        lambda m: f"\n\n## {m.group(1).strip()}\n\n",
+        text,
+    )
+    text = re.sub(r"\[newpage\]", "\n\n---\n\n", text)
+    text = re.sub(
+        r"\[\[jumpuri:([^>]+)>([^\]]+)\]\]",
+        lambda m: f"[{m.group(1).strip()}]({m.group(2).strip()})",
+        text,
+    )
+
+    def _uploaded_repl(match: re.Match) -> str:
+        image_id = match.group(1)
+        url = embedded_image_urls.get(image_id)
+        return f"![图片 {image_id}]({url})" if url else f"*[未能加载图片 uploadedimage:{image_id}]*"
+
+    text = re.sub(r"\[uploadedimage:(\d+)\]", _uploaded_repl, text)
+    text = re.sub(
+        r"\[pixivimage:(\d+)\]",
+        lambda m: (
+            f"[Pixiv 插图 {m.group(1)}]"
+            f"(https://www.pixiv.net/artworks/{m.group(1)})"
+        ),
+        text,
+    )
+    return "\n".join(lines) + text.strip() + "\n"
+
+
 def _split_novel_text(content: str, limit: int = NOVEL_TEXT_SOFT_LIMIT) -> list[str]:
     """按正文字符数把 Pixiv 小说拆成多段。
 
@@ -488,4 +559,4 @@ def _render_novel_content(content: str, embedded_images: dict[str, dict]) -> Nod
     return html_to_nodes_safe(full_html)
 
 
-__all__ = ["publish_novel"]
+__all__ = ["fetch_novel_markdown", "novel_to_markdown", "publish_novel"]

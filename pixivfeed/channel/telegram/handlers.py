@@ -75,7 +75,7 @@ from ...provider.pixiv import (
     PixivNotFoundError,
     PixivProvider,
 )
-from ...provider.pixiv.novel_publisher import publish_novel
+from ...provider.pixiv.novel_publisher import fetch_novel_markdown, publish_novel
 from ...publisher import TelegraphPublisher
 from ...storage import (
     KIND_ARCHIVE_CMD,
@@ -3021,7 +3021,7 @@ def _extract_zip_images(zip_path: Path, dest_dir: Path) -> list[Path]:
 #   - eh / ex 链接：弹四模式按钮（与原 message handler 行为一致），用户选定模式
 #                   后产出 zip 直接 sendDocument。同时保留缓存（沿用原下载路径）。
 #   - pixiv illust / nhentai：把图片打包为临时 zip 直接 sendDocument。
-#   - pixiv novel：报错（small text only，不打包意义不大）。
+#   - pixiv novel：导出单个 UTF-8 Markdown 文件。
 #
 # 文件 > TG_DOCUMENT_LIMIT (50MB) 且未配置本地 Bot API 时直接报错。
 
@@ -3052,12 +3052,6 @@ async def _archive_one_ref(
     # eh/ex：复用 _eh_offer_modes 流程，但回调走 archive 通道（按按钮后才入队）
     if ref.provider in ("e-hentai.org", "exhentai.org"):
         await _eh_offer_modes_for_archive(update, context, ref)
-        return
-
-    if ref.provider == "pixiv" and ref.kind == "novel":
-        await update.message.reply_text(
-            "⚠️ /archive 不支持 pixiv novel（纯文本无意义）"
-        )
         return
 
     placeholder = await update.message.reply_text(
@@ -3093,6 +3087,39 @@ async def _archive_one_ref_run(
         provider = registry.find_by_name(ref.provider)
         if provider is None:
             await progress.finish(f"⚠️ Provider {ref.provider!r} 未启用")
+            return
+
+        if ref.provider == "pixiv" and ref.kind == "novel":
+            await progress.status("⏳ 拉取小说并生成 Markdown...")
+            pixiv = _pixiv_provider(registry)
+            assert pixiv is not None
+            novel, markdown = await fetch_novel_markdown(pixiv, ref.id)
+            tmpdir = Path(tempfile.mkdtemp(prefix="archive_markdown_"))
+            try:
+                md_path = tmpdir / f"{_safe_zip_name(novel.title) or f'pixiv_novel_{ref.id}'}.md"
+                await asyncio.to_thread(md_path.write_text, markdown, encoding="utf-8")
+                delivered = await _send_zip_file(
+                    context,
+                    update.effective_chat.id,
+                    md_path,
+                    progress,
+                    caption=_archive_caption(novel.title, ref),
+                    reply_to=update.effective_message.message_id,
+                    cleanup_progress=True,
+                    caption_parse_mode=ParseMode.HTML,
+                    file_label="Markdown 文件",
+                )
+                if not delivered:
+                    await _log_usage(context, update, kind=KIND_ARCHIVE_CMD,
+                                     provider=ref.provider, ref_id=ref.id, status="failed")
+                    return
+                md_size = md_path.stat().st_size
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            await _log_usage(
+                context, update, kind=KIND_ARCHIVE_CMD,
+                provider=ref.provider, ref_id=ref.id, bytes_out=md_size,
+            )
             return
 
         if ref.provider == "pixiv":
@@ -3568,6 +3595,7 @@ async def _send_zip_file(
     reply_to: int | None,
     cleanup_progress: bool = False,
     caption_parse_mode: str | None = None,
+    file_label: str = "zip",
 ) -> bool:
     size = zip_path.stat().st_size
     config: Config = context.bot_data["config"]
@@ -3575,13 +3603,13 @@ async def _send_zip_file(
     limit = LOCAL_BOT_API_DOCUMENT_LIMIT if using_local else TG_DOCUMENT_LIMIT
     if size > limit:
         await progress.finish(
-            f"⚠️ 压缩包 {fmt_bytes(size)} 超过 Bot 上传上限 {fmt_bytes(limit)}"
+            f"⚠️ {file_label} {fmt_bytes(size)} 超过 Bot 上传上限 {fmt_bytes(limit)}"
             + ("（已配置本地 Bot API + local_mode）" if using_local
                else "（未启用本地 Bot API local_mode；上限 50MB）")
         )
         return False
 
-    await progress.status(f"⏳ 上传 zip ({fmt_bytes(size)})...")
+    await progress.status(f"⏳ 上传 {file_label} ({fmt_bytes(size)})...")
     # 进入上传阶段：按你的要求，上传过程不可取消（PTB 把 fd 交给 httpx 后 cancel
     # 也无法让 telegram-bot-api 停止往 TG 主网传输）。直接把按钮去掉。
     await _drop_cancel_button(progress._msg, progress)
@@ -3603,7 +3631,7 @@ async def _send_zip_file(
                     pass
                 elapsed = int(time.monotonic() - upload_t0)
                 await progress.update(
-                    f"⏳ 上传 zip ({fmt_bytes(size)})... 已 {fmt_duration(elapsed)}（本地 Bot API → TG 主网）"
+                    f"⏳ 上传 {file_label} ({fmt_bytes(size)})... 已 {fmt_duration(elapsed)}（本地 Bot API → TG 主网）"
                 )
 
         hb_task = asyncio.create_task(_heartbeat())
@@ -3634,7 +3662,7 @@ async def _send_zip_file(
             wait_s = int(getattr(e, "retry_after", 30)) + 1
             if upload_attempts >= 3:
                 await progress.finish(
-                    f"⚠️ 上传 zip 被 TG 限频（已重试 {upload_attempts} 次）：{e}\n"
+                    f"⚠️ 上传 {file_label} 被 TG 限频（已重试 {upload_attempts} 次）：{e}\n"
                     "请稍后手动重发。"
                 )
                 return False
@@ -3658,12 +3686,12 @@ async def _send_zip_file(
                     f"({type(e).__name__}: {e}); upload may still complete in background"
                 )
                 await progress.finish(
-                    f"⏳ 上传超时（{fmt_bytes(size)}）。本地 Bot API 仍在向 TG 主网传输，"
+                    f"⏳ 上传 {file_label} 超时（{fmt_bytes(size)}）。本地 Bot API 仍在向 TG 主网传输，"
                     "请稍候 1-2 分钟查看是否已收到文件；如未收到再重试。"
                 )
                 return False
             logger.exception("send_document failed")
-            await progress.finish(f"⚠️ 发送 zip 失败：{e}")
+            await progress.finish(f"⚠️ 发送 {file_label} 失败：{e}")
             return False
         finally:
             stop_heartbeat.set()

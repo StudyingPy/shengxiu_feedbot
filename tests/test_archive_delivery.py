@@ -10,6 +10,8 @@ from telegram.constants import ParseMode
 from pixivfeed.channel.telegram import handlers
 from pixivfeed.provider import ParsedRef
 from pixivfeed.provider.ehentai import SearchResultItem, SearchResultPage
+from pixivfeed.provider.pixiv.model import NovelWork
+from pixivfeed.provider.pixiv.novel_publisher import novel_to_markdown
 
 
 class _Message:
@@ -192,6 +194,33 @@ def test_archive_caption_keeps_label_and_escapes_html() -> None:
         "e-hentai.org 10/abcdef</a>"
     ) in caption
     assert caption.endswith("模式：归档 · 原图")
+
+
+def test_novel_to_markdown_converts_pixiv_markers() -> None:
+    novel = NovelWork(
+        nid="123",
+        title="测试小说",
+        author="作者",
+        user_id="7",
+        description="简介",
+        create_date="2026-08-27",
+        tags=["tag"],
+        text_length=20,
+        cover_url="",
+        content=(
+            "[chapter:第一章]\n正文 [[jumpuri:链接>https://example.com]]\n\n"
+            "[uploadedimage:9] [pixivimage:88][newpage]续篇"
+        ),
+    )
+
+    markdown = novel_to_markdown(novel, {"9": "https://img.example/9.jpg"})
+
+    assert markdown.startswith("# 测试小说\n")
+    assert "## 第一章" in markdown
+    assert "[链接](https://example.com)" in markdown
+    assert "![图片 9](https://img.example/9.jpg)" in markdown
+    assert "[Pixiv 插图 88](https://www.pixiv.net/artworks/88)" in markdown
+    assert "\n---\n" in markdown
 
 
 def test_eh_cards_and_search_results_link_visible_source_labels() -> None:
