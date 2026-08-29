@@ -225,6 +225,59 @@ async def test_guest_picker_callback_starts_selected_ref(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_guest_eh_archive_callback_preserves_archive_mode(monkeypatch):
+    token = "guest-eh-archive"
+    ref = ParsedRef(
+        provider="e-hentai.org", kind="gallery", id="123/token", raw="eh",
+    )
+    edits = []
+    pending_reply = SimpleNamespace(
+        edit_text=lambda *args, **kwargs: _record_async(edits, args, kwargs),
+    )
+    handlers._GUEST_PENDING[token] = handlers._GuestPending(
+        ref=ref, reply=pending_reply, update=SimpleNamespace(),
+        user_id=7, created_at=0,
+    )
+    queued = {}
+    called = {}
+
+    async def fake_enqueue(context, **kwargs):
+        queued.update(kwargs)
+
+    async def fake_run(update, context, ref, *, mode, placeholder, **kwargs):
+        called.update(ref=ref, mode=mode, placeholder=placeholder)
+
+    monkeypatch.setattr(handlers, "_enqueue", fake_enqueue)
+    monkeypatch.setattr(handlers, "_eh_run_with_mode", fake_run)
+    monkeypatch.setattr(handlers, "_gate_disk_space", lambda context, placeholder: _true())
+
+    class FakeQuery:
+        data = f"g:{token}:archive_resample"
+        from_user = User(id=7, first_name="tester", is_bot=False)
+        message = None
+
+        async def answer(self, *args, **kwargs):
+            return None
+
+    try:
+        await handlers._handle_guest_callback(
+            SimpleNamespace(callback_query=FakeQuery()),
+            SimpleNamespace(),
+        )
+        await queued["coro_factory"]()
+    finally:
+        handlers._GUEST_PENDING.pop(token, None)
+
+    assert called["ref"] == ref
+    assert called["mode"] is EHMode.ARCHIVE_RES
+    assert queued["category"] == "telegraph_publish"
+
+
+async def _record_async(target, args, kwargs):
+    target.append((args, kwargs))
+
+
+@pytest.mark.asyncio
 async def test_guest_pixiv_direct_edits_inline_media_with_public_url(monkeypatch, tmp_path):
     source = _message(text="@feed_bot https://www.pixiv.net/artworks/123")
 

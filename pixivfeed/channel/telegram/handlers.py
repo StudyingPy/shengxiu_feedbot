@@ -2177,11 +2177,10 @@ async def _handle_guest_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("⚠️ 未知模式", show_alert=True)
             return
         _GUEST_PENDING.pop(token, None)
-        # Guest API 只能编辑一条 inline 回复，不能把本地生成的 ZIP 作为普通
-        # sendDocument 发回聊天；归档按钮保留给用户选择，但在 Guest 中安全
-        # 回退到网页显示图（仍然不消耗 archive 配额）。
-        run_mode = EHMode.PAGE_SAMPLE if mode.is_archive else mode
-        label = mode.label_zh if not mode.is_archive else f"{mode.label_zh}（Guest 改用网页显示图）"
+        # Guest 的交付仍然是同一条 Telegraph inline 回复；归档模式只决定
+        # 后台如何从 EH/EX 获取图片（先下载并解包 archive），不等于要把 ZIP
+        # 文件作为 Telegram document 发回。因此这里必须保留用户选择的 mode。
+        label = mode.label_zh
         await query.answer(f"使用 {label}")
         try:
             await pending.reply.edit_text(f"⏳ 已收到（{label}），准备处理...")
@@ -2192,8 +2191,7 @@ async def _handle_guest_callback(update: Update, context: ContextTypes.DEFAULT_T
 
         async def _do_eh() -> None:
             await _eh_run_with_mode(
-                # archive ZIP 无法由 Guest inline API 上传，使用页面模式完成同一条回复。
-                pending.update, context, pending.ref, mode=run_mode,
+                pending.update, context, pending.ref, mode=mode,
                 placeholder=pending.reply,
             )
 
