@@ -3,21 +3,10 @@
 ## v0.14.0 — 2026-08-29
 
 ### 新增 / 变更
-- **Guest Mode 支持引用消息中的作品链接**。回复用户发送的 Pixiv、EH/EX 或 nhentai 链接并 `@bot` 时可继续创建任务；回复 Bot 自己的结果消息且当前没有新链接时保持静默。
-- **Guest Mode 多链接选择**。当前消息与引用消息合计提取到多个作品链接时，先显示选择按钮，选择后进入对应的详情和处理流程；普通 Bot 模式保持原有行为。
-- **Guest 取消回退显示“已取消”**。标准接口无法删除 Guest inline 消息时，移除按钮并编辑取消状态。
-- **补充 Guest Mode 排查提示词与项目记忆**，记录引用字段、线上日志抓取和 Guest inline 删除能力的限制。
-
-### 验证
-- 新增 Guest 引用链接提取、Bot 结果链接忽略、多链接选择按钮和回调选择测试。
-- 已完成 Python 语法编译检查与 `git diff --check`；完整 pytest 需在项目运行环境中执行。
-
-### 改动文件
-- `pixivfeed/channel/telegram/handlers.py`
-- `tests/test_guest_mode.py`
-- `docs/GUEST_DEBUG_PROMPT.md`
-- `docs/PROJECT_MEMORY.md`
-- `pyproject.toml`
+- **新增 Guest Mode**。无需将 Bot 加入群组，直接在任意支持的聊天中使用 `@bot + 链接` 即可请求处理 Pixiv、EH/EX、nhentai 等作品。
+- Guest 结果会直接显示在当前聊天中，并支持 Pixiv 单图直发、Telegra.ph，以及各来源原有的详情选项。
+- 回复用户消息中的作品链接并 `@bot` 也可以创建任务；回复 Bot 已发送的结果但没有新的作品链接时不会触发响应。
+- 一条消息或引用上下文中包含多个作品链接时，会先让用户选择要处理的作品。
 
 ## v0.13.1 — 2026-08-27
 
