@@ -36,6 +36,7 @@ from telegram import (
     InlineQueryResultArticle,
     InputMediaPhoto,
     InputTextMessageContent,
+    LinkPreviewOptions,
     Update,
 )
 from telegram.constants import ParseMode
@@ -565,6 +566,11 @@ class _Pending:
 
 
 _PENDING: dict[str, _Pending] = {}
+
+
+def _small_link_preview(url: str) -> LinkPreviewOptions:
+    """请求 Telegram 使用右侧小缩略图布局的链接预览。"""
+    return LinkPreviewOptions(url=url, prefer_small_media=True)
 
 
 class GuestReply:
@@ -1586,12 +1592,18 @@ async def _eh_run_with_mode(
                 reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
             if placeholder:
                 await placeholder.edit_text(
-                    reply, disable_web_page_preview=False, reply_markup=extras_markup,
+                    reply,
+                    link_preview_options=_small_link_preview(cached.url),
+                    reply_markup=extras_markup,
                 )
             else:
                 msg = update_or_query.effective_message if hasattr(update_or_query, "effective_message") else None
                 if msg:
-                    await msg.reply_text(reply, reply_markup=extras_markup)
+                    await msg.reply_text(
+                        reply,
+                        link_preview_options=_small_link_preview(cached.url),
+                        reply_markup=extras_markup,
+                    )
             return
 
     if placeholder is None:
@@ -1634,7 +1646,9 @@ async def _eh_run_with_mode(
                 if eff_force and cached.durable:
                     reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
                 await placeholder.edit_text(
-                    reply, disable_web_page_preview=False, reply_markup=extras_markup,
+                    reply,
+                    link_preview_options=_small_link_preview(cached.url),
+                    reply_markup=extras_markup,
                 )
                 return
             try:
@@ -1728,7 +1742,7 @@ async def _eh_run_with_mode(
     suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
     await placeholder.edit_text(
         pub.primary_url + suffix,
-        disable_web_page_preview=False,
+        link_preview_options=_small_link_preview(pub.primary_url),
         reply_markup=extras_markup,
         parse_mode=ParseMode.HTML if suffix else None,
     )
@@ -2840,9 +2854,13 @@ async def _send_via_telegraph_generic(
         if eff_force and cached.durable:
             reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
         if placeholder is not None:
-            await placeholder.edit_text(reply)
+            await placeholder.edit_text(
+                reply, link_preview_options=_small_link_preview(cached.url),
+            )
         else:
-            await update.message.reply_text(reply)
+            await update.message.reply_text(
+                reply, link_preview_options=_small_link_preview(cached.url),
+            )
         return
 
     if placeholder is None:
@@ -2904,6 +2922,7 @@ async def _send_via_telegraph_generic(
     suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
     await placeholder.edit_text(
         pub.primary_url + suffix,
+        link_preview_options=_small_link_preview(pub.primary_url),
         parse_mode=ParseMode.HTML if suffix else None,
     )
     total_bytes = 0
@@ -2956,9 +2975,13 @@ async def _send_pixiv_illust_via_telegraph(
         if eff_force and cached.durable:
             reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
         if placeholder is not None:
-            await placeholder.edit_text(reply)
+            await placeholder.edit_text(
+                reply, link_preview_options=_small_link_preview(cached.url),
+            )
         else:
-            await update.message.reply_text(reply)
+            await update.message.reply_text(
+                reply, link_preview_options=_small_link_preview(cached.url),
+            )
         return
 
     if placeholder is None:
@@ -3018,6 +3041,7 @@ async def _send_pixiv_illust_via_telegraph(
     suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
     await placeholder.edit_text(
         pub.primary_url + suffix,
+        link_preview_options=_small_link_preview(pub.primary_url),
         parse_mode=ParseMode.HTML if suffix else None,
     )
     total_bytes = 0
@@ -3051,9 +3075,13 @@ async def _send_pixiv_novel(
         if eff_force and cached.durable:
             reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
         if placeholder is not None:
-            await placeholder.edit_text(reply)
+            await placeholder.edit_text(
+                reply, link_preview_options=_small_link_preview(cached.url),
+            )
         else:
-            await update.message.reply_text(reply)
+            await update.message.reply_text(
+                reply, link_preview_options=_small_link_preview(cached.url),
+            )
         return
 
     if placeholder is None:
@@ -3099,6 +3127,7 @@ async def _send_pixiv_novel(
     suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
     await placeholder.edit_text(
         pub.primary_url + suffix,
+        link_preview_options=_small_link_preview(pub.primary_url),
         parse_mode=ParseMode.HTML if suffix else None,
     )
     await _log_usage(context, update, kind=KIND_PIXIV_NOVEL, provider="pixiv",
@@ -3655,12 +3684,17 @@ async def _process_zip_to_telegraph(
 
         suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
         if suffix:
-            # progress.finish 直接 edit_text 不支持 parse_mode；用 placeholder 兜底
+            # progress.finish 直接 edit_text 不支持 parse_mode / 预览选项；用 placeholder 兜底
             await placeholder.edit_text(
-                pub.primary_url + suffix, parse_mode=ParseMode.HTML,
+                pub.primary_url + suffix,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=_small_link_preview(pub.primary_url),
             )
         else:
-            await progress.finish(pub.primary_url)
+            await placeholder.edit_text(
+                pub.primary_url,
+                link_preview_options=_small_link_preview(pub.primary_url),
+            )
         await _log_usage(
             context, update,
             kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
