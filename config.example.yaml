@@ -18,6 +18,7 @@
 telegram:
   # Bot Token，从 @BotFather 获取。也可用环境变量 PIXIVFEED_TG_TOKEN 覆盖。
   token: "PUT_YOUR_BOT_TOKEN_HERE"
+  # 需在 @BotFather Mini App 开启 Guest Mode，才能在任意聊天中“链接 @bot”触发。
   # 可选：本地 Bot API Server 的 base URL。留空则用官方 https://api.telegram.org
   # 例如自建 telegram-bot-api 监听 127.0.0.1:8081 时填 "http://127.0.0.1:8081"
   base_url: ""

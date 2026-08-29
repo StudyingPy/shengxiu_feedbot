@@ -453,7 +453,7 @@ R2 计费（截至 2026 年）：
 
 ## 本地 Bot API
 
-Telegram 官方 Bot API 限制 `getFile` 20MB、`sendDocument` 50MB。使用 `/zip2tph`（接收用户上传的 zip）或 `/archive`（打包图集回传）时，文件大小几乎一定会超过此限制。需自建 [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) 服务以绕开限制。
+Telegram 官方 Bot API 限制 `getFile` 20MB、`sendDocument` 50MB。使用 `/zip2tph`（接收用户上传的 zip）或 `/archive`（打包图集回传）时，文件大小几乎一定会超过此限制。需自建 [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) 服务以绕开限制。Guest Mode 还要求 Bot API 10.0+；使用本地服务时请确保镜像已更新到支持该版本的构建。
 
 ### 1. 启动 telegram-bot-api 服务
 

@@ -33,7 +33,9 @@ from pathlib import Path
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
     InputMediaPhoto,
+    InputTextMessageContent,
     Update,
 )
 from telegram.constants import ParseMode
@@ -565,6 +567,67 @@ class _Pending:
 _PENDING: dict[str, _Pending] = {}
 
 
+class GuestReply:
+    """可编辑的 Guest Mode 占位消息。
+
+    Guest API 只能先用 ``answerGuestQuery`` 投递一个 inline result，后续更新
+    必须通过返回的 ``inline_message_id`` 编辑；不能调用普通 Message 的
+    ``reply_text`` / ``delete``。这个小适配器让既有 Progress、磁盘护栏和发布
+    流程继续使用 ``edit_text`` 协议，同时为后续媒体/按钮扩展保留独立句柄。
+    """
+
+    def __init__(self, bot, inline_message_id: str, source_message):
+        self._bot = bot
+        self.inline_message_id = inline_message_id
+        self.chat = source_message.chat
+        # Guest inline 消息没有普通 message_id；0 仅用于满足现有 placeholder 协议。
+        self.message_id = 0
+
+    @classmethod
+    async def create(cls, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> "GuestReply":
+        message = update.guest_message
+        if message is None or not message.guest_query_id:
+            raise ValueError("guest update is missing guest_query_id")
+        result = InlineQueryResultArticle(
+            id=uuid.uuid4().hex,
+            title="Feed Bot",
+            input_message_content=InputTextMessageContent(message_text=text),
+        )
+        sent = await context.bot.answer_guest_query(message.guest_query_id, result)
+        return cls(context.bot, sent.inline_message_id, message)
+
+    async def edit_text(self, text: str, **kwargs):
+        """兼容 ``Message.edit_text`` 的最小子集。"""
+        return await self._bot.edit_message_text(
+            inline_message_id=self.inline_message_id,
+            text=text,
+            **kwargs,
+        )
+
+    async def reply_text(self, text: str, **kwargs):
+        # 防止未来复用旧流程时意外创建第二条 guest 消息。
+        return await self.edit_text(text, **kwargs)
+
+    async def edit_media(self, media, **kwargs):
+        """后续 Pixiv 单图/缓存媒体模式使用的 inline 编辑入口。"""
+        return await self._bot.edit_message_media(
+            inline_message_id=self.inline_message_id,
+            media=media,
+            **kwargs,
+        )
+
+    async def edit_caption(self, caption: str, **kwargs):
+        return await self._bot.edit_message_caption(
+            inline_message_id=self.inline_message_id,
+            caption=caption,
+            **kwargs,
+        )
+
+    async def delete(self):
+        # Guest API 没有按 guest message 删除的接口；完成态由 edit 覆盖。
+        return True
+
+
 @dataclass
 class _SearchState:
     """/ehsearch 一次搜索的会话状态。
@@ -816,6 +879,122 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _handle_ref(update, context, ref, mode="auto", force_r2=force_r2)
 
 
+def _guest_input_text(message) -> str:
+    """拼出 Guest Mode 本次可见的输入文本。
+
+    Guest update 只携带召唤消息和（若为回复）被回复消息；不读取聊天历史。
+    链接可能在任一条消息的正文或 caption 中，按正文优先、回复其次合并。
+    """
+    chunks: list[str] = []
+    for item in (message, getattr(message, "reply_to_message", None)):
+        if item is None:
+            continue
+        value = item.text or item.caption or ""
+        if value and value not in chunks:
+            chunks.append(value)
+    return "\n".join(chunks)
+
+
+async def _guest_error(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """回答 Guest query 的错误；不回答会让客户端一直显示加载状态。"""
+    message = update.guest_message
+    if message is None or not message.guest_query_id:
+        return
+    try:
+        await context.bot.answer_guest_query(
+            message.guest_query_id,
+            InlineQueryResultArticle(
+                id=uuid.uuid4().hex,
+                title="Feed Bot",
+                input_message_content=InputTextMessageContent(message_text=text),
+            ),
+        )
+    except Exception:
+        logger.exception("answer guest error failed")
+
+
+async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Guest Mode 入口：``链接 @bot`` 或回复链接后 ``@bot``。
+
+    Guest reply 是一次性的，因此这里不走私聊详情卡和多消息直发路径：
+    Pixiv/nhentai 统一发布 Telegra.ph，EH/EX 固定使用归档 1280x 模式，
+    最终结果编辑回同一条 guest 消息。按钮与 Pixiv 直发将在此句柄上扩展。
+    """
+    message = update.guest_message
+    if message is None:
+        return
+    _, registry, *_ = _ctx(context)
+    allowlist: AllowList = context.bot_data["allowlist"]
+    if not await is_authorized(update, allowlist):
+        await _guest_error(update, context, "⚠️ 你尚未被授权使用此 Bot。")
+        return
+    await _track_user(update, context)
+
+    text = _guest_input_text(message)
+    refs = registry.extract_all_refs(text)
+    if not refs:
+        await _guest_error(update, context, "用法：在消息中附上支持的作品链接后再 @bot。")
+        return
+    if len(refs) > 1:
+        await _guest_error(update, context, "⚠️ 一次只处理一个链接，请逐个 @bot。")
+        return
+
+    ref = refs[0]
+    try:
+        placeholder = await GuestReply.create(
+            update, context, f"⏳ 已收到（{ref.provider}），准备处理...",
+        )
+    except Exception:
+        logger.exception("answer guest placeholder failed")
+        return
+    if not await _gate_disk_space(context, placeholder):
+        return
+
+    user_id = update.effective_user.id if update.effective_user else 0
+    if ref.provider == "pixiv" and ref.kind == "novel":
+        category = "telegraph_publish"
+
+        async def _do() -> None:
+            await _send_pixiv_novel(update, context, ref.id, placeholder=placeholder)
+
+    elif ref.provider == "pixiv" and ref.kind == "illust":
+        category = "telegraph_publish"
+
+        async def _do() -> None:
+            await _send_pixiv_illust_via_telegraph(
+                update, context, ref.id, placeholder=placeholder,
+            )
+
+    elif ref.provider in ("e-hentai.org", "exhentai.org"):
+        # Guest 没有模式选择卡；默认固定为免费归档 1280x，避免把用户配置里的
+        # page_sample 意外带入这个新入口。后续按钮交互可覆盖此选择。
+        category = "archive_zip"
+
+        async def _do() -> None:
+            await _eh_run_with_mode(
+                update, context, ref, mode=EHMode.ARCHIVE_RES,
+                placeholder=placeholder,
+            )
+
+    else:
+        category = "telegraph_publish"
+
+        async def _do() -> None:
+            await _send_via_telegraph_generic(
+                update, context, ref, placeholder=placeholder,
+            )
+
+    await _enqueue(
+        context,
+        category=category,
+        user_id=user_id,
+        placeholder=placeholder,
+        work_label=f"{ref.provider} 处理中...",
+        coro_factory=_do,
+        cancellable=False,
+    )
+
+
 async def cmd_pixiv_telegraph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config, registry, _, _, allowlist = _ctx(context)
     if not await is_authorized(update, allowlist):
@@ -865,6 +1044,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Feed Bot\n\n"
         "在群里/私聊发送以下站点的链接即可自动转发：\n"
         f"  注册 Provider：{enabled}\n\n"
+        "Guest Mode：在任意聊天发送“链接 @bot”即可处理（需 BotFather 开启 Guest Mode）。\n\n"
         "命令：\n"
         "  /pixiv_telegraph <链接>  强制 pixiv Telegra.ph 模式\n"
         "  /pixiv_direct <链接>     强制 pixiv 直发图片\n"
@@ -5599,6 +5779,8 @@ def _friendly_chat_id(chat_id: int, chat_type: str = "") -> str:
 
 __all__ = [
     "handle_message",
+    "handle_guest_message",
+    "GuestReply",
     "handle_callback",
     "handle_callback_archive",
     "cmd_pixiv_telegraph",

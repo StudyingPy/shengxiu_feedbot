@@ -5,6 +5,7 @@
 ## 特点
 
 - **零命令触发**：贴链接即响应，不需要记 `/` 命令。
+- **Guest Mode**：在任意非秘密聊天发送“链接 `@bot`”即可直接处理，Bot 不必加入该群。
 - **自动选择最佳展示方式**：图片少时直发到聊天（保留原图质量），多时生成 Telegra.ph 长页面。
 - **私聊可选模式、群聊全自动**：私聊提供按钮选取下载模式；群聊静默按预设模式处理，不打扰对话。
 - **运行时热配置**：绝大多数参数通过 `/setting` 私聊修改即时生效，不需要 SSH 上去重启。
@@ -76,6 +77,18 @@ e-hentai / ExHentai / nhentai 默认禁用，启动后通过私聊命令开启�
   - 直发上限 10 张（Telegram API 限制），超出自动转 Telegra.ph。
   - `/pixiv_telegraph <链接>` 强制走 Telegra.ph；`/pixiv_direct <链接>` 强制直发。
 - **小说**：自动转为 Telegra.ph 页面，支持 `[newpage]`、`[chapter:]`、`[[jumpuri:>]]`、`[pixivimage:]` 等 Pixiv 小说标记。
+
+### Guest Mode（链接后 @bot）
+
+在 @BotFather 的 Bot 设置 Mini App 中开启 **Guest Mode** 后，可以在任意非秘密私聊、群组或超级群组中使用：
+
+```text
+https://www.pixiv.net/artworks/123456 @你的bot
+```
+
+也可以回复一条链接消息，只发送 `@你的bot`。Guest 入口只处理一条链接：Pixiv 统一发布 Telegra.ph，e-hentai / ExHentai 默认使用“归档 · 1280x”模式，其他图集站点走 Telegra.ph。处理过程会持续编辑同一条回复；Guest Bot 看不到聊天历史，也不会自动接收后续消息。
+
+使用者仍需通过本 Bot 白名单授权。开启 Guest Mode 需要 Telegram Bot API 10.0 或更高版本；使用本项目自带的本地 Bot API 时也要同步更新服务镜像。
 
 ### e-hentai / ExHentai
 

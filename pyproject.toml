@@ -8,7 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "凤笙休" }]
 
 dependencies = [
-    "python-telegram-bot[all]>=21.0",
+    "python-telegram-bot[all]>=22.8",
     "httpx[http2]>=0.27",
     "telegraph[aio]>=2.2",
     "Pillow>=10.0",

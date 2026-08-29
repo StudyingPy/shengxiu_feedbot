@@ -45,6 +45,7 @@ from .handlers import (
     cmd_stats,
     cmd_zip2tph,
     handle_callback,
+    handle_guest_message,
     handle_message,
     handle_zip_document,
 )
@@ -202,6 +203,9 @@ def build_application(
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     # 消息监听
+    # Guest Mode 的 update 也携带 effective_message；必须先于普通文本 handler
+    # 截获，否则会落入 handle_message 并访问不存在的 update.message。
+    app.add_handler(MessageHandler(filters.UpdateType.GUEST_MESSAGE, handle_guest_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     # 文档监听：caption 含 /zip2tph 时处理
     app.add_handler(MessageHandler(filters.Document.ALL, handle_zip_document))
