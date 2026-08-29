@@ -810,13 +810,19 @@ async def _safe_update_card(
     Pixiv / nhentai 详情卡把 ~XX MB 写在正文里，prefetch 完成时需要重写正文；
     eh/ex 详情卡走 _safe_update_buttons（只动按钮 label）减小冲突面。
 
-    校验维度与 _safe_update_buttons 一致（token + chat + msg_id 三重）。
+    普通消息按 token + chat + msg_id 三重校验；Guest inline 消息则按
+    token + `GuestReply` 对象身份校验。
     """
     pending = _PENDING.get(token)
-    if pending is None:
-        return False
-    if pending.chat_id != placeholder.chat.id or pending.msg_id != placeholder.message_id:
-        return False
+    if pending is not None:
+        if pending.chat_id != placeholder.chat.id or pending.msg_id != placeholder.message_id:
+            return False
+    else:
+        # Guest inline 消息没有普通 chat/message id；用对象身份绑定状态，
+        # 防止旧的 size prefetch 覆盖另一张 Guest 详情卡或已进入处理态的回复。
+        guest_pending = _GUEST_PENDING.get(token)
+        if guest_pending is None or guest_pending.reply is not placeholder:
+            return False
     try:
         await placeholder.edit_text(
             new_text,
@@ -1087,6 +1093,10 @@ async def _start_guest_ref(
             reply_markup=_make_guest_pixiv_keyboard(selected_token, work),
             disable_web_page_preview=True,
         )
+        _schedule_pixiv_size_prefetch(
+            context, placeholder, selected_token, work,
+            keyboard_builder=lambda: _make_guest_pixiv_keyboard(selected_token, work),
+        )
         return
 
     elif ref.provider in ("e-hentai.org", "exhentai.org"):
@@ -1169,6 +1179,10 @@ async def _start_guest_ref(
                 parse_mode=ParseMode.HTML,
                 reply_markup=_make_guest_nhentai_keyboard(selected_token),
                 disable_web_page_preview=True,
+            )
+            _schedule_nhentai_size_prefetch(
+                context, placeholder, selected_token, album,
+                keyboard_builder=lambda: _make_guest_nhentai_keyboard(selected_token),
             )
             return
         category = "telegraph_publish"
@@ -2195,8 +2209,9 @@ async def _handle_guest_callback(update: Update, context: ContextTypes.DEFAULT_T
                 placeholder=pending.reply,
             )
 
+        category = "archive_zip" if mode.is_archive else "telegraph_publish"
         await _enqueue(
-            context, category="telegraph_publish",
+            context, category=category,
             user_id=pending.user_id, placeholder=pending.reply,
             work_label=f"{pending.ref.provider} 处理中（{mode.label_zh}）...",
             coro_factory=_do_eh, cancellable=False,
@@ -2396,8 +2411,14 @@ def _schedule_pixiv_size_prefetch(
     placeholder,
     token: str,
     work,
+    *,
+    keyboard_builder=None,
 ) -> None:
-    """异步采样 i.pximg.net 头几张原图，估算总字节数后回填详情卡正文。"""
+    """异步采样 i.pximg.net 头几张原图，估算总字节数后回填详情卡正文。
+
+    ``keyboard_builder`` 供 Guest 详情卡传入 Guest 专用按钮布局；普通私聊
+    路径不传时仍使用 `_make_pixiv_keyboard`。
+    """
     config, *_ = _ctx(context)
     sp = config.size_prefetch
     if not sp.enabled or not sp.pixiv:
@@ -2436,7 +2457,14 @@ def _schedule_pixiv_size_prefetch(
         if total is None or total <= 0:
             return
         new_text = _render_pixiv_detail_card(work, total_bytes=total)
-        new_markup = _make_pixiv_keyboard(token, work, config)
+        if keyboard_builder is not None:
+            try:
+                new_markup = keyboard_builder()
+            except Exception as e:
+                logger.debug(f"pixiv size prefetch {work.pid}: keyboard_builder failed: {e}")
+                return
+        else:
+            new_markup = _make_pixiv_keyboard(token, work, config)
         await _safe_update_card(placeholder, token, new_text, new_markup)
 
     start_background_task(
@@ -2661,8 +2689,14 @@ def _schedule_nhentai_size_prefetch(
     placeholder,
     token: str,
     album: NHentaiAlbum,
+    *,
+    keyboard_builder=None,
 ) -> None:
-    """异步采样 nhentai CDN 头几张图，估算总字节数后回填详情卡正文。"""
+    """异步采样 nhentai CDN 头几张图，估算总字节数后回填详情卡正文。
+
+    ``keyboard_builder`` 供 Guest 详情卡传入 Guest 专用按钮布局；普通私聊
+    路径不传时仍使用 `_make_nhentai_keyboard`。
+    """
     config, *_ = _ctx(context)
     sp = config.size_prefetch
     if not sp.enabled or not sp.nhentai:
@@ -2695,7 +2729,14 @@ def _schedule_nhentai_size_prefetch(
         if total <= 0:
             return
         new_text = _render_nhentai_detail_card(album, total_bytes=total)
-        new_markup = _make_nhentai_keyboard(token)
+        if keyboard_builder is not None:
+            try:
+                new_markup = keyboard_builder()
+            except Exception as e:
+                logger.debug(f"nhentai size prefetch {album.gallery_id}: keyboard_builder failed: {e}")
+                return
+        else:
+            new_markup = _make_nhentai_keyboard(token)
         await _safe_update_card(placeholder, token, new_text, new_markup)
 
     start_background_task(

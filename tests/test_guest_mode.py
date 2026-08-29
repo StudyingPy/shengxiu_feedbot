@@ -270,7 +270,7 @@ async def test_guest_eh_archive_callback_preserves_archive_mode(monkeypatch):
 
     assert called["ref"] == ref
     assert called["mode"] is EHMode.ARCHIVE_RES
-    assert queued["category"] == "telegraph_publish"
+    assert queued["category"] == "archive_zip"
 
 
 async def _record_async(target, args, kwargs):
@@ -320,6 +320,49 @@ async def test_guest_pixiv_direct_edits_inline_media_with_public_url(monkeypatch
     assert bot.media_edits[0]["inline_message_id"] == "inline-1"
     assert bot.media_edits[0]["media"].media == "https://cdn.example/p0.jpg"
     assert bot.media_edits[0]["media"].has_spoiler is True
+
+
+@pytest.mark.asyncio
+async def test_guest_detail_card_size_prefetch_can_update_inline_card():
+    token = "guest-card"
+    edits = []
+
+    class FakeReply:
+        chat = SimpleNamespace(id=-1001)
+        message_id = 0
+
+        async def edit_text(self, *args, **kwargs):
+            edits.append((args, kwargs))
+            return True
+
+    reply = FakeReply()
+    work = SimpleNamespace(page_count=1)
+    handlers._GUEST_PENDING[token] = handlers._GuestPending(
+        ref=ParsedRef(provider="pixiv", kind="illust", id="123", raw="pixiv"),
+        reply=reply,
+        update=SimpleNamespace(),
+        user_id=7,
+        created_at=0,
+        work=work,
+    )
+    try:
+        markup = _make_guest_pixiv_keyboard(token, work)
+        assert await handlers._safe_update_card(
+            reply, token, "details with size", markup,
+        )
+    finally:
+        handlers._GUEST_PENDING.pop(token, None)
+
+    assert edits == [
+        (
+            ("details with size",),
+            {
+                "parse_mode": "HTML",
+                "reply_markup": markup,
+                "disable_web_page_preview": True,
+            },
+        ),
+    ]
 
 
 @pytest.mark.asyncio
