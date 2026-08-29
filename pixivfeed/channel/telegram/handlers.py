@@ -623,9 +623,31 @@ class GuestReply:
             **kwargs,
         )
 
+    async def edit_reply_markup(self, **kwargs):
+        return await self._bot.edit_message_reply_markup(
+            inline_message_id=self.inline_message_id,
+            **kwargs,
+        )
+
     async def delete(self):
         # Guest API 没有按 guest message 删除的接口；完成态由 edit 覆盖。
         return True
+
+
+@dataclass
+class _GuestPending:
+    """Guest 详情卡状态；inline callback 没有普通 chat/message 可供回调复用。"""
+
+    ref: ParsedRef
+    reply: GuestReply
+    update: Update
+    user_id: int
+    created_at: float
+    work: object | None = None
+    album: NHentaiAlbum | None = None
+
+
+_GUEST_PENDING: dict[str, _GuestPending] = {}
 
 
 @dataclass
@@ -658,6 +680,12 @@ def _gc_pending() -> None:
     expired = [k for k, v in _PENDING.items() if now - v.created_at > PENDING_TTL]
     for k in expired:
         _PENDING.pop(k, None)
+    guest_expired = [
+        k for k, v in _GUEST_PENDING.items()
+        if now - v.created_at > PENDING_TTL
+    ]
+    for k in guest_expired:
+        _GUEST_PENDING.pop(k, None)
     # search 状态走同一 TTL
     search_expired = [
         k for k, v in _SEARCH_STATES.items() if now - v.created_at > PENDING_TTL
@@ -895,6 +923,43 @@ def _guest_input_text(message) -> str:
     return "\n".join(chunks)
 
 
+def _make_guest_eh_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Guest 专用 EH 键盘：默认视觉顺序为归档 1280x。"""
+    rows = [
+        [
+            InlineKeyboardButton("📦 归档 · 1280x（默认）", callback_data=f"g:{token}:archive_resample"),
+            InlineKeyboardButton("🌐 网页 · 显示图", callback_data=f"g:{token}:page_sample"),
+        ],
+        [
+            InlineKeyboardButton("🌐 网页 · 原图", callback_data=f"g:{token}:page_original"),
+            InlineKeyboardButton("📦 归档 · 原图", callback_data=f"g:{token}:archive_original"),
+        ],
+        [InlineKeyboardButton("取消", callback_data=f"g:{token}:cancel")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _make_guest_pixiv_keyboard(token: str, work) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if work.page_count <= 1:
+        rows.append([
+            InlineKeyboardButton("📷 直发图片", callback_data=f"g:{token}:direct"),
+            InlineKeyboardButton("📰 Telegra.ph", callback_data=f"g:{token}:ph"),
+        ])
+    else:
+        # inline 消息不能上传本地文件；多图走 Telegraph 才能稳定交付。
+        rows.append([InlineKeyboardButton("📰 Telegra.ph（多图）", callback_data=f"g:{token}:ph")])
+    rows.append([InlineKeyboardButton("取消", callback_data=f"g:{token}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _make_guest_nhentai_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 开始发布", callback_data=f"g:{token}:go")],
+        [InlineKeyboardButton("取消", callback_data=f"g:{token}:cancel")],
+    ])
+
+
 async def _guest_error(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """回答 Guest query 的错误；不回答会让客户端一直显示加载状态。"""
     message = update.guest_message
@@ -916,9 +981,7 @@ async def _guest_error(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Guest Mode 入口：``链接 @bot`` 或回复链接后 ``@bot``。
 
-    Guest reply 是一次性的，因此这里不走私聊详情卡和多消息直发路径：
-    Pixiv/nhentai 统一发布 Telegra.ph，EH/EX 固定使用归档 1280x 模式，
-    最终结果编辑回同一条 guest 消息。按钮与 Pixiv 直发将在此句柄上扩展。
+    Guest reply 是一次性的，因此详情卡和最终产物都编辑同一条 inline 消息。
     """
     message = update.guest_message
     if message is None:
@@ -958,23 +1021,122 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await _send_pixiv_novel(update, context, ref.id, placeholder=placeholder)
 
     elif ref.provider == "pixiv" and ref.kind == "illust":
+        config, registry, *_ = _ctx(context)
+        pixiv = _pixiv_provider(registry)
+        if pixiv is None:
+            await placeholder.edit_text("⚠️ Pixiv Provider 未启用")
+            return
+        try:
+            work = await pixiv.fetch_illust(ref.id)
+        except PixivNotFoundError:
+            await placeholder.edit_text(f"⚠️ 作品 {ref.id} 不存在或已删除")
+            return
+        except PixivAuthError as e:
+            await placeholder.edit_text(f"⚠️ 需要登录才能查看：{e}")
+            return
+        except PixivAPIError as e:
+            await placeholder.edit_text(f"⚠️ 拉取作品失败：{e}")
+            return
+        if work.is_ugoira:
+            await placeholder.edit_text(f"⚠️ 暂不支持动图（ugoira）：https://www.pixiv.net/artworks/{ref.id}")
+            return
+        _gc_pending()
+        token = uuid.uuid4().hex[:10]
+        _GUEST_PENDING[token] = _GuestPending(
+            ref=ref, reply=placeholder, update=update,
+            user_id=user_id, created_at=time.time(), work=work,
+        )
+        await placeholder.edit_text(
+            _render_pixiv_detail_card(work, total_bytes=None),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_make_guest_pixiv_keyboard(token, work),
+            disable_web_page_preview=True,
+        )
+        return
+
+    elif ref.provider in ("e-hentai.org", "exhentai.org"):
+        try:
+            provider = _eh_provider(registry, ref.provider)
+        except AttributeError:
+            provider = None
+        if provider is None:
+            # 测试/极简部署可能没有 EH provider；保留旧的固定 1280x 回退路径。
+            category = "archive_zip"
+
+            async def _do() -> None:
+                await _eh_run_with_mode(
+                    update, context, ref, mode=EHMode.ARCHIVE_RES,
+                    placeholder=placeholder,
+                )
+
+            await _enqueue(
+                context, category=category, user_id=user_id, placeholder=placeholder,
+                work_label=f"{ref.provider} 处理中...", coro_factory=_do,
+                cancellable=False,
+            )
+            return
+        try:
+            gallery = await provider.fetch_work(ref)
+        except EHGalleryUnavailable as e:
+            if ref.provider == "e-hentai.org":
+                fallback = await _try_fallback_to_exhentai(context, ref, placeholder, str(e))
+                if fallback is None:
+                    return
+                ref, gallery, provider = fallback
+            else:
+                await placeholder.edit_text(f"⚠️ 解析失败：{e}")
+                return
+        except EHError as e:
+            await placeholder.edit_text(f"⚠️ 解析失败：{e}")
+            return
+        except Exception as e:
+            logger.exception(f"guest {ref.provider} fetch_work failed for {ref.id}")
+            await placeholder.edit_text(f"⚠️ 解析失败：{e}")
+            return
+        _gc_pending()
+        token = uuid.uuid4().hex[:10]
+        _GUEST_PENDING[token] = _GuestPending(
+            ref=ref, reply=placeholder, update=update,
+            user_id=user_id, created_at=time.time(), work=gallery,
+        )
+        await placeholder.edit_text(
+            _render_eh_detail_card(
+                title=gallery.title, host=ref.provider,
+                source_url=_source_url_for_ref(ref), category=gallery.category,
+                pages=gallery.page_count, tags=gallery.tags,
+                ehtagdb=_get_ehtagdb(context), footer_prompt="选择处理方式：",
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_make_guest_eh_keyboard(token),
+            disable_web_page_preview=True,
+        )
+        return
+
+    elif ref.provider == "nhentai":
+        provider = registry.find_by_name("nhentai")
+        if isinstance(provider, NHentaiProvider):
+            try:
+                album = await provider.fetch_work(ref)
+            except Exception as e:
+                await placeholder.edit_text(f"⚠️ 解析失败：{e}")
+                return
+            _gc_pending()
+            token = uuid.uuid4().hex[:10]
+            _GUEST_PENDING[token] = _GuestPending(
+                ref=ref, reply=placeholder, update=update,
+                user_id=user_id, created_at=time.time(), album=album,
+            )
+            await placeholder.edit_text(
+                _render_nhentai_detail_card(album, total_bytes=None),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_make_guest_nhentai_keyboard(token),
+                disable_web_page_preview=True,
+            )
+            return
         category = "telegraph_publish"
 
         async def _do() -> None:
-            await _send_pixiv_illust_via_telegraph(
-                update, context, ref.id, placeholder=placeholder,
-            )
-
-    elif ref.provider in ("e-hentai.org", "exhentai.org"):
-        # Guest 没有模式选择卡；默认固定为免费归档 1280x，避免把用户配置里的
-        # page_sample 意外带入这个新入口。后续按钮交互可覆盖此选择。
-        category = "archive_zip"
-
-        async def _do() -> None:
-            await _eh_run_with_mode(
-                update, context, ref, mode=EHMode.ARCHIVE_RES,
-                placeholder=placeholder,
-            )
+            await _send_via_telegraph_generic(update, context, ref, placeholder=placeholder)
 
     else:
         category = "telegraph_publish"
@@ -1670,6 +1832,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query is None or not query.data:
         return
 
+    if query.data.startswith("g:"):
+        await _handle_guest_callback(update, context)
+        return
+
     # jc: 前缀（job cancel）只有 2 段
     if query.data.startswith("jc:"):
         await _handle_job_cancel(update, context)
@@ -1787,6 +1953,133 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         work_label=f"{pending.ref.provider} 处理中（{mode.label_zh}）...",
         coro_factory=_do,
     )
+
+
+async def _handle_guest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """处理 Guest inline 消息上的详情卡按钮。"""
+    query = update.callback_query
+    parts = (query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer()
+        return
+    _, token, action = parts
+    pending = _GUEST_PENDING.get(token)
+    if pending is None:
+        await query.answer("⚠️ 选项已过期，请重新发送链接", show_alert=True)
+        return
+    if query.from_user is None or query.from_user.id != pending.user_id:
+        await query.answer("⚠️ 这个选择来自其他用户", show_alert=True)
+        return
+
+    if action == "cancel":
+        _GUEST_PENDING.pop(token, None)
+        await query.answer("已取消")
+        try:
+            await pending.reply.edit_text("已取消")
+        except Exception:
+            pass
+        return
+
+    if pending.ref.provider == "pixiv":
+        if action not in ("direct", "ph"):
+            await query.answer("⚠️ 未知操作", show_alert=True)
+            return
+        if action == "direct" and pending.work is not None and getattr(pending.work, "page_count", 1) > 1:
+            await query.answer("多图作品请使用 Telegra.ph", show_alert=True)
+            return
+        label = "直发图片" if action == "direct" else "Telegra.ph"
+        category = "direct_image" if action == "direct" else "telegraph_publish"
+        await query.answer(f"使用 {label}")
+
+        _GUEST_PENDING.pop(token, None)
+        try:
+            await pending.reply.edit_text(f"⏳ 已收到（pixiv {pending.ref.id} · {label}），准备处理...")
+        except Exception:
+            pass
+        if not await _gate_disk_space(context, pending.reply):
+            return
+
+        async def _do_pixiv() -> None:
+            if action == "direct":
+                await _send_pixiv_guest_direct(
+                    pending.update, context, pending.ref.id, pending.reply,
+                    work=pending.work,
+                )
+            else:
+                await _send_pixiv_illust_via_telegraph(
+                    pending.update, context, pending.ref.id, placeholder=pending.reply,
+                )
+
+        await _enqueue(
+            context, category=category, user_id=pending.user_id,
+            placeholder=pending.reply, work_label=f"pixiv {pending.ref.id} 处理中...",
+            coro_factory=_do_pixiv, cancellable=False,
+        )
+        return
+
+    if pending.ref.provider in ("e-hentai.org", "exhentai.org"):
+        if action == "cancel":
+            return
+        try:
+            mode = EHMode(action)
+        except ValueError:
+            await query.answer("⚠️ 未知模式", show_alert=True)
+            return
+        _GUEST_PENDING.pop(token, None)
+        # Guest API 只能编辑一条 inline 回复，不能把本地生成的 ZIP 作为普通
+        # sendDocument 发回聊天；归档按钮保留给用户选择，但在 Guest 中安全
+        # 回退到网页显示图（仍然不消耗 archive 配额）。
+        run_mode = EHMode.PAGE_SAMPLE if mode.is_archive else mode
+        label = mode.label_zh if not mode.is_archive else f"{mode.label_zh}（Guest 改用网页显示图）"
+        await query.answer(f"使用 {label}")
+        try:
+            await pending.reply.edit_text(f"⏳ 已收到（{label}），准备处理...")
+        except Exception:
+            pass
+        if not await _gate_disk_space(context, pending.reply):
+            return
+
+        async def _do_eh() -> None:
+            await _eh_run_with_mode(
+                # archive ZIP 无法由 Guest inline API 上传，使用页面模式完成同一条回复。
+                pending.update, context, pending.ref, mode=run_mode,
+                placeholder=pending.reply,
+            )
+
+        await _enqueue(
+            context, category="telegraph_publish",
+            user_id=pending.user_id, placeholder=pending.reply,
+            work_label=f"{pending.ref.provider} 处理中（{mode.label_zh}）...",
+            coro_factory=_do_eh, cancellable=False,
+        )
+        return
+
+    if pending.ref.provider == "nhentai":
+        if action != "go":
+            await query.answer("⚠️ 未知操作", show_alert=True)
+            return
+        _GUEST_PENDING.pop(token, None)
+        await query.answer("开始处理")
+        try:
+            await pending.reply.edit_text(f"⏳ 已收到（nhentai {pending.ref.id}），准备处理...")
+        except Exception:
+            pass
+        if not await _gate_disk_space(context, pending.reply):
+            return
+
+        async def _do_nh() -> None:
+            await _send_via_telegraph_generic(
+                pending.update, context, pending.ref, placeholder=pending.reply,
+            )
+
+        await _enqueue(
+            context, category="telegraph_publish", user_id=pending.user_id,
+            placeholder=pending.reply, work_label=f"nhentai {pending.ref.id} 处理中...",
+            coro_factory=_do_nh, cancellable=False,
+        )
+        return
+
+    await query.answer("⚠️ 未知操作", show_alert=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2797,6 +3090,93 @@ async def _send_pixiv_illust_direct(
     await _log_usage(
         context, update,
         kind="pixiv_direct", provider="pixiv", ref_id=pid,
+        bytes_out=bytes_out,
+    )
+
+
+async def _send_pixiv_guest_direct(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    pid: str,
+    placeholder: GuestReply,
+    *,
+    work=None,
+) -> None:
+    """Guest inline 单图直发。
+
+    Guest 消息不能用 ``send_photo`` 上传本地文件；inline media 编辑只接受 URL
+    或已经上传过的 file_id。因此单图使用缓存目录对应的公开 tgphoto URL，
+    多图由调用方按钮限制并回退到 Telegraph。
+    """
+    config, registry, *_ = _ctx(context)
+    pixiv = _pixiv_provider(registry)
+    if pixiv is None:
+        await placeholder.edit_text("⚠️ Pixiv Provider 未启用")
+        return
+    if work is not None and getattr(work, "page_count", 1) > 1:
+        await _send_pixiv_illust_via_telegraph(
+            update, context, pid, placeholder=placeholder,
+        )
+        return
+
+    p = Progress(placeholder, prefix=f"🖼️ pixiv {pid}")
+    _attach_progress_markup(p, placeholder)
+    try:
+        illust = await pixiv.fetch_and_download_illust(
+            pid, on_progress=make_item_hook(p, "下载图片"),
+        )
+    except PixivAPIError as e:
+        await placeholder.edit_text(f"⚠️ {e}")
+        await _log_usage(context, update, kind="pixiv_direct", provider="pixiv", ref_id=pid, status="failed")
+        return
+    except Exception as e:
+        logger.exception(f"guest fetch_and_download_illust({pid}) failed")
+        await placeholder.edit_text(f"⚠️ 下载失败：{e}")
+        await _log_usage(context, update, kind="pixiv_direct", provider="pixiv", ref_id=pid, status="failed")
+        return
+
+    if len(illust.images) != 1:
+        # 元数据在按钮阶段可能过期，仍以实际下载结果为准。
+        await _send_pixiv_illust_via_telegraph(
+            update, context, pid, placeholder=placeholder,
+        )
+        return
+    candidates = list(illust.public_urls_tgphoto or []) + list(illust.public_urls_original or [])
+    url = next((item for item in candidates if item.startswith(("http://", "https://"))), "")
+    if not url or not url.startswith(("http://", "https://")):
+        await placeholder.edit_text("⚠️ 没有可用于 Guest 直发的公开图片地址，请选择 Telegra.ph")
+        await _log_usage(context, update, kind="pixiv_direct", provider="pixiv", ref_id=pid, status="failed")
+        return
+
+    caption = _render_direct_caption(
+        config.templates.illust.direct_caption, illust.work.template_vars(),
+    )
+    chat = update.effective_chat
+    use_spoiler = chat is not None and chat.type in ("group", "supergroup") and (illust.work.x_restrict or 0) >= 1
+    try:
+        await placeholder.edit_media(
+            InputMediaPhoto(
+                media=url,
+                caption=caption or None,
+                parse_mode=ParseMode.HTML if caption else None,
+                has_spoiler=use_spoiler,
+            ),
+            reply_markup=None,
+        )
+    except Exception as e:
+        logger.exception(f"guest send_direct({pid}) failed")
+        await placeholder.edit_text(f"⚠️ 发送失败：{e}")
+        await _log_usage(context, update, kind="pixiv_direct", provider="pixiv", ref_id=pid, status="failed")
+        return
+
+    bytes_out = 0
+    for image in illust.images:
+        try:
+            bytes_out += image.tgphoto_path.stat().st_size
+        except OSError:
+            pass
+    await _log_usage(
+        context, update, kind="pixiv_direct", provider="pixiv", ref_id=pid,
         bytes_out=bytes_out,
     )
 

@@ -6,7 +6,12 @@ from telegram import Chat, Message, Update, User
 from telegram.ext import filters
 
 from pixivfeed.channel.telegram import handlers
-from pixivfeed.channel.telegram.handlers import GuestReply, _guest_input_text
+from pixivfeed.channel.telegram.handlers import (
+    GuestReply,
+    _guest_input_text,
+    _make_guest_eh_keyboard,
+    _make_guest_pixiv_keyboard,
+)
 from pixivfeed.provider import ParsedRef
 from pixivfeed.provider.ehentai import EHMode
 
@@ -87,6 +92,66 @@ async def test_guest_reply_answers_once_then_edits_inline_message():
             "disable_web_page_preview": False,
         }
     ]
+
+
+def test_guest_keyboards_use_guest_callback_prefix_and_default_archive_first():
+    eh = _make_guest_eh_keyboard("abc123")
+    assert eh.inline_keyboard[0][0].callback_data == "g:abc123:archive_resample"
+    assert eh.inline_keyboard[-1][0].callback_data == "g:abc123:cancel"
+
+    single = SimpleNamespace(page_count=1)
+    multi = SimpleNamespace(page_count=2)
+    assert single.page_count == 1
+    assert _make_guest_pixiv_keyboard("p1", single).inline_keyboard[0][0].callback_data == "g:p1:direct"
+    assert _make_guest_pixiv_keyboard("p2", multi).inline_keyboard[0][0].callback_data == "g:p2:ph"
+
+
+@pytest.mark.asyncio
+async def test_guest_pixiv_direct_edits_inline_media_with_public_url(monkeypatch, tmp_path):
+    source = _message(text="@feed_bot https://www.pixiv.net/artworks/123")
+
+    class FakeBot:
+        def __init__(self):
+            self.media_edits = []
+
+        async def edit_message_media(self, **kwargs):
+            self.media_edits.append(kwargs)
+            return True
+
+    bot = FakeBot()
+    reply = GuestReply(bot, "inline-1", source)
+    image_path = tmp_path / "p0.jpg"
+    image_path.write_bytes(b"image")
+    work = SimpleNamespace(
+        page_count=1,
+        x_restrict=0,
+        template_vars=lambda: {"pid": "123", "title": "demo"},
+    )
+    result = SimpleNamespace(
+        work=work,
+        images=[SimpleNamespace(tgphoto_path=image_path)],
+        public_urls_tgphoto=["https://cdn.example/p0.jpg"],
+        public_urls_original=[],
+    )
+    provider = SimpleNamespace(fetch_and_download_illust=lambda pid, on_progress=None: _result(result))
+    config = SimpleNamespace(templates=SimpleNamespace(illust=SimpleNamespace(direct_caption="{title}")))
+    registry = SimpleNamespace(find_by_name=lambda name: provider)
+    context = SimpleNamespace(bot_data={"config": config, "registry": registry, "publisher": None, "telegraph_cache": None, "allowlist": None})
+
+    class DummyProgress:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(handlers, "Progress", DummyProgress)
+    monkeypatch.setattr(handlers, "_pixiv_provider", lambda registry: provider)
+    await handlers._send_pixiv_guest_direct(Update(update_id=3, message=source), context, "123", reply, work=work)
+
+    assert bot.media_edits[0]["inline_message_id"] == "inline-1"
+    assert bot.media_edits[0]["media"].media == "https://cdn.example/p0.jpg"
+
+
+async def _result(value):
+    return value
 
 
 @pytest.mark.asyncio
