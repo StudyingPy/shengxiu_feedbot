@@ -979,6 +979,17 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
     text = _guest_input_text(message)
     refs = registry.extract_all_refs(text)
     if not refs:
+        # 回复触发但当前消息只有 @bot 时静默忽略；Guest 不再读取被回复内容，
+        # 这样不会因为“回复 bot 后只输入 @bot”又产生一条提示响应。
+        api_kwargs = getattr(message, "api_kwargs", {}) or {}
+        has_reference = bool(api_kwargs.get("reference_messages"))
+        if (
+            getattr(message, "reply_to_message", None) is not None
+            or getattr(message, "external_reply", None) is not None
+            or getattr(message, "quote", None) is not None
+            or has_reference
+        ):
+            return
         await _guest_error(update, context, "用法：在消息中附上支持的作品链接后再 @bot。")
         return
     if len(refs) > 1:
@@ -1842,7 +1853,12 @@ async def _delete_guest_reply_after_cancel(reply: GuestReply, callback_message=N
             return
         except Exception as e:
             logger.debug(f"guest inline delete failed: {e}")
-    logger.debug("Guest inline message has no standard delete API; keeping cancel fallback")
+    # 标准 API 无法删除 inline 消息时，移除键盘并替换为零宽字符，避免在
+    # 对话中留下可见的“已取消”响应。消息对象本身仍由 Telegram 保留。
+    try:
+        await reply.edit_text("\u2063", reply_markup=None)
+    except Exception as e:
+        logger.debug(f"guest inline cancel hide failed: {e}")
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1993,10 +2009,6 @@ async def _handle_guest_callback(update: Update, context: ContextTypes.DEFAULT_T
     if action == "cancel":
         _GUEST_PENDING.pop(token, None)
         await query.answer("已取消")
-        try:
-            await pending.reply.edit_text("已取消")
-        except Exception:
-            pass
         start_background_task(
             context.application,
             _delete_guest_reply_after_cancel(pending.reply, query.message),

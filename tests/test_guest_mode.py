@@ -16,7 +16,7 @@ from pixivfeed.provider import ParsedRef
 from pixivfeed.provider.ehentai import EHMode
 
 
-def _message(*, text=None, caption=None, reply_to_message=None):
+def _message(*, text=None, caption=None, reply_to_message=None, api_kwargs=None):
     return Message(
         message_id=1,
         date=datetime.now(timezone.utc),
@@ -25,6 +25,7 @@ def _message(*, text=None, caption=None, reply_to_message=None):
         text=text,
         caption=caption,
         reply_to_message=reply_to_message,
+        api_kwargs=api_kwargs,
     )
 
 
@@ -40,6 +41,11 @@ def test_guest_input_text_uses_caption_when_no_text():
     summon = _message(caption="https://e-hentai.org/g/1/token", reply_to_message=source)
 
     assert _guest_input_text(summon) == "https://e-hentai.org/g/1/token"
+
+
+def test_guest_reference_message_is_not_processed():
+    summon = _message(text="@feed_bot", api_kwargs={"reference_messages": [{"message_id": 99}]})
+    assert _guest_input_text(summon) == "@feed_bot"
 
 
 def test_guest_update_filter_matches_guest_message_only():
