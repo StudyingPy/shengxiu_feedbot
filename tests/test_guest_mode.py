@@ -8,9 +8,11 @@ from telegram.ext import filters
 from pixivfeed.channel.telegram import handlers
 from pixivfeed.channel.telegram.handlers import (
     GuestReply,
+    _guest_extract_refs,
     _guest_input_text,
     _make_guest_eh_keyboard,
     _make_guest_pixiv_keyboard,
+    _make_guest_ref_picker,
 )
 from pixivfeed.provider import ParsedRef
 from pixivfeed.provider.ehentai import EHMode
@@ -46,6 +48,30 @@ def test_guest_input_text_uses_caption_when_no_text():
 def test_guest_reference_message_is_not_processed():
     summon = _message(text="@feed_bot", api_kwargs={"reference_messages": [{"message_id": 99}]})
     assert _guest_input_text(summon) == "@feed_bot"
+
+
+def test_guest_user_reference_link_is_processed():
+    source = _message(text="https://www.pixiv.net/artworks/123")
+    summon = _message(text="@feed_bot", reply_to_message=source)
+    ref = ParsedRef(provider="pixiv", kind="illust", id="123", raw=source.text)
+    registry = SimpleNamespace(extract_all_refs=lambda text: [ref] if "pixiv" in text else [])
+
+    assert _guest_extract_refs(summon, registry) == [ref]
+
+
+def test_guest_bot_reference_link_is_ignored():
+    summon = _message(
+        text="@feed_bot",
+        api_kwargs={
+            "reference_messages": [{
+                "message": "https://www.pixiv.net/artworks/123",
+                "via_bot_id": 99,
+            }],
+        },
+    )
+    registry = SimpleNamespace(extract_all_refs=lambda text: [object()] if "pixiv" in text else [])
+
+    assert _guest_extract_refs(summon, registry) == []
 
 
 def test_guest_update_filter_matches_guest_message_only():
@@ -100,6 +126,37 @@ async def test_guest_reply_answers_once_then_edits_inline_message():
     ]
 
 
+@pytest.mark.asyncio
+async def test_guest_reply_without_new_link_is_silent(monkeypatch):
+    guest = Message(
+        message_id=1,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=-1001, type="supergroup"),
+        from_user=User(id=7, first_name="tester", is_bot=False),
+        text="这个图片好棒",
+        guest_query_id="guest-q-noop",
+    )
+    update = Update(update_id=10, guest_message=guest)
+
+    class FakeBot:
+        def __init__(self):
+            self.answers = []
+
+        async def answer_guest_query(self, *args, **kwargs):
+            self.answers.append((args, kwargs))
+
+    bot = FakeBot()
+    registry = SimpleNamespace(extract_all_refs=lambda text: [])
+    monkeypatch.setattr(handlers, "_ctx", lambda context: (SimpleNamespace(), registry, None, None, None))
+    monkeypatch.setattr(handlers, "is_authorized", lambda update, allowlist: _true())
+    monkeypatch.setattr(handlers, "_track_user", lambda update, context: _done())
+
+    context = SimpleNamespace(bot=bot, bot_data={"allowlist": object()})
+    await handlers.handle_guest_message(update, context)
+
+    assert bot.answers == []
+
+
 def test_guest_keyboards_match_regular_layout_without_extra_emoji():
     eh = _make_guest_eh_keyboard("abc123")
     assert eh.inline_keyboard[0][0].callback_data == "g:abc123:page_sample"
@@ -112,6 +169,59 @@ def test_guest_keyboards_match_regular_layout_without_extra_emoji():
     assert single.page_count == 1
     assert _make_guest_pixiv_keyboard("p1", single).inline_keyboard[0][0].callback_data == "g:p1:direct"
     assert _make_guest_pixiv_keyboard("p2", multi).inline_keyboard[0][0].callback_data == "g:p2:ph"
+
+
+def test_guest_multiple_refs_use_picker_buttons():
+    refs = [
+        ParsedRef(provider="pixiv", kind="illust", id="123", raw="pixiv"),
+        ParsedRef(provider="e-hentai.org", kind="gallery", id="456/token", raw="eh"),
+    ]
+
+    keyboard = _make_guest_ref_picker("select1", refs)
+
+    assert keyboard.inline_keyboard[0][0].text == "1. Pixiv 123"
+    assert keyboard.inline_keyboard[0][0].callback_data == "g:select1:pick:0"
+    assert keyboard.inline_keyboard[1][0].text == "2. EH 456/token"
+    assert keyboard.inline_keyboard[1][0].callback_data == "g:select1:pick:1"
+    assert keyboard.inline_keyboard[-1][0].callback_data == "g:select1:cancel"
+
+
+@pytest.mark.asyncio
+async def test_guest_picker_callback_starts_selected_ref(monkeypatch):
+    refs = [
+        ParsedRef(provider="pixiv", kind="illust", id="123", raw="pixiv"),
+        ParsedRef(provider="e-hentai.org", kind="gallery", id="456/token", raw="eh"),
+    ]
+    token = "select2"
+    pending = handlers._GuestPending(
+        ref=None, refs=refs, reply=SimpleNamespace(), update=SimpleNamespace(),
+        user_id=7, created_at=0,
+    )
+    handlers._GUEST_PENDING[token] = pending
+    selected = {}
+
+    async def fake_start(update, context, ref, placeholder, user_id, *, token=None):
+        selected.update(ref=ref, user_id=user_id, token=token)
+
+    monkeypatch.setattr(handlers, "_start_guest_ref", fake_start)
+
+    class FakeQuery:
+        data = f"g:{token}:pick:1"
+        from_user = User(id=7, first_name="tester", is_bot=False)
+        message = None
+
+        async def answer(self, *args, **kwargs):
+            return None
+
+    try:
+        await handlers._handle_guest_callback(
+            SimpleNamespace(callback_query=FakeQuery()),
+            SimpleNamespace(),
+        )
+    finally:
+        handlers._GUEST_PENDING.pop(token, None)
+
+    assert selected == {"ref": refs[1], "user_id": 7, "token": token}
 
 
 @pytest.mark.asyncio
@@ -174,6 +284,25 @@ async def test_guest_cancel_delete_uses_optional_guest_delete_api(monkeypatch):
     monkeypatch.setattr(handlers.asyncio, "sleep", no_sleep)
     await handlers._delete_guest_reply_after_cancel(reply)
     assert calls == [{"inline_message_id": "inline-cancel"}]
+
+
+@pytest.mark.asyncio
+async def test_guest_cancel_falls_back_to_cancelled_text(monkeypatch):
+    edits = []
+
+    class FakeBot:
+        async def edit_message_text(self, **kwargs):
+            edits.append(kwargs)
+
+    reply = GuestReply(FakeBot(), "inline-cancel", None)
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(handlers.asyncio, "sleep", no_sleep)
+    await handlers._delete_guest_reply_after_cancel(reply)
+
+    assert edits == [{"inline_message_id": "inline-cancel", "text": "已取消", "reply_markup": None}]
 
 
 async def _result(value):

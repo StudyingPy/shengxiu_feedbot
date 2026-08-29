@@ -638,13 +638,14 @@ class GuestReply:
 class _GuestPending:
     """Guest 详情卡状态；inline callback 没有普通 chat/message 可供回调复用。"""
 
-    ref: ParsedRef
+    ref: ParsedRef | None
     reply: GuestReply
     update: Update
     user_id: int
     created_at: float
     work: object | None = None
     album: NHentaiAlbum | None = None
+    refs: list[ParsedRef] | None = None
 
 
 _GUEST_PENDING: dict[str, _GuestPending] = {}
@@ -913,8 +914,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _guest_input_text(message) -> str:
-    """只读取显式召唤消息本身，不处理被回复消息或聊天历史。"""
+    """读取 Guest 召唤消息本身的正文/说明。"""
     return message.text or message.caption or ""
+
+
+def _guest_reference_text(item) -> str:
+    """从 PTB Message 或 Bot API 原始字典取引用消息正文。"""
+    if isinstance(item, dict):
+        return item.get("text") or item.get("caption") or item.get("message") or ""
+    return getattr(item, "text", None) or getattr(item, "caption", None) or ""
+
+
+def _guest_reference_is_bot(item) -> bool:
+    """判断引用消息是否由 Bot 发出，避免回复 Bot 结果时重处理旧链接。"""
+    if isinstance(item, dict):
+        sender = item.get("from") or item.get("from_user") or {}
+        return bool(
+            (isinstance(sender, dict) and sender.get("is_bot"))
+            or item.get("via_bot") is not None
+            or item.get("via_bot_id") is not None
+            or item.get("guestchat_via_from") is not None
+        )
+    sender = getattr(item, "from_user", None)
+    return bool(
+        getattr(sender, "is_bot", False)
+        or getattr(item, "via_bot", None) is not None
+        or getattr(item, "via_bot_id", None) is not None
+        or getattr(item, "guestchat_via_from", None) is not None
+    )
+
+
+def _guest_extract_refs(message, registry) -> list[ParsedRef]:
+    """提取当前召唤消息及用户引用消息中的链接，忽略 Bot 自己的结果消息。"""
+    texts = [_guest_input_text(message)]
+    reply = getattr(message, "reply_to_message", None)
+    if reply is not None and not _guest_reference_is_bot(reply):
+        texts.append(_guest_reference_text(reply))
+
+    api_kwargs = getattr(message, "api_kwargs", {}) or {}
+    for item in api_kwargs.get("reference_messages") or []:
+        if not _guest_reference_is_bot(item):
+            texts.append(_guest_reference_text(item))
+
+    refs: list[ParsedRef] = []
+    seen: set[tuple[str, str, str]] = set()
+    for text in texts:
+        for ref in registry.extract_all_refs(text):
+            key = (ref.provider, ref.kind, ref.id)
+            if key not in seen:
+                seen.add(key)
+                refs.append(ref)
+    return refs
 
 
 def _make_guest_eh_keyboard(token: str) -> InlineKeyboardMarkup:
@@ -943,6 +993,25 @@ def _make_guest_nhentai_keyboard(token: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _guest_ref_label(ref: ParsedRef, index: int) -> str:
+    provider = {
+        "pixiv": "Pixiv",
+        "e-hentai.org": "EH",
+        "exhentai.org": "EX",
+        "nhentai": "NH",
+    }.get(ref.provider, ref.provider)
+    return f"{index}. {provider} {ref.id}"
+
+
+def _make_guest_ref_picker(token: str, refs: list[ParsedRef]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(_guest_ref_label(ref, i), callback_data=f"g:{token}:pick:{i - 1}")]
+        for i, ref in enumerate(refs, 1)
+    ]
+    rows.append([InlineKeyboardButton("取消", callback_data=f"g:{token}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def _guest_error(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """回答 Guest query 的错误；不回答会让客户端一直显示加载状态。"""
     message = update.guest_message
@@ -961,53 +1030,20 @@ async def _guest_error(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         logger.exception("answer guest error failed")
 
 
-async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Guest Mode 入口：在同一条消息中发送 ``链接 @bot``。
-
-    Guest reply 是一次性的，因此详情卡和最终产物都编辑同一条 inline 消息。
-    """
-    message = update.guest_message
-    if message is None:
-        return
+async def _start_guest_ref(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    ref: ParsedRef,
+    placeholder: GuestReply,
+    user_id: int,
+    *,
+    token: str | None = None,
+) -> None:
+    """为已选中的 Guest 链接加载详情或进入处理队列。"""
     _, registry, *_ = _ctx(context)
-    allowlist: AllowList = context.bot_data["allowlist"]
-    if not await is_authorized(update, allowlist):
-        await _guest_error(update, context, "⚠️ 你尚未被授权使用此 Bot。")
-        return
-    await _track_user(update, context)
-
-    text = _guest_input_text(message)
-    refs = registry.extract_all_refs(text)
-    if not refs:
-        # 回复触发但当前消息只有 @bot 时静默忽略；Guest 不再读取被回复内容，
-        # 这样不会因为“回复 bot 后只输入 @bot”又产生一条提示响应。
-        api_kwargs = getattr(message, "api_kwargs", {}) or {}
-        has_reference = bool(api_kwargs.get("reference_messages"))
-        if (
-            getattr(message, "reply_to_message", None) is not None
-            or getattr(message, "external_reply", None) is not None
-            or getattr(message, "quote", None) is not None
-            or has_reference
-        ):
-            return
-        await _guest_error(update, context, "用法：在消息中附上支持的作品链接后再 @bot。")
-        return
-    if len(refs) > 1:
-        await _guest_error(update, context, "⚠️ 一次只处理一个链接，请逐个 @bot。")
-        return
-
-    ref = refs[0]
-    try:
-        placeholder = await GuestReply.create(
-            update, context, f"⏳ 已收到（{ref.provider}），准备处理...",
-        )
-    except Exception:
-        logger.exception("answer guest placeholder failed")
-        return
     if not await _gate_disk_space(context, placeholder):
         return
 
-    user_id = update.effective_user.id if update.effective_user else 0
     if ref.provider == "pixiv" and ref.kind == "novel":
         category = "telegraph_publish"
 
@@ -1015,7 +1051,6 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await _send_pixiv_novel(update, context, ref.id, placeholder=placeholder)
 
     elif ref.provider == "pixiv" and ref.kind == "illust":
-        config, registry, *_ = _ctx(context)
         pixiv = _pixiv_provider(registry)
         if pixiv is None:
             await placeholder.edit_text("⚠️ Pixiv Provider 未启用")
@@ -1035,15 +1070,15 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await placeholder.edit_text(f"⚠️ 暂不支持动图（ugoira）：https://www.pixiv.net/artworks/{ref.id}")
             return
         _gc_pending()
-        token = uuid.uuid4().hex[:10]
-        _GUEST_PENDING[token] = _GuestPending(
+        selected_token = token or uuid.uuid4().hex[:10]
+        _GUEST_PENDING[selected_token] = _GuestPending(
             ref=ref, reply=placeholder, update=update,
             user_id=user_id, created_at=time.time(), work=work,
         )
         await placeholder.edit_text(
             _render_pixiv_detail_card(work, total_bytes=None),
             parse_mode=ParseMode.HTML,
-            reply_markup=_make_guest_pixiv_keyboard(token, work),
+            reply_markup=_make_guest_pixiv_keyboard(selected_token, work),
             disable_web_page_preview=True,
         )
         return
@@ -1054,7 +1089,6 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
         except AttributeError:
             provider = None
         if provider is None:
-            # 测试/极简部署可能没有 EH provider；保留旧的固定 1280x 回退路径。
             category = "archive_zip"
 
             async def _do() -> None:
@@ -1088,8 +1122,8 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await placeholder.edit_text(f"⚠️ 解析失败：{e}")
             return
         _gc_pending()
-        token = uuid.uuid4().hex[:10]
-        _GUEST_PENDING[token] = _GuestPending(
+        selected_token = token or uuid.uuid4().hex[:10]
+        _GUEST_PENDING[selected_token] = _GuestPending(
             ref=ref, reply=placeholder, update=update,
             user_id=user_id, created_at=time.time(), work=gallery,
         )
@@ -1101,12 +1135,12 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 ehtagdb=_get_ehtagdb(context), footer_prompt="选择处理方式：",
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=_make_guest_eh_keyboard(token),
+            reply_markup=_make_guest_eh_keyboard(selected_token),
             disable_web_page_preview=True,
         )
         _schedule_eh_size_prefetch(
-            context, placeholder, token, ref, prefix="g",
-            keyboard_builder=lambda sizes: _make_eh_keyboard(token, sizes=sizes, prefix="g"),
+            context, placeholder, selected_token, ref, prefix="g",
+            keyboard_builder=lambda sizes: _make_eh_keyboard(selected_token, sizes=sizes, prefix="g"),
         )
         return
 
@@ -1119,15 +1153,15 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await placeholder.edit_text(f"⚠️ 解析失败：{e}")
                 return
             _gc_pending()
-            token = uuid.uuid4().hex[:10]
-            _GUEST_PENDING[token] = _GuestPending(
+            selected_token = token or uuid.uuid4().hex[:10]
+            _GUEST_PENDING[selected_token] = _GuestPending(
                 ref=ref, reply=placeholder, update=update,
                 user_id=user_id, created_at=time.time(), album=album,
             )
             await placeholder.edit_text(
                 _render_nhentai_detail_card(album, total_bytes=None),
                 parse_mode=ParseMode.HTML,
-                reply_markup=_make_guest_nhentai_keyboard(token),
+                reply_markup=_make_guest_nhentai_keyboard(selected_token),
                 disable_web_page_preview=True,
             )
             return
@@ -1140,19 +1174,60 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
         category = "telegraph_publish"
 
         async def _do() -> None:
-            await _send_via_telegraph_generic(
-                update, context, ref, placeholder=placeholder,
-            )
+            await _send_via_telegraph_generic(update, context, ref, placeholder=placeholder)
 
     await _enqueue(
-        context,
-        category=category,
-        user_id=user_id,
-        placeholder=placeholder,
-        work_label=f"{ref.provider} 处理中...",
-        coro_factory=_do,
+        context, category=category, user_id=user_id, placeholder=placeholder,
+        work_label=f"{ref.provider} 处理中...", coro_factory=_do,
         cancellable=False,
     )
+
+
+async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Guest Mode 入口：在同一条消息中发送 ``链接 @bot``。
+
+    Guest reply 是一次性的，因此详情卡和最终产物都编辑同一条 inline 消息。
+    """
+    message = update.guest_message
+    if message is None:
+        return
+    _, registry, *_ = _ctx(context)
+    allowlist: AllowList = context.bot_data["allowlist"]
+    if not await is_authorized(update, allowlist):
+        await _guest_error(update, context, "⚠️ 你尚未被授权使用此 Bot。")
+        return
+    await _track_user(update, context)
+
+    refs = _guest_extract_refs(message, registry)
+    if not refs:
+        # Guest Mode 也可能因为“回复 Bot 的结果消息”而产生 update；
+        # 这类普通回复（例如“这个图片好棒”）必须完全静默。当前消息和
+        # 用户引用消息都没有支持链接时，不创建任何 Guest 响应。
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    try:
+        placeholder = await GuestReply.create(
+            update, context,
+            "请选择要处理的链接：" if len(refs) > 1 else f"⏳ 已收到（{refs[0].provider}），准备处理...",
+        )
+    except Exception:
+        logger.exception("answer guest placeholder failed")
+        return
+    if len(refs) > 1:
+        _gc_pending()
+        token = uuid.uuid4().hex[:10]
+        _GUEST_PENDING[token] = _GuestPending(
+            ref=None, refs=refs, reply=placeholder, update=update,
+            user_id=user_id, created_at=time.time(),
+        )
+        await placeholder.edit_text(
+            "请选择要处理的链接：",
+            reply_markup=_make_guest_ref_picker(token, refs),
+            disable_web_page_preview=True,
+        )
+        return
+
+    await _start_guest_ref(update, context, refs[0], placeholder, user_id)
 
 
 async def cmd_pixiv_telegraph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1853,10 +1928,10 @@ async def _delete_guest_reply_after_cancel(reply: GuestReply, callback_message=N
             return
         except Exception as e:
             logger.debug(f"guest inline delete failed: {e}")
-    # 标准 API 无法删除 inline 消息时，移除键盘并替换为零宽字符，避免在
-    # 对话中留下可见的“已取消”响应。消息对象本身仍由 Telegram 保留。
+    # 标准 API 无法删除 inline 消息时，移除键盘并显示取消状态。
+    # 消息对象本身仍由 Telegram 保留。
     try:
-        await reply.edit_text("\u2063", reply_markup=None)
+        await reply.edit_text("已取消", reply_markup=None)
     except Exception as e:
         logger.debug(f"guest inline cancel hide failed: {e}")
 
@@ -2006,6 +2081,28 @@ async def _handle_guest_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("⚠️ 这个选择来自其他用户", show_alert=True)
         return
 
+    if action.startswith("pick:"):
+        if pending.refs is None:
+            await query.answer("⚠️ 选项已过期，请重新发送链接", show_alert=True)
+            return
+        try:
+            index = int(action.split(":", 1)[1])
+            ref = pending.refs[index]
+        except (ValueError, IndexError):
+            await query.answer("⚠️ 未知链接选项", show_alert=True)
+            return
+        pending.refs = None
+        pending.ref = ref
+        await query.answer(f"已选择 {ref.provider} {ref.id}")
+        try:
+            await pending.reply.edit_text(f"⏳ 已收到（{ref.provider}），准备处理...")
+        except Exception:
+            pass
+        await _start_guest_ref(
+            pending.update, context, ref, pending.reply, pending.user_id, token=token,
+        )
+        return
+
     if action == "cancel":
         _GUEST_PENDING.pop(token, None)
         await query.answer("已取消")
@@ -2014,6 +2111,10 @@ async def _handle_guest_callback(update: Update, context: ContextTypes.DEFAULT_T
             _delete_guest_reply_after_cancel(pending.reply, query.message),
             name=f"guest-cancel-delete-{token}",
         )
+        return
+
+    if pending.ref is None:
+        await query.answer("⚠️ 请先选择要处理的链接", show_alert=True)
         return
 
     if pending.ref.provider == "pixiv":
