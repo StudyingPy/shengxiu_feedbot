@@ -28,14 +28,14 @@ def _message(*, text=None, caption=None, reply_to_message=None):
     )
 
 
-def test_guest_input_text_reads_summon_and_replied_message():
+def test_guest_input_text_reads_only_explicit_summon_message():
     source = _message(text="https://www.pixiv.net/artworks/123")
     summon = _message(text="@feed_bot", reply_to_message=source)
 
-    assert _guest_input_text(summon) == "@feed_bot\nhttps://www.pixiv.net/artworks/123"
+    assert _guest_input_text(summon) == "@feed_bot"
 
 
-def test_guest_input_text_deduplicates_same_caption():
+def test_guest_input_text_uses_caption_when_no_text():
     source = _message(caption="https://e-hentai.org/g/1/token")
     summon = _message(caption="https://e-hentai.org/g/1/token", reply_to_message=source)
 
@@ -94,9 +94,11 @@ async def test_guest_reply_answers_once_then_edits_inline_message():
     ]
 
 
-def test_guest_keyboards_use_guest_callback_prefix_and_default_archive_first():
+def test_guest_keyboards_match_regular_layout_without_extra_emoji():
     eh = _make_guest_eh_keyboard("abc123")
-    assert eh.inline_keyboard[0][0].callback_data == "g:abc123:archive_resample"
+    assert eh.inline_keyboard[0][0].callback_data == "g:abc123:page_sample"
+    assert eh.inline_keyboard[0][0].text == EHMode.PAGE_SAMPLE.label_zh
+    assert eh.inline_keyboard[1][0].callback_data == "g:abc123:archive_resample"
     assert eh.inline_keyboard[-1][0].callback_data == "g:abc123:cancel"
 
     single = SimpleNamespace(page_count=1)
@@ -124,7 +126,7 @@ async def test_guest_pixiv_direct_edits_inline_media_with_public_url(monkeypatch
     image_path.write_bytes(b"image")
     work = SimpleNamespace(
         page_count=1,
-        x_restrict=0,
+        x_restrict=1,
         template_vars=lambda: {"pid": "123", "title": "demo"},
     )
     result = SimpleNamespace(
@@ -148,6 +150,24 @@ async def test_guest_pixiv_direct_edits_inline_media_with_public_url(monkeypatch
 
     assert bot.media_edits[0]["inline_message_id"] == "inline-1"
     assert bot.media_edits[0]["media"].media == "https://cdn.example/p0.jpg"
+    assert bot.media_edits[0]["media"].has_spoiler is True
+
+
+@pytest.mark.asyncio
+async def test_guest_cancel_delete_uses_optional_guest_delete_api(monkeypatch):
+    calls = []
+
+    class FakeBot:
+        async def delete_guest_message(self, **kwargs):
+            calls.append(kwargs)
+
+    reply = SimpleNamespace(_bot=FakeBot(), inline_message_id="inline-cancel")
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(handlers.asyncio, "sleep", no_sleep)
+    await handlers._delete_guest_reply_after_cancel(reply)
+    assert calls == [{"inline_message_id": "inline-cancel"}]
 
 
 async def _result(value):

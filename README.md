@@ -86,13 +86,13 @@ e-hentai / ExHentai / nhentai 默认禁用，启动后通过私聊命令开启�
 https://www.pixiv.net/artworks/123456 @你的bot
 ```
 
-也可以回复一条链接消息，只发送 `@你的bot`。Guest 入口只处理一条链接，并先返回可交互详情卡：
+Guest 只处理显式召唤消息中的链接（链接与 `@你的bot` 放在同一条消息）；不会读取或响应被回复消息中的链接。Guest 入口只处理一条链接，并先返回可交互详情卡：
 
 - Pixiv 单图可点“直发图片”（使用缓存公开 URL 编辑 inline 图片）；多图只提供 Telegra.ph，避免 Guest inline 消息上传本地文件的限制。
 - e-hentai / ExHentai 的“归档 · 1280x（默认）”按钮排在首位，也可改选网页显示图、网页原图或归档原图；由于 Guest API 只能编辑一条 inline 回复，归档按钮在 Guest 中会安全回退为网页显示图。
 - nhentai 与其他图集站点提供“开始发布”按钮，最终结果仍编辑回同一条 Guest 回复。
 
-处理过程会持续编辑同一条回复；Guest Bot 看不到聊天历史，也不会自动接收后续消息。按钮仅允许最初召唤 Bot 的用户操作。
+处理过程会持续编辑同一条回复；取消后会短暂延迟尝试删除响应。由于 Telegram 标准接口目前不能按 `inline_message_id` 删除 Guest inline 消息，普通 Bot API 部署会保留“已取消”文本作为兼容结果。Guest Bot 看不到聊天历史，也不会自动接收后续消息。按钮仅允许最初召唤 Bot 的用户操作。
 
 使用者仍需通过本 Bot 白名单授权。开启 Guest Mode 需要 Telegram Bot API 10.0 或更高版本；使用本项目自带的本地 Bot API 时也要同步更新服务镜像。
 

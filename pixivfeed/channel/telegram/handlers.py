@@ -777,10 +777,15 @@ async def _safe_update_buttons(
     一律静默返回 False；prefetch 永远不应该把"处理中"覆盖回详情卡。
     """
     pending = _PENDING.get(token)
-    if pending is None:
-        return False
-    if pending.chat_id != placeholder.chat.id or pending.msg_id != placeholder.message_id:
-        return False
+    if pending is not None:
+        if pending.chat_id != placeholder.chat.id or pending.msg_id != placeholder.message_id:
+            return False
+    else:
+        # Guest inline 消息没有可比对的普通 message_id；用对象身份绑定状态，
+        # 防止过期 prefetch 覆盖另一张 Guest 详情卡。
+        guest_pending = _GUEST_PENDING.get(token)
+        if guest_pending is None or guest_pending.reply is not placeholder:
+            return False
     try:
         await placeholder.edit_reply_markup(reply_markup=new_markup)
         return True
@@ -908,35 +913,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _guest_input_text(message) -> str:
-    """拼出 Guest Mode 本次可见的输入文本。
-
-    Guest update 只携带召唤消息和（若为回复）被回复消息；不读取聊天历史。
-    链接可能在任一条消息的正文或 caption 中，按正文优先、回复其次合并。
-    """
-    chunks: list[str] = []
-    for item in (message, getattr(message, "reply_to_message", None)):
-        if item is None:
-            continue
-        value = item.text or item.caption or ""
-        if value and value not in chunks:
-            chunks.append(value)
-    return "\n".join(chunks)
+    """只读取显式召唤消息本身，不处理被回复消息或聊天历史。"""
+    return message.text or message.caption or ""
 
 
 def _make_guest_eh_keyboard(token: str) -> InlineKeyboardMarkup:
-    """Guest 专用 EH 键盘：默认视觉顺序为归档 1280x。"""
-    rows = [
-        [
-            InlineKeyboardButton("📦 归档 · 1280x（默认）", callback_data=f"g:{token}:archive_resample"),
-            InlineKeyboardButton("🌐 网页 · 显示图", callback_data=f"g:{token}:page_sample"),
-        ],
-        [
-            InlineKeyboardButton("🌐 网页 · 原图", callback_data=f"g:{token}:page_original"),
-            InlineKeyboardButton("📦 归档 · 原图", callback_data=f"g:{token}:archive_original"),
-        ],
-        [InlineKeyboardButton("取消", callback_data=f"g:{token}:cancel")],
-    ]
-    return InlineKeyboardMarkup(rows)
+    """Guest EH 键盘与普通详情卡共用完全相同的布局与文案。"""
+    return _make_eh_keyboard(token, prefix="g")
 
 
 def _make_guest_pixiv_keyboard(token: str, work) -> InlineKeyboardMarkup:
@@ -979,7 +962,7 @@ async def _guest_error(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
 
 async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Guest Mode 入口：``链接 @bot`` 或回复链接后 ``@bot``。
+    """Guest Mode 入口：在同一条消息中发送 ``链接 @bot``。
 
     Guest reply 是一次性的，因此详情卡和最终产物都编辑同一条 inline 消息。
     """
@@ -1109,6 +1092,10 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode=ParseMode.HTML,
             reply_markup=_make_guest_eh_keyboard(token),
             disable_web_page_preview=True,
+        )
+        _schedule_eh_size_prefetch(
+            context, placeholder, token, ref, prefix="g",
+            keyboard_builder=lambda sizes: _make_eh_keyboard(token, sizes=sizes, prefix="g"),
         )
         return
 
@@ -1826,6 +1813,38 @@ async def _delete_pair_after_cancel(
             logger.debug(f"cancel-delete: delete_message({chat_id}, {mid}) failed: {e}")
 
 
+async def _delete_guest_reply_after_cancel(reply: GuestReply, callback_message=None) -> None:
+    """取消后短暂延迟删除 Guest 回复。
+
+    兼容未来/本地 Bot API 可能提供的 delete_guest_message；标准 Guest inline
+    回复目前只有 inline_message_id，无法通过 deleteMessage 删除，因此退回已取消文本。
+    """
+    try:
+        await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return
+
+    # 某些实现可能把回调来源作为普通 Message 提供，优先使用它。
+    if callback_message is not None and hasattr(callback_message, "delete"):
+        try:
+            await callback_message.delete()
+            return
+        except Exception as e:
+            logger.debug(f"guest cancel message delete failed: {e}")
+
+    # 为本地/未来 Bot API 保留能力探测，不影响当前 PTB 标准实现。
+    deleter = getattr(reply._bot, "delete_guest_message", None)
+    if callable(deleter):
+        try:
+            await deleter(inline_message_id=reply.inline_message_id)
+            return
+        except Exception as e:
+            logger.debug(f"guest inline delete failed: {e}")
+    logger.debug("Guest inline message has no standard delete API; keeping cancel fallback")
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """所有 inline button 都进这里。"""
     query = update.callback_query
@@ -1978,6 +1997,11 @@ async def _handle_guest_callback(update: Update, context: ContextTypes.DEFAULT_T
             await pending.reply.edit_text("已取消")
         except Exception:
             pass
+        start_background_task(
+            context.application,
+            _delete_guest_reply_after_cancel(pending.reply, query.message),
+            name=f"guest-cancel-delete-{token}",
+        )
         return
 
     if pending.ref.provider == "pixiv":
