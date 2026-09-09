@@ -77,8 +77,11 @@ from ...provider.pixiv import (
     PixivAuthError,
     PixivNotFoundError,
     PixivProvider,
+    UgoiraError,
+    UgoiraFFmpegMissingError,
 )
 from ...provider.pixiv.novel_publisher import fetch_novel_markdown, publish_novel
+from ...provider.pixiv.ugoira import ffmpeg_available
 from ...publisher import TelegraphPublisher
 from ...storage import (
     KIND_ARCHIVE_CMD,
@@ -2279,8 +2282,24 @@ async def _handle_pixiv_illust(
         return
 
     if work.is_ugoira:
-        await update.message.reply_text(
-            f"⚠️ 暂不支持动图（ugoira）：https://www.pixiv.net/artworks/{pid}"
+        if not ffmpeg_available():
+            await update.message.reply_text(
+                "⚠️ 当前部署未安装 ffmpeg，无法转换 Pixiv 动图（ugoira）；"
+                "普通插画与小说不受影响。\n"
+                f"原作链接：https://www.pixiv.net/artworks/{pid}"
+            )
+            return
+        placeholder = await update.message.reply_text(f"⏳ 已收到（pixiv 动图 {pid}），准备处理...")
+        if not await _gate_disk_space(context, placeholder):
+            return
+        user_id = update.effective_user.id if update.effective_user else 0
+
+        async def _do_ugoira() -> None:
+            await _send_pixiv_ugoira(update, context, work, placeholder=placeholder)
+
+        await _enqueue(
+            context, category="direct_image", user_id=user_id, placeholder=placeholder,
+            work_label=f"pixiv {pid} 转换动图中...", coro_factory=_do_ugoira,
         )
         return
 
@@ -2503,8 +2522,23 @@ async def _pixiv_offer_modes(
         return
 
     if work.is_ugoira:
-        await placeholder.edit_text(
-            f"⚠️ 暂不支持动图（ugoira）：https://www.pixiv.net/artworks/{pid}"
+        if not ffmpeg_available():
+            await placeholder.edit_text(
+                "⚠️ 当前部署未安装 ffmpeg，无法转换 Pixiv 动图（ugoira）；"
+                "普通插画与小说不受影响。\n"
+                f"原作链接：https://www.pixiv.net/artworks/{pid}"
+            )
+            return
+        if not await _gate_disk_space(context, placeholder):
+            return
+        user_id = update.effective_user.id if update.effective_user else 0
+
+        async def _do_ugoira() -> None:
+            await _send_pixiv_ugoira(update, context, work, placeholder=placeholder)
+
+        await _enqueue(
+            context, category="direct_image", user_id=user_id, placeholder=placeholder,
+            work_label=f"pixiv {pid} 转换动图中...", coro_factory=_do_ugoira,
         )
         return
 
@@ -3383,6 +3417,98 @@ async def _send_pixiv_guest_direct(
     await _log_usage(
         context, update, kind="pixiv_direct", provider="pixiv", ref_id=pid,
         bytes_out=bytes_out,
+    )
+
+
+# ---------------------------------------------------------------------------
+# pixiv ugoira 动图
+# ---------------------------------------------------------------------------
+
+
+async def _send_pixiv_ugoira(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    work,
+    placeholder=None,
+    *,
+    reply_to_message_id: int | None = None,
+    reply_to_chat_id: int | None = None,
+) -> None:
+    """下载帧包并用 ffmpeg 转 GIF，以 Telegram animation 回复。
+
+    ffmpeg 缺失或转换失败只改 placeholder 文案，不写成功记录、不留缓存半成品。
+    reply_to_* 语义与 _send_pixiv_illust_direct 一致。
+    """
+    config, registry, _, _, _ = _ctx(context)
+    pixiv = _pixiv_provider(registry)
+    assert pixiv is not None
+    pid = work.pid
+
+    if placeholder is None:
+        placeholder = await update.message.reply_text("⏳ 处理动图中...")
+
+    try:
+        result = await pixiv.fetch_and_convert_ugoira(work)
+    except UgoiraFFmpegMissingError:
+        logger.info(f"[{pid}] ugoira requested but ffmpeg is unavailable")
+        await placeholder.edit_text(
+            "⚠️ 当前部署未安装 ffmpeg，无法转换 Pixiv 动图（ugoira）；"
+            "普通插画与小说不受影响。\n"
+            f"原作链接：https://www.pixiv.net/artworks/{pid}"
+        )
+        return
+    except (UgoiraError, PixivAPIError) as e:
+        logger.exception(f"ugoira convert({pid}) failed")
+        await placeholder.edit_text(f"⚠️ 动图处理失败：{e}")
+        return
+
+    caption = _render_direct_caption(
+        config.templates.illust.direct_caption, work.template_vars()
+    )
+    chat_id = reply_to_chat_id if reply_to_chat_id is not None else update.effective_chat.id
+    if reply_to_message_id is not None:
+        reply_to = reply_to_message_id
+    else:
+        reply_to = update.effective_message.message_id
+    chat = update.effective_chat
+    use_spoiler = (
+        chat is not None and chat.type in ("group", "supergroup") and (work.x_restrict or 0) >= 1
+    )
+
+    try:
+        with open(result.gif_path, "rb") as f:
+            await context.bot.send_animation(
+                chat_id=chat_id,
+                animation=f,
+                caption=caption or None,
+                parse_mode=ParseMode.HTML if caption else None,
+                reply_to_message_id=reply_to,
+                has_spoiler=use_spoiler,
+            )
+    except Exception as e:
+        logger.exception(f"send_ugoira({pid}) failed")
+        try:
+            await placeholder.edit_text(f"⚠️ 发送失败：{e}")
+        except Exception:
+            pass
+        await _log_usage(
+            context, update,
+            kind="pixiv_direct", provider="pixiv", ref_id=pid, status="failed",
+        )
+        return
+
+    try:
+        await placeholder.delete()
+    except Exception:
+        pass
+
+    try:
+        bytes_out = result.gif_path.stat().st_size
+    except OSError:
+        bytes_out = 0
+    await _log_usage(
+        context, update,
+        kind="pixiv_direct", provider="pixiv", ref_id=pid, bytes_out=bytes_out,
     )
 
 

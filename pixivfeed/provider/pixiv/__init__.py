@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,14 @@ from .api import PixivAPI, PixivAPIError, PixivAuthError, PixivNotFoundError
 from .downloader import DownloadedImage, PixivDownloader, relative_url
 from .model import IllustWork, NovelWork
 from .parser import parse_illust_meta, parse_novel_meta
+from .ugoira import (
+    UgoiraError,
+    UgoiraFFmpegMissingError,
+    UgoiraValidationError,
+    convert_ugoira,
+    ffmpeg_available,
+    parse_ugoira_meta,
+)
 from .url import extract_pixiv_refs, parse_inline_query
 
 
@@ -33,6 +42,15 @@ class IllustResult:
     images: list[DownloadedImage]
     public_urls_original: list[str]
     public_urls_tgphoto: list[str]
+
+
+@dataclass
+class UgoiraResult:
+    """动图转换结果：GIF 本地路径 + Nginx 对外 URL。"""
+
+    work: IllustWork
+    gif_path: Path
+    public_url: str
 
 
 class PixivProvider(Provider):
@@ -52,6 +70,8 @@ class PixivProvider(Provider):
         self.config = config
         self.cache_dir = Path(cache_dir)
         self.public_base_url = public_base_url.rstrip("/")
+        # 同一 pid 的转换串行化，避免两个请求同时下载/转换同一个动图。
+        self._ugoira_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def phpsessid(self) -> str:
@@ -157,6 +177,54 @@ class PixivProvider(Provider):
             body = await api.fetch_novel(nid)
             return parse_novel_meta(body)
 
+    # ------------------------------------------------------------------
+    # Ugoira
+    # ------------------------------------------------------------------
+
+    async def fetch_and_convert_ugoira(self, work: IllustWork) -> UgoiraResult:
+        """拉 ugoira_meta、下载帧 ZIP 并转成 GIF。
+
+        产物在 {cache_dir}/{pid}/ugoira/animation.gif，命中即返回。ZIP 是
+        转换期间的临时文件，任何失败都清掉半成品，下次请求全量重试。
+        """
+        pid = work.pid
+        lock = self._ugoira_locks.setdefault(pid, asyncio.Lock())
+        async with lock:
+            work_dir = self.cache_dir / pid / "ugoira"
+            gif_path = work_dir / "animation.gif"
+
+            if not gif_path.exists():
+                # 缺 ffmpeg 时在发起任何 HTTP 请求前失败。
+                if not ffmpeg_available():
+                    raise UgoiraFFmpegMissingError("ffmpeg not found; ugoira conversion unavailable")
+                work_dir.mkdir(parents=True, exist_ok=True)
+                async with PixivAPI(self.phpsessid, self.timeout) as api:
+                    meta = parse_ugoira_meta(await api.fetch_ugoira_meta(pid))
+                    zip_bytes = await api.download_image(meta.zip_url)
+
+                zip_path = work_dir / ".frames.zip.tmp"
+                try:
+                    zip_path.write_bytes(zip_bytes)
+                    # ZIP 解包 + ffmpeg 都是阻塞操作，扔到线程池。
+                    await asyncio.to_thread(convert_ugoira, zip_path, meta, gif_path)
+                except BaseException:
+                    try:
+                        gif_path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.exception(f"[{pid}] failed to clean partial ugoira gif")
+                    raise
+                finally:
+                    try:
+                        zip_path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.exception(f"[{pid}] failed to clean ugoira zip")
+
+            return UgoiraResult(
+                work=work,
+                gif_path=gif_path,
+                public_url=relative_url(self.public_base_url, self.cache_dir, gif_path),
+            )
+
 
 def _illust_result_to_gallery(result: IllustResult) -> GalleryWork:
     """把 pixiv 的 IllustResult 降维成通用 GalleryWork。"""
@@ -188,11 +256,15 @@ def _illust_result_to_gallery(result: IllustResult) -> GalleryWork:
 __all__ = [
     "PixivProvider",
     "IllustResult",
+    "UgoiraResult",
     "IllustWork",
     "NovelWork",
     "PixivAPIError",
     "PixivAuthError",
     "PixivNotFoundError",
+    "UgoiraError",
+    "UgoiraFFmpegMissingError",
+    "UgoiraValidationError",
     "extract_pixiv_refs",
     "parse_inline_query",
 ]
