@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.14.2 — 2026-09-27
+
+### 修复 / 变更
+- **改进 `/zip2tph` 图片排序**：使用 `natsort` 的自然路径排序，数字按整数比较，支持多级目录、大小写折叠和稳定 tie-breaker，避免 `1/10/2` 的字典序错乱。
+
+### 改动文件
+- `pixivfeed/channel/telegram/handlers.py`
+- `tests/test_zip2tph_archives.py`
+- `pyproject.toml`
+
 ## v0.14.1 — 2026-09-27
 
 ### 修复 / 变更

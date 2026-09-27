@@ -33,6 +33,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from natsort import natsorted, ns
 from PIL import Image
 
 try:
@@ -3928,6 +3929,15 @@ def _archive_member_name(name: str) -> str:
     return path.as_posix()
 
 
+def _sort_archive_members(members: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """按人类直觉排序归档成员，而不是按字符逐个比较。"""
+    return natsorted(
+        members,
+        key=lambda item: item[0],
+        alg=ns.INT | ns.PATH | ns.IGNORECASE | ns.PRESORT,
+    )
+
+
 def _iter_archive_metadata(archive_path: Path, limits) -> tuple[str, list[tuple[str, int]]]:
     """返回归档类型和 (成员名, 未压缩大小)，同时拒绝危险成员。"""
     max_entries = int(limits.max_entries)
@@ -3945,7 +3955,7 @@ def _iter_archive_metadata(archive_path: Path, limits) -> tuple[str, list[tuple[
                 if stat.S_ISLNK(mode):
                     raise ArchiveError(f"symbolic link is not allowed: {info.filename!r}")
                 members.append((name, int(info.file_size)))
-        return "zip", sorted(members, key=lambda item: item[0])
+        return "zip", _sort_archive_members(members)
 
     if tarfile.is_tarfile(archive_path):
         with tarfile.open(archive_path, "r:*") as tf:
@@ -3959,7 +3969,7 @@ def _iter_archive_metadata(archive_path: Path, limits) -> tuple[str, list[tuple[
                 if not info.isfile():
                     raise ArchiveError(f"non-regular archive member is not allowed: {info.name!r}")
                 members.append((name, int(info.size)))
-        return "tar", sorted(members, key=lambda item: item[0])
+        return "tar", _sort_archive_members(members)
 
     if rarfile is not None and rarfile.is_rarfile(archive_path):
         try:
@@ -3978,7 +3988,7 @@ def _iter_archive_metadata(archive_path: Path, limits) -> tuple[str, list[tuple[
             raise
         except Exception as exc:
             raise ArchiveError("RAR backend cannot read this archive") from exc
-        return "rar", sorted(members, key=lambda item: item[0])
+        return "rar", _sort_archive_members(members)
 
     if py7zr is not None and py7zr.is_7zfile(archive_path):
         try:
@@ -3997,7 +4007,7 @@ def _iter_archive_metadata(archive_path: Path, limits) -> tuple[str, list[tuple[
             raise
         except Exception as exc:
             raise ArchiveError("7z backend cannot read this archive") from exc
-        return "7z", sorted(members, key=lambda item: item[0])
+        return "7z", _sort_archive_members(members)
 
     raise ArchiveError("unsupported or corrupted archive format")
 

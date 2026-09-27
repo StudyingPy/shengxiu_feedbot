@@ -1,6 +1,6 @@
 [project]
 name = "pixiv-feed-bot"
-version = "0.14.1"
+version = "0.14.2"
 description = "Telegram bot that turns Pixiv links into Telegra.ph pages or inline images."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,7 @@ dependencies = [
     "pykakasi>=2.3,<3",
     "rarfile>=4.2",
     "py7zr>=0.22",
+    "natsort>=8.4",
 ]
 
 [dependency-groups]

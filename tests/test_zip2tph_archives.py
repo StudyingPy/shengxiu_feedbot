@@ -15,6 +15,7 @@ from pixivfeed.channel.telegram.handlers import (  # noqa: E402
     _extract_image_archive,
     _inspect_image_archive,
     _safe_download_failure,
+    _sort_archive_members,
 )
 from pixivfeed.provider.ehentai._archive import ArchiveError  # noqa: E402
 
@@ -65,3 +66,20 @@ def test_rejects_unsafe_member(tmp_path: Path, archive_limits) -> None:
         zf.writestr("../../escape.png", _png_bytes())
     with pytest.raises(ArchiveError):
         _inspect_image_archive(archive, archive_limits)
+
+
+def test_natural_sort_handles_numbers_paths_and_case() -> None:
+    members = [(name, 1) for name in (
+        "chapter10/page2.jpg",
+        "chapter2/page10.jpg",
+        "chapter2/page1.jpg",
+        "chapter10/page1.jpg",
+        "chapter2/Page01.jpg",
+    )]
+    assert [name for name, _ in _sort_archive_members(members)] == [
+        "chapter2/Page01.jpg",
+        "chapter2/page1.jpg",
+        "chapter2/page10.jpg",
+        "chapter10/page1.jpg",
+        "chapter10/page2.jpg",
+    ]
