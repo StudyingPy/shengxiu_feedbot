@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import os
 import re
 import shutil
+import stat
+import tarfile
 import tempfile
 import time
 import unicodedata
@@ -28,8 +31,18 @@ import uuid
 import zipfile
 from collections import deque
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from PIL import Image
+
+try:
+    import py7zr
+except ImportError:  # pragma: no cover - optional deployment dependency
+    py7zr = None
+try:
+    import rarfile
+except ImportError:  # pragma: no cover - optional deployment dependency
+    rarfile = None
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -1305,7 +1318,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /pixiv_direct <链接>     强制 pixiv 直发图片\n"
         "  /archive <链接>          直接返回压缩包（eh/ex 仍弹模式按钮）\n"
         "  /ehsearch <关键词>       搜索 eh/ex 画廊（点结果即开）\n"
-        "  /zip2tph                 回复一张 zip 图片包，发布为 Telegra.ph\n"
+        "  /zip2tph                 回复图片归档，发布为 Telegra.ph\n"
         "  /wiki <词条>             查中文维基百科\n"
         "  /chatid                  查看当前 chat_id\n"
         "  /setting list            （仅 admin）查看运行时配置\n"
@@ -3399,19 +3412,68 @@ async def _send_pixiv_guest_direct(
 # 上传到 cache_dir 下独立子目录，交给 Nginx 暴露给 Telegra.ph。
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+_ARCHIVE_EXTS = {
+    ".zip", ".tar", ".tgz", ".tar.gz", ".tbz", ".tbz2", ".tar.bz2",
+    ".txz", ".tar.xz", ".rar", ".7z",
+}
 
 
-def _is_zip(document) -> bool:
-    """文档是否像一个 zip。"""
+def _is_archive(document) -> bool:
+    """文档是否像一个受支持的图片归档。"""
     if document is None:
         return False
     name = (document.file_name or "").lower()
     mime = (document.mime_type or "").lower()
-    if name.endswith(".zip"):
+    if any(name.endswith(ext) for ext in _ARCHIVE_EXTS):
         return True
-    if mime in ("application/zip", "application/x-zip-compressed", "application/octet-stream"):
-        return name.endswith(".zip") or mime.startswith("application/zip")
+    if mime in (
+        "application/zip", "application/x-zip-compressed", "application/gzip",
+        "application/x-gzip", "application/x-tar", "application/x-bzip2",
+        "application/x-xz", "application/octet-stream",
+        "application/vnd.rar", "application/x-7z-compressed",
+    ):
+        return mime != "application/octet-stream" or bool(name)
     return False
+
+
+def _safe_download_failure(exc: BaseException) -> str:
+    """将 PTB/HTTP/本地文件异常映射为不泄漏路径的用户提示。"""
+    text = str(exc).lower()
+    if isinstance(exc, PermissionError) or "permission denied" in text or "access is denied" in text:
+        return "本地 Bot API 已返回文件，但 bot 进程无权读取。请检查共享挂载和文件权限。"
+    if isinstance(exc, FileNotFoundError) or "no such file" in text or "not found" in text:
+        return "本地 Bot API 返回的文件路径在 bot 进程中不可见。请检查容器挂载路径。"
+    if _is_timeout_exc(exc):
+        return "下载超时；请检查本地 Bot API 到 Telegram 的连接后重试。"
+    return "Bot API 文件下载失败，请检查本地 Bot API 状态和日志。"
+
+
+async def _download_telegram_file(tg_file, destination: Path) -> None:
+    """下载 Telegram 文件，保留原子落盘并隐藏本地 Bot API 路径。"""
+    partial = destination.with_suffix(destination.suffix + ".part")
+    try:
+        source_name = getattr(tg_file, "file_path", None)
+        source = Path(source_name) if source_name else None
+        if source is not None and source.is_absolute():
+            def _copy_local() -> None:
+                with source.open("rb") as src, partial.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                os.replace(partial, destination)
+
+            await asyncio.to_thread(_copy_local)
+            return
+        await tg_file.download_to_drive(
+            custom_path=str(partial),
+            read_timeout=TG_UPLOAD_TIMEOUT, write_timeout=TG_UPLOAD_TIMEOUT,
+            connect_timeout=60, pool_timeout=60,
+        )
+        await asyncio.to_thread(os.replace, partial, destination)
+    except Exception:
+        try:
+            await asyncio.to_thread(partial.unlink, True)
+        except OSError:
+            pass
+        raise
 
 
 async def cmd_zip2tph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3431,10 +3493,10 @@ async def cmd_zip2tph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = update.effective_message
     target_msg = msg.reply_to_message if msg.reply_to_message else msg
     document = target_msg.document if target_msg else None
-    if not _is_zip(document):
+    if not _is_archive(document):
         await msg.reply_text(
-            "用法：把图片 zip 发给我并在 caption 里写 /zip2tph，"
-            "或对 zip 消息回复 /zip2tph"
+            "用法：把图片归档发给我并在 caption 里写 /zip2tph，"
+            "或对归档消息回复 /zip2tph（支持 zip、tar、tar.gz、tar.bz2、tar.xz、rar、7z）"
         )
         return
     await _enqueue_zip_to_telegraph(update, context, target_msg, force_r2=force_r2)
@@ -3447,7 +3509,7 @@ async def handle_zip_document(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await _track_user(update, context)
     msg = update.effective_message
-    if not _is_zip(msg.document):
+    if not _is_archive(msg.document):
         return
     caption = (msg.caption or "").strip()
     if not caption.lower().startswith("/zip2tph"):
@@ -3505,8 +3567,9 @@ async def _process_zip_to_telegraph(
     document = zip_msg.document
     file_size = document.file_size or 0
 
+    limits = config.zip2tph
     # Telegram 标准 Bot API getFile 只支持 ≤20MB 下载；本地 Bot API 可放宽。
-    # 这里直接尝试，失败时给清晰的报错。
+    # 下载 helper 会区分本地路径不可读和网络失败，且不会把 token 路径回显。
     if placeholder is None:
         placeholder = await update.effective_message.reply_text(
             f"⏳ 接收 zip ({fmt_bytes(file_size)})..."
@@ -3514,8 +3577,35 @@ async def _process_zip_to_telegraph(
     progress = Progress(placeholder, prefix=f"📦 {document.file_name or 'archive.zip'}")
     _attach_progress_markup(progress, placeholder)
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="zip2tph_"))
-    zip_path = tmpdir / "input.zip"
+    max_archive_bytes = int(limits.max_archive_size_gb * 1024 ** 3)
+    if file_size > max_archive_bytes:
+        await progress.finish(
+            f"⚠️ 归档过大：{fmt_bytes(file_size)}，上限 {fmt_bytes(max_archive_bytes)}"
+        )
+        await _log_usage(
+            context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+            bytes_in=file_size, status="failed",
+        )
+        return
+
+    work_root = Path(limits.work_dir) if limits.work_dir else None
+    tmpdir: Path | None = None
+    zip_path: Path | None = None
+    public_dir: Path | None = None
+    published_ok = False
+    try:
+        if work_root is not None:
+            work_root.mkdir(parents=True, exist_ok=True)
+        tmpdir = Path(tempfile.mkdtemp(prefix="zip2tph_", dir=str(work_root) if work_root else None))
+        zip_path = tmpdir / "input.archive"
+    except OSError:
+        logger.exception("zip2tph work directory is not usable")
+        await progress.finish("⚠️ 无法创建归档工作目录，请联系管理员检查磁盘和权限。")
+        await _log_usage(
+            context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+            bytes_in=file_size, status="failed",
+        )
+        return
     try:
         # 下载并验证大小：超时但落盘字节数等于 file_size 仍视为成功。
         download_ok = False
@@ -3531,7 +3621,7 @@ async def _process_zip_to_telegraph(
                 tracker = ByteRateTracker(file_size)
                 stop_watch = asyncio.Event()
 
-                async def _watch_size() -> None:
+                async def _watch_size(tracker=tracker, stop_watch=stop_watch) -> None:
                     while not stop_watch.is_set():
                         try:
                             cur = zip_path.stat().st_size if zip_path.exists() else 0
@@ -3549,11 +3639,7 @@ async def _process_zip_to_telegraph(
 
                 watch_task = asyncio.create_task(_watch_size())
                 try:
-                    await tg_file.download_to_drive(
-                        custom_path=str(zip_path),
-                        read_timeout=TG_UPLOAD_TIMEOUT, write_timeout=TG_UPLOAD_TIMEOUT,
-                        connect_timeout=60, pool_timeout=60,
-                    )
+                    await _download_telegram_file(tg_file, zip_path)
                 finally:
                     stop_watch.set()
                     try:
@@ -3584,25 +3670,84 @@ async def _process_zip_to_telegraph(
                             pass
                     await progress.status("⏳ 下载超时，重试中...")
                     continue
-                await progress.finish(
-                    f"⚠️ 下载 zip 失败：{e}\n"
-                    "（>20MB 必须使用本地 Bot API 且打开 telegram.local_mode=true；"
-                    "Permission denied 见 README 'local Bot API 文件读权限'）"
+                logger.warning(
+                    f"zip2tph download failed ({type(e).__name__}): {_safe_download_failure(e)}"
+                )
+                await progress.finish(f"⚠️ 下载归档失败：{_safe_download_failure(e)}")
+                await _log_usage(
+                    context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                    bytes_in=actual, status="failed",
                 )
                 return
         if not download_ok:
             await progress.finish("⚠️ 下载 zip 失败：连续两次超时未完成")
+            await _log_usage(
+                context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                bytes_in=zip_path.stat().st_size if zip_path.exists() else 0,
+                status="failed",
+            )
+            return
+
+        actual_downloaded = zip_path.stat().st_size if zip_path.exists() else 0
+        if actual_downloaded <= 0 or actual_downloaded > max_archive_bytes:
+            await progress.finish(
+                f"⚠️ 下载后的归档大小无效：{fmt_bytes(actual_downloaded)}"
+            )
+            await _log_usage(
+                context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                bytes_in=actual_downloaded, status="failed",
+            )
+            return
+        if file_size > 0 and actual_downloaded != file_size:
+            await progress.finish(
+                f"⚠️ 归档下载不完整：收到 {fmt_bytes(actual_downloaded)}，"
+                f"应为 {fmt_bytes(file_size)}"
+            )
+            await _log_usage(
+                context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                bytes_in=actual_downloaded, status="failed",
+            )
             return
 
         # 解压：放到线程池避免阻塞 event loop；同时旁路 watcher 监听输出目录推进度。
-        await progress.status("⏳ 解析 zip 中（统计文件数）...")
+        await progress.status("⏳ 解析归档中（统计文件数）...")
         try:
-            total_imgs = await asyncio.to_thread(_count_zip_images, zip_path)
-        except zipfile.BadZipFile as e:
-            await progress.finish(f"⚠️ 不是有效 zip：{e}")
+            archive_info = await asyncio.to_thread(_inspect_image_archive, zip_path, limits)
+            total_imgs = archive_info[0]
+        except (ArchiveError, zipfile.BadZipFile, tarfile.TarError, OSError) as e:
+            await progress.finish(f"⚠️ 不是有效或安全的图片归档：{e}")
+            await _log_usage(
+                context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                bytes_in=file_size, status="failed",
+            )
             return
         if total_imgs == 0:
-            await progress.finish("⚠️ zip 内没有可识别的图片")
+            await progress.finish("⚠️ 归档内没有可识别的图片")
+            await _log_usage(
+                context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                bytes_in=file_size, status="failed",
+            )
+            return
+
+        # 解压目录和 cache_dir 可能不是同一挂载点，分别做峰值检查。
+        estimated = int(archive_info[1])
+        work_probe = tmpdir if tmpdir.exists() else tmpdir.parent
+        work_ok, work_free, work_required = check_disk_free(
+            work_probe, extra_required=estimated + file_size
+        )
+        cache_ok, cache_free, cache_required = check_disk_free(
+            Path(config.storage.cache_dir), extra_required=estimated
+        )
+        if not work_ok or not cache_ok:
+            free = min(work_free, cache_free)
+            required = max(work_required, cache_required)
+            await progress.finish(
+                f"⚠️ 解压所需磁盘空间不足：剩余 {fmt_bytes(free)}，至少需要 {fmt_bytes(required)}"
+            )
+            await _log_usage(
+                context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                bytes_in=file_size, status="failed",
+            )
             return
 
         extract_dir = tmpdir / "extracted"
@@ -3635,12 +3780,22 @@ async def _process_zip_to_telegraph(
         watch_extract_task = asyncio.create_task(_watch_extract())
         try:
             try:
-                images = await asyncio.to_thread(_extract_zip_images, zip_path, extract_dir)
+                images = await asyncio.to_thread(
+                    _extract_image_archive, zip_path, extract_dir, limits
+                )
             except ArchiveError as e:
-                await progress.finish(f"⚠️ zip 解析失败：{e}")
+                await progress.finish(f"⚠️ 归档解析失败：{e}")
+                await _log_usage(
+                    context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                    bytes_in=file_size, status="failed",
+                )
                 return
-            except zipfile.BadZipFile as e:
-                await progress.finish(f"⚠️ 不是有效 zip：{e}")
+            except (zipfile.BadZipFile, tarfile.TarError, OSError) as e:
+                await progress.finish(f"⚠️ 不是有效图片归档：{e}")
+                await _log_usage(
+                    context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                    bytes_in=file_size, status="failed",
+                )
                 return
         finally:
             stop_extract.set()
@@ -3650,7 +3805,11 @@ async def _process_zip_to_telegraph(
                 pass
 
         if not images:
-            await progress.finish("⚠️ zip 内没有可识别的图片")
+            await progress.finish("⚠️ 归档内没有可识别的图片")
+            await _log_usage(
+                context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                bytes_in=file_size, status="failed",
+            )
             return
 
         # 拷贝到 cache_dir 让 Nginx 暴露。这是 R2 不可用 / R2 上传失败 / R2 被
@@ -3665,7 +3824,7 @@ async def _process_zip_to_telegraph(
         for i, src in enumerate(images):
             ext = src.suffix.lower() or ".jpg"
             dest = public_dir / f"p{i:04d}{ext}"
-            shutil.copy2(src, dest)
+            await asyncio.to_thread(shutil.copy2, src, dest)
             rel = dest.resolve().relative_to(cache_dir.resolve())
             public_url = f"{config.publish.base_url.rstrip('/')}/{rel.as_posix()}"
             # R2 key 用 zip_{token}/pN.ext 跟 cache_dir 相对路径完全对齐——便于
@@ -3680,7 +3839,10 @@ async def _process_zip_to_telegraph(
 
         # 标题：去掉扩展名
         raw_name = document.file_name or "archive.zip"
-        title = re.sub(r"\.zip$", "", raw_name, flags=re.IGNORECASE).strip() or "图片包"
+        title = re.sub(
+            r"\.(?:tar\.gz|tar\.bz2|tar\.xz|zip|tar|tgz|tbz|tbz2|txz|rar|7z)$", "",
+            raw_name, flags=re.IGNORECASE,
+        ).strip() or "图片包"
 
         await _drop_cancel_button(placeholder)
         await progress.status("⏳ 发布到 Telegra.ph...")
@@ -3712,14 +3874,17 @@ async def _process_zip_to_telegraph(
                 on_status=progress.update,
                 force_r2=force_r2,
             )
-        except Exception as e:
+        except Exception:
             logger.exception("zip2tph publish_gallery failed")
-            await progress.finish(f"⚠️ 发布失败：{e}")
+            await progress.finish("⚠️ 发布失败，请稍后重试；详细原因已记录到服务日志。")
             await _log_usage(
                 context, update, kind=KIND_ZIP2TPH,
                 ref_id=document.file_unique_id, status="failed",
             )
             return
+
+        # Telegraph 页面已经提交；后续 Telegram 编辑失败也不能删掉其图片源。
+        published_ok = True
 
         suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
         if suffix:
@@ -3740,46 +3905,205 @@ async def _process_zip_to_telegraph(
             bytes_in=file_size,
         )
     finally:
+        if public_dir is not None and not published_ok:
+            try:
+                await asyncio.to_thread(shutil.rmtree, public_dir, True)
+            except Exception:
+                logger.warning("zip2tph failed to remove partial public dir")
         try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            if tmpdir is not None:
+                await asyncio.to_thread(shutil.rmtree, tmpdir, True)
         except Exception:
             pass
 
 
-def _count_zip_images(zip_path: Path) -> int:
-    """快速统计 zip 内可识别的图片数（不解压）。"""
-    n = 0
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        for name in zf.namelist():
-            if name.endswith("/"):
-                continue
-            if Path(name).suffix.lower() in _IMAGE_EXTS:
-                n += 1
-    return n
+def _archive_member_name(name: str) -> str:
+    """验证归档成员路径并返回稳定的 POSIX 名称。"""
+    raw = name.replace("\\", "/")
+    path = PurePosixPath(raw)
+    if path.is_absolute() or ".." in path.parts:
+        raise ArchiveError(f"archive member path is unsafe: {name!r}")
+    if not path.name:
+        return ""
+    return path.as_posix()
 
 
-def _extract_zip_images(zip_path: Path, dest_dir: Path) -> list[Path]:
-    """解压 zip，仅保留图片，按字典序返回路径列表。"""
+def _iter_archive_metadata(archive_path: Path, limits) -> tuple[str, list[tuple[str, int]]]:
+    """返回归档类型和 (成员名, 未压缩大小)，同时拒绝危险成员。"""
+    max_entries = int(limits.max_entries)
+    members: list[tuple[str, int]] = []
+    if zipfile.is_zipfile(archive_path):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            if len(infos) > max_entries:
+                raise ArchiveError(f"archive contains too many entries ({len(infos)})")
+            for info in infos:
+                name = _archive_member_name(info.filename)
+                if not name:
+                    continue
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if stat.S_ISLNK(mode):
+                    raise ArchiveError(f"symbolic link is not allowed: {info.filename!r}")
+                members.append((name, int(info.file_size)))
+        return "zip", sorted(members, key=lambda item: item[0])
+
+    if tarfile.is_tarfile(archive_path):
+        with tarfile.open(archive_path, "r:*") as tf:
+            infos = [i for i in tf.getmembers() if not i.isdir()]
+            if len(infos) > max_entries:
+                raise ArchiveError(f"archive contains too many entries ({len(infos)})")
+            for info in infos:
+                name = _archive_member_name(info.name)
+                if not name:
+                    continue
+                if not info.isfile():
+                    raise ArchiveError(f"non-regular archive member is not allowed: {info.name!r}")
+                members.append((name, int(info.size)))
+        return "tar", sorted(members, key=lambda item: item[0])
+
+    if rarfile is not None and rarfile.is_rarfile(archive_path):
+        try:
+            with rarfile.RarFile(archive_path, "r") as rf:
+                infos = [i for i in rf.infolist() if not i.is_dir()]
+                if len(infos) > max_entries:
+                    raise ArchiveError(f"archive contains too many entries ({len(infos)})")
+                for info in infos:
+                    name = _archive_member_name(info.filename)
+                    if not name:
+                        continue
+                    if getattr(info, "is_symlink", lambda: False)():
+                        raise ArchiveError(f"symbolic link is not allowed: {info.filename!r}")
+                    members.append((name, int(info.file_size)))
+        except ArchiveError:
+            raise
+        except Exception as exc:
+            raise ArchiveError("RAR backend cannot read this archive") from exc
+        return "rar", sorted(members, key=lambda item: item[0])
+
+    if py7zr is not None and py7zr.is_7zfile(archive_path):
+        try:
+            with py7zr.SevenZipFile(archive_path, "r") as archive:
+                infos = [i for i in archive.list() if not getattr(i, "is_directory", False)]
+                if len(infos) > max_entries:
+                    raise ArchiveError(f"archive contains too many entries ({len(infos)})")
+                for info in infos:
+                    name = _archive_member_name(str(info.filename))
+                    if not name:
+                        continue
+                    if getattr(info, "is_symlink", False):
+                        raise ArchiveError(f"symbolic link is not allowed: {info.filename!r}")
+                    members.append((name, int(info.uncompressed)))
+        except ArchiveError:
+            raise
+        except Exception as exc:
+            raise ArchiveError("7z backend cannot read this archive") from exc
+        return "7z", sorted(members, key=lambda item: item[0])
+
+    raise ArchiveError("unsupported or corrupted archive format")
+
+
+def _inspect_image_archive(archive_path: Path, limits) -> tuple[int, int]:
+    kind, members = _iter_archive_metadata(archive_path, limits)
+    del kind
+    total_bytes = sum(size for _, size in members)
+    max_total = int(limits.max_uncompressed_size_gb * 1024 ** 3)
+    if total_bytes > max_total:
+        raise ArchiveError(
+            f"archive expands to {total_bytes / 1024 ** 3:.2f} GiB, limit is "
+            f"{limits.max_uncompressed_size_gb:.2f} GiB"
+        )
+    max_image = int(limits.max_image_size_mb * 1024 ** 2)
+    image_members = [(name, size) for name, size in members if PurePosixPath(name).suffix.lower() in _IMAGE_EXTS]
+    seen: set[str] = set()
+    for name, size in image_members:
+        if size > max_image:
+            raise ArchiveError(f"image is too large: {name!r}")
+        key = PurePosixPath(name).name.lower()
+        if key in seen:
+            raise ArchiveError(f"duplicate image basename: {key!r}")
+        seen.add(key)
+    return len(image_members), total_bytes
+
+
+def _extract_image_archive(archive_path: Path, dest_dir: Path, limits) -> list[Path]:
+    """解压 zip/tar 家族，仅保留有效图片，按归档路径排序。"""
+    kind, members = _iter_archive_metadata(archive_path, limits)
+    max_image = int(limits.max_image_size_mb * 1024 ** 2)
+    image_members = [(name, size) for name, size in members if PurePosixPath(name).suffix.lower() in _IMAGE_EXTS]
     dest_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        names = sorted(n for n in zf.namelist() if not n.endswith("/"))
-        extracted: list[Path] = []
-        for name in names:
-            ext = Path(name).suffix.lower()
-            if ext not in _IMAGE_EXTS:
-                continue
-            target = dest_dir / Path(name).name
-            # 防 zip slip
-            if target.parent.resolve() != dest_dir.resolve():
-                continue
-            with zf.open(name) as src, target.open("wb") as dst:
-                while True:
-                    chunk = src.read(64 * 1024)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-            extracted.append(target)
-    extracted.sort(key=lambda p: p.name)
+    extracted: list[Path] = []
+
+    def write_stream(src, target: Path, expected: int) -> None:
+        copied = 0
+        with target.open("wb") as dst:
+            while chunk := src.read(1024 * 1024):
+                copied += len(chunk)
+                if copied > max_image:
+                    raise ArchiveError(f"image is too large: {target.name!r}")
+                dst.write(chunk)
+        if copied != expected:
+            raise ArchiveError(f"archive member truncated: {target.name!r}")
+        try:
+            with Image.open(target) as image:
+                image.verify()
+        except Exception as exc:
+            raise ArchiveError(f"invalid image: {target.name!r}") from exc
+
+    if kind == "zip":
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            by_name = {_archive_member_name(info.filename): info for info in zf.infolist()}
+            for index, (name, size) in enumerate(image_members):
+                info = by_name.get(name)
+                if info is None:
+                    raise ArchiveError(f"archive member disappeared: {name!r}")
+                target = dest_dir / f"p{index:04d}{PurePosixPath(name).suffix.lower()}"
+                with zf.open(info) as src:
+                    write_stream(src, target, size)
+                extracted.append(target)
+    elif kind == "tar":
+        with tarfile.open(archive_path, "r:*") as tf:
+            by_name = {_archive_member_name(info.name): info for info in tf.getmembers()}
+            for index, (name, size) in enumerate(image_members):
+                info = by_name.get(name)
+                if info is None:
+                    raise ArchiveError(f"archive member disappeared: {name!r}")
+                src = tf.extractfile(info)
+                if src is None:
+                    raise ArchiveError(f"cannot read archive member: {name!r}")
+                target = dest_dir / f"p{index:04d}{PurePosixPath(name).suffix.lower()}"
+                with src:
+                    write_stream(src, target, size)
+                extracted.append(target)
+    elif kind == "rar":
+        if rarfile is None:
+            raise ArchiveError("RAR support is not installed on this deployment")
+        with rarfile.RarFile(archive_path, "r") as rf:
+            by_name = {_archive_member_name(info.filename): info for info in rf.infolist()}
+            for index, (name, size) in enumerate(image_members):
+                info = by_name.get(name)
+                if info is None:
+                    raise ArchiveError(f"archive member disappeared: {name!r}")
+                target = dest_dir / f"p{index:04d}{PurePosixPath(name).suffix.lower()}"
+                with rf.open(info) as src:
+                    write_stream(src, target, size)
+                extracted.append(target)
+    else:
+        if py7zr is None:
+            raise ArchiveError("7z support is not installed on this deployment")
+        with py7zr.SevenZipFile(archive_path, "r") as archive:
+            names = {_archive_member_name(str(info.filename)): str(info.filename) for info in archive.list()}
+            for index, (name, size) in enumerate(image_members):
+                original = names.get(name)
+                if original is None:
+                    raise ArchiveError(f"archive member disappeared: {name!r}")
+                payloads = archive.read([original])
+                src = payloads.get(original)
+                if src is None:
+                    raise ArchiveError(f"cannot read archive member: {name!r}")
+                target = dest_dir / f"p{index:04d}{PurePosixPath(name).suffix.lower()}"
+                with src:
+                    write_stream(src, target, size)
+                extracted.append(target)
     return extracted
 
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.14.1 — 2026-09-27
+
+### 修复 / 变更
+- **修复 `/zip2tph` 本地 Bot API 文件接收**：区分权限、路径不可见、超时和一般下载失败，避免把底层路径直接回显；下载采用原子落盘并补齐失败统计。
+- **扩展归档格式**：支持 ZIP、TAR、TAR.GZ、TAR.BZ2、TAR.XZ、RAR 和 7z；RAR 需要 `unrar`、`unar` 或 `bsdtar` 后端。
+- **加固归档链路**：增加压缩包/解压后/条目/单图大小限制，拒绝路径穿越、符号链接和重复图片名，校验图片内容，异步执行大文件拷贝并清理失败产物。
+
+### 改动文件
+- `pixivfeed/channel/telegram/handlers.py`
+- `pixivfeed/config.py`
+- `config.example.yaml`
+- `docs/DEPLOY.md`
+- `tests/test_zip2tph_archives.py`
+- `pyproject.toml`
+
 ## v0.14.0 — 2026-08-29
 
 ### 新增 / 变更

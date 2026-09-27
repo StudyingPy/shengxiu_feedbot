@@ -228,6 +228,18 @@ class SizePrefetchConfig:
     nhentai: bool = True
 
 
+@dataclass
+class Zip2TphConfig:
+    """用户上传归档的资源限制。"""
+
+    max_archive_size_gb: float = 2.0
+    max_uncompressed_size_gb: float = 8.0
+    max_entries: int = 5000
+    max_image_size_mb: int = 100
+    # 为空时使用系统临时目录；生产环境建议指向与 cache_dir 同一挂载点。
+    work_dir: str = ""
+
+
 # ---------------------------------------------------------------------------
 # 顶层
 # ---------------------------------------------------------------------------
@@ -245,6 +257,7 @@ class Config:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     job_queue: JobQueueConfig = field(default_factory=JobQueueConfig)
     size_prefetch: SizePrefetchConfig = field(default_factory=SizePrefetchConfig)
+    zip2tph: Zip2TphConfig = field(default_factory=Zip2TphConfig)
 
     _source_path: Path | None = field(default=None, repr=False)
     _runtime: Any | None = field(default=None, repr=False)  # RuntimeSettings 实例（可空）
@@ -302,6 +315,7 @@ class Config:
             logging=LoggingConfig(**(data.get("logging") or {})),
             job_queue=JobQueueConfig(**(data.get("job_queue") or {})),
             size_prefetch=SizePrefetchConfig(**(data.get("size_prefetch") or {})),
+            zip2tph=Zip2TphConfig(**(data.get("zip2tph") or {})),
         )
 
     def _apply_env_overrides(self) -> None:
@@ -322,6 +336,13 @@ class Config:
             self.publish.base_url = self.publish.base_url.rstrip("/")
         if not self.auth.admin_users:
             errors.append("auth.admin_users must contain at least one user id")
+        if self.telegram.local_mode and not self.telegram.base_url:
+            errors.append("telegram.local_mode=true requires telegram.base_url")
+        z = self.zip2tph
+        if z.max_archive_size_gb <= 0 or z.max_uncompressed_size_gb <= 0:
+            errors.append("zip2tph archive size limits must be positive")
+        if z.max_entries < 1 or z.max_image_size_mb < 1:
+            errors.append("zip2tph entry/image limits must be positive")
         # 与 /setting 共用同一组范围/枚举约束，避免 YAML 能启动但 runtime 不能设，
         # 或 runtime 脏值在重启后悄悄覆盖成危险值。
         for key in _RUNTIME_CONSTRAINED_KEYS:

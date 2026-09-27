@@ -506,13 +506,29 @@ telegram:
 
 ### 4. 文件读权限
 
-`--local` 模式下 telegram-bot-api 将上传的文件写入 `--dir` 目录（默认 `/var/lib/telegram-bot-api/<token>/...`）。运行 feed bot 的用户必须有读取权限：
+`--local` 模式下 telegram-bot-api 将上传的文件写入 `--dir` 目录（默认 `/var/lib/telegram-bot-api/<token>/...`）。`local_mode=true` 并不等于 feed bot 自动获得这些文件的权限：PTB 会在 feed bot 进程内直接打开该路径，因此两个服务必须共享同一目录，并且 feed bot 运行用户必须能穿过父目录、读取 `documents` 下的新文件。
+
+不要对整个目录执行 `chmod -R o+rX`——路径中包含敏感凭据。优先让两个服务使用同一个专用用户/组；如果暂时不能重建容器，可只对当前 bot 的 token 目录授予最小 ACL（以下命令中的 `<feed-user>`、`<token>` 替换为实际值）：
 
 ```bash
-chmod -R o+rX /var/lib/telegram-bot-api
+setfacl -m u:<feed-user>:x /var/lib/telegram-bot-api
+setfacl -m u:<feed-user>:x /var/lib/telegram-bot-api/<token>
+find /var/lib/telegram-bot-api/<token>/documents -type d -exec setfacl -m u:<feed-user>:rx,d:u:<feed-user>:rx {} +
+find /var/lib/telegram-bot-api/<token>/documents -type f -exec setfacl -m u:<feed-user>:r {} +
+sudo -u <feed-user> test -r /var/lib/telegram-bot-api/<token>/documents/<file>
 ```
 
-出现 `Permission denied` 错误即说明此步骤遗漏。
+最后一条测试必须成功；否则 `/zip2tph` 会收到 `Permission denied`。如果 telegram-bot-api 在独立容器中，宿主机目录还必须以相同路径（或明确的路径映射）挂载到 feed bot 容器；只在 Bot API 容器里存在的路径对 `local_mode` 不可用。
+
+Docker 还要注意 UID/GID 映射：容器内的 `telegram-bot-api` 用户（常见为 UID/GID 101）会以宿主机上的对应数字用户写文件；宿主机用户名可能显示为 `sshd`，这不代表 feed bot 可以读取。应按数字 UID/GID 或 ACL 配置权限，而不要按用户名猜测：
+
+```bash
+docker exec telegram-bot-api id telegram-bot-api
+stat -Lc '%u:%g %A %n' /var/lib/telegram-bot-api/<token>/documents/<file>
+id <feed-user>
+```
+
+`/zip2tph` 的 RAR/7z 支持由 Python 后端提供：依赖安装会包含 `rarfile` 与 `py7zr`。RAR 还需要宿主机或 bot 容器内存在 `unrar`、`unar` 或 `bsdtar` 之一；没有解压后端时，bot 会明确提示管理员安装依赖，不会执行归档内的命令。
 
 ### 5. 启动并验证
 
