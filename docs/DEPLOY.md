@@ -511,10 +511,16 @@ telegram:
 不要对整个目录执行 `chmod -R o+rX`——路径中包含敏感凭据。优先让两个服务使用同一个专用用户/组；如果暂时不能重建容器，可只对当前 bot 的 token 目录授予最小 ACL（以下命令中的 `<feed-user>`、`<token>` 替换为实际值）：
 
 ```bash
-setfacl -m u:<feed-user>:x /var/lib/telegram-bot-api
-setfacl -m u:<feed-user>:x /var/lib/telegram-bot-api/<token>
-find /var/lib/telegram-bot-api/<token>/documents -type d -exec setfacl -m u:<feed-user>:rx,d:u:<feed-user>:rx {} +
-find /var/lib/telegram-bot-api/<token>/documents -type f -exec setfacl -m u:<feed-user>:r {} +
+API_ROOT=/var/lib/telegram-bot-api
+TMP_ROOT=/tmp/telegram-bot-api
+# local Bot API 可能先在 temp-dir 写文件，再改名到 --dir；两个目录都要设置默认 ACL。
+for dir in "$TMP_ROOT" "$API_ROOT"; do
+  setfacl -m u:<feed-user>:x "$dir"
+  setfacl -m d:u:<feed-user>:r-x,d:m::r-x "$dir"
+done
+setfacl -m u:<feed-user>:x "$API_ROOT/<token>"
+find "$API_ROOT/<token>/documents" -type d -exec setfacl -m u:<feed-user>:rx,d:u:<feed-user>:r-x,d:m::r-x {} +
+find "$API_ROOT/<token>/documents" -type f -exec setfacl -m u:<feed-user>:r {} +
 sudo -u <feed-user> test -r /var/lib/telegram-bot-api/<token>/documents/<file>
 ```
 
