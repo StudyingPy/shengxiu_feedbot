@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import tarfile
 import tempfile
 import time
@@ -3791,6 +3792,17 @@ async def _process_zip_to_telegraph(
                     bytes_in=file_size, status="failed",
                 )
                 return
+            except Exception as e:
+                # 第三方解压后端（尤其 rarfile/bsdtar）可能抛出未被标准库
+                # 异常层次覆盖的错误；无论如何都要结束 watcher 和进度消息，
+                # 不能让用户永久看到“解压中 0/N”。详细堆栈只写服务日志。
+                logger.exception("zip2tph archive extraction failed")
+                await progress.finish("⚠️ 归档解压失败，请检查文件完整性或稍后重试。")
+                await _log_usage(
+                    context, update, kind=KIND_ZIP2TPH, ref_id=document.file_unique_id,
+                    bytes_in=file_size, status="failed",
+                )
+                return
             except (zipfile.BadZipFile, tarfile.TarError, OSError) as e:
                 await progress.finish(f"⚠️ 不是有效图片归档：{e}")
                 await _log_usage(
@@ -4057,7 +4069,47 @@ def _extract_image_archive(archive_path: Path, dest_dir: Path, limits) -> list[P
             with Image.open(target) as image:
                 image.verify()
         except Exception as exc:
-            raise ArchiveError(f"invalid image: {target.name!r}") from exc
+                raise ArchiveError(f"invalid image: {target.name!r}") from exc
+
+    def open_rar_member(name: str):
+        """打开 RAR 成员；修正 rarfile 4.5 对 bsdtar 的参数顺序。"""
+        if rarfile is None:
+            raise ArchiveError("RAR support is not installed on this deployment")
+        try:
+            setup = rarfile.tool_setup()
+        except Exception as exc:
+            raise ArchiveError("RAR backend is not available on this deployment") from exc
+        tool_name = setup.setup["open_cmd"][0]
+        if tool_name != "BSDTAR_TOOL":
+            return None
+        bsdtar = shutil.which(rarfile.BSDTAR_TOOL)
+        if not bsdtar:
+            raise ArchiveError("RAR backend is not installed on this deployment")
+        # rarfile 4.5 生成的是 `-f -- archive`, 而 bsdtar 要求
+        # `-f archive -- member`；成员名放在分隔符后避免参数注入。
+        proc = subprocess.Popen(
+            [bsdtar, "-x", "--to-stdout", "-f", str(archive_path), "--", name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        class _ProcessStream:
+            def __enter__(self):
+                return proc.stdout
+
+            def __exit__(self, exc_type, exc, tb):
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                stderr = proc.stderr.read() if proc.stderr is not None else b""
+                if proc.stderr is not None:
+                    proc.stderr.close()
+                rc = proc.wait()
+                if rc != 0 and exc_type is None:
+                    detail = stderr.decode("utf-8", errors="replace").strip()
+                    raise ArchiveError(f"RAR member extraction failed ({rc}): {detail[:160]}")
+                return False
+
+        return _ProcessStream()
 
     if kind == "zip":
         with zipfile.ZipFile(archive_path, "r") as zf:
@@ -4087,16 +4139,27 @@ def _extract_image_archive(archive_path: Path, dest_dir: Path, limits) -> list[P
     elif kind == "rar":
         if rarfile is None:
             raise ArchiveError("RAR support is not installed on this deployment")
-        with rarfile.RarFile(archive_path, "r") as rf:
-            by_name = {_archive_member_name(info.filename): info for info in rf.infolist()}
+        setup = rarfile.tool_setup()
+        if setup.setup["open_cmd"][0] == "BSDTAR_TOOL":
             for index, (name, size) in enumerate(image_members):
-                info = by_name.get(name)
-                if info is None:
-                    raise ArchiveError(f"archive member disappeared: {name!r}")
                 target = dest_dir / f"p{index:04d}{PurePosixPath(name).suffix.lower()}"
-                with rf.open(info) as src:
+                stream = open_rar_member(name)
+                if stream is None:
+                    raise ArchiveError("RAR backend cannot read this archive")
+                with stream as src:
                     write_stream(src, target, size)
                 extracted.append(target)
+        else:
+            with rarfile.RarFile(archive_path, "r") as rf:
+                by_name = {_archive_member_name(info.filename): info for info in rf.infolist()}
+                for index, (name, size) in enumerate(image_members):
+                    info = by_name.get(name)
+                    if info is None:
+                        raise ArchiveError(f"archive member disappeared: {name!r}")
+                    target = dest_dir / f"p{index:04d}{PurePosixPath(name).suffix.lower()}"
+                    with rf.open(info) as src:
+                        write_stream(src, target, size)
+                    extracted.append(target)
     else:
         if py7zr is None:
             raise ArchiveError("7z support is not installed on this deployment")
