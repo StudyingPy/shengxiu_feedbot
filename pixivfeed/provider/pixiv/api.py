@@ -3,7 +3,7 @@
 只封装我们用得到的端点：
 - /ajax/illust/{pid}              获取插画/漫画元数据
 - /ajax/illust/{pid}/pages        获取多图作品的所有图片 URL（page_count > 1 时）
-- /ajax/illust/{pid}/ugoira_meta  动图元数据（保留接口，目前不实现下载）
+- /ajax/illust/{pid}/ugoira_meta  动图元数据（帧 ZIP URL + 每帧 delay）
 - /ajax/novel/{nid}               获取小说全文与元数据
 
 PHPSESSID 是关键：不带或失效时，R-18 作品会返回 error=true。
@@ -137,6 +137,14 @@ class PixivAPI:
         body = await self._get_json(url, label=f"illust/{pid}/pages")
         if not isinstance(body, list):
             raise PixivAPIError(f"unexpected pages response shape: {type(body).__name__}")
+        return body
+
+    async def fetch_ugoira_meta(self, pid: str) -> dict[str, Any]:
+        """获取动图元数据：帧 ZIP 地址（src/originalSrc）与 frames 逐帧 delay。"""
+        url = f"https://www.pixiv.net/ajax/illust/{pid}/ugoira_meta"
+        body = await self._get_json(url, label=f"illust/{pid}/ugoira_meta")
+        if not isinstance(body, dict):
+            raise PixivAPIError(f"unexpected ugoira_meta response shape: {type(body).__name__}")
         return body
 
     async def fetch_novel(self, nid: str) -> dict[str, Any]:

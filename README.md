@@ -21,6 +21,7 @@
 | Telegram Bot Token | 通过 [@BotFather](https://t.me/BotFather) 申请 |
 | Pixiv PHPSESSID（可选）| 访问 R-18 或受限小说时需要 |
 | 本地 Bot API（可选）| 处理 >50 MB 文件时需要，详见 [部署指南](docs/DEPLOY.md#本地-bot-api) |
+| ffmpeg ≥ 5.1（可选）| 转换并发送 Pixiv 动图（ugoira）需要（如 `apt install ffmpeg`）；未安装时动图会提示无法转换，插画与小说不受影响 |
 | Cloudflare R2（可选）| 让 Telegra.ph 页面图片永久可用，免受 7 天缓存 TTL 限制 |
 
 ## 快速开始
