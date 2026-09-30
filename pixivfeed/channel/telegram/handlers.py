@@ -4075,16 +4075,9 @@ def _extract_image_archive(archive_path: Path, dest_dir: Path, limits) -> list[P
         """打开 RAR 成员；修正 rarfile 4.5 对 bsdtar 的参数顺序。"""
         if rarfile is None:
             raise ArchiveError("RAR support is not installed on this deployment")
-        try:
-            setup = rarfile.tool_setup()
-        except Exception as exc:
-            raise ArchiveError("RAR backend is not available on this deployment") from exc
-        tool_name = setup.setup["open_cmd"][0]
-        if tool_name != "BSDTAR_TOOL":
-            return None
         bsdtar = shutil.which(rarfile.BSDTAR_TOOL)
         if not bsdtar:
-            raise ArchiveError("RAR backend is not installed on this deployment")
+            return None
         # rarfile 4.5 生成的是 `-f -- archive`, 而 bsdtar 要求
         # `-f archive -- member`；成员名放在分隔符后避免参数注入。
         proc = subprocess.Popen(
@@ -4139,8 +4132,7 @@ def _extract_image_archive(archive_path: Path, dest_dir: Path, limits) -> list[P
     elif kind == "rar":
         if rarfile is None:
             raise ArchiveError("RAR support is not installed on this deployment")
-        setup = rarfile.tool_setup()
-        if setup.setup["open_cmd"][0] == "BSDTAR_TOOL":
+        if shutil.which(rarfile.BSDTAR_TOOL):
             for index, (name, size) in enumerate(image_members):
                 target = dest_dir / f"p{index:04d}{PurePosixPath(name).suffix.lower()}"
                 stream = open_rar_member(name)
