@@ -18,6 +18,7 @@ from telegram.error import BadRequest, TelegramError
 
 from ...provider import ProgressHook
 from ...utils import ByteRateTracker, fmt_bytes, fmt_duration, logger
+from .retry import retry_on_rate_limit
 
 
 class Progress:
@@ -48,9 +49,12 @@ class Progress:
             return text
         return f"{self._prefix}\n{text}"
 
-    async def _do_edit(self, full: str) -> None:
+    async def _do_edit(self, full: str, *, final: bool = False) -> None:
         try:
-            await self._msg.edit_text(full, reply_markup=self._markup)
+            if final:
+                await retry_on_rate_limit(self._msg.edit_text, full, reply_markup=self._markup)
+            else:
+                await self._msg.edit_text(full, reply_markup=self._markup)
             self._last_text = full
             self._last_t = time.monotonic()
         except BadRequest as e:
@@ -59,8 +63,12 @@ class Progress:
                 self._last_text = full
                 self._last_t = time.monotonic()
             else:
+                if final:
+                    raise
                 logger.debug(f"progress edit BadRequest: {e}")
         except TelegramError as e:
+            if final:
+                raise
             logger.debug(f"progress edit failed: {e}")
 
     async def update(self, text: str) -> None:
@@ -83,10 +91,10 @@ class Progress:
             await self._do_edit(full)
 
     async def finish(self, text: str) -> None:
-        """终态：强制刷新（重置节流计时）。"""
+        """终态：强制刷新，限频时等待重试，耗尽后向上传播。"""
         full = self._full(text)
         async with self._lock:
-            await self._do_edit(full)
+            await self._do_edit(full, final=True)
 
 
 class ImageCounter:
