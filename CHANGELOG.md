@@ -1,5 +1,17 @@
 # Changelog
 
+## 未发布 — 2026-10-05
+
+### 修复
+- **最终 Telegram 回复遇到限频后自动重试**：最终链接发送/编辑和 `Progress.finish` 遇到 `RetryAfter` 时，按服务端等待时间加 1 秒重试，最多重试 10 次。覆盖 EH/EX（含回退缓存）、nhentai、Pixiv 插画/小说、`/zip2tph`、缓存回复和 Guest inline 编辑；只重发消息，不重复下载或发布页面，保留预览、格式和按钮。
+- 重试耗尽、终态消息不存在或其它交付错误向上传播，避免把未交付结果静默当作成功；等待可被任务取消或服务关闭中断。
+
+### 改动文件
+- `pixivfeed/channel/telegram/retry.py`
+- `pixivfeed/channel/telegram/handlers.py`
+- `pixivfeed/channel/telegram/progress.py`
+- `tests/test_telegram_final_retry.py`
+
 ## v0.14.2 — 2026-09-27
 
 ### 修复 / 变更

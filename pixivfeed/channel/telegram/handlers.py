@@ -132,6 +132,7 @@ from .progress import (
     fmt_duration,
     make_item_hook,
 )
+from .retry import retry_on_rate_limit
 
 # ---------------------------------------------------------------------------
 # 共享上下文
@@ -600,7 +601,7 @@ class GuestReply:
     def __init__(self, bot, inline_message_id: str, source_message):
         self._bot = bot
         self.inline_message_id = inline_message_id
-        self.chat = source_message.chat
+        self.chat = getattr(source_message, "chat", None)
         # Guest inline 消息没有普通 message_id；0 仅用于满足现有 placeholder 协议。
         self.message_id = 0
 
@@ -1620,7 +1621,8 @@ async def _eh_run_with_mode(
             if eff_force and cached.durable:
                 reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
             if placeholder:
-                await placeholder.edit_text(
+                await retry_on_rate_limit(
+                    placeholder.edit_text,
                     reply,
                     link_preview_options=_small_link_preview(cached.url),
                     reply_markup=extras_markup,
@@ -1628,7 +1630,8 @@ async def _eh_run_with_mode(
             else:
                 msg = update_or_query.effective_message if hasattr(update_or_query, "effective_message") else None
                 if msg:
-                    await msg.reply_text(
+                    await retry_on_rate_limit(
+                        msg.reply_text,
                         reply,
                         link_preview_options=_small_link_preview(cached.url),
                         reply_markup=extras_markup,
@@ -1674,7 +1677,8 @@ async def _eh_run_with_mode(
                 reply = cached.url
                 if eff_force and cached.durable:
                     reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
-                await placeholder.edit_text(
+                await retry_on_rate_limit(
+                    placeholder.edit_text,
                     reply,
                     link_preview_options=_small_link_preview(cached.url),
                     reply_markup=extras_markup,
@@ -1769,7 +1773,8 @@ async def _eh_run_with_mode(
         fallback_reason=pub.fallback_reason,
     )
     suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
-    await placeholder.edit_text(
+    await retry_on_rate_limit(
+        placeholder.edit_text,
         pub.primary_url + suffix,
         link_preview_options=_small_link_preview(pub.primary_url),
         reply_markup=extras_markup,
@@ -2908,11 +2913,13 @@ async def _send_via_telegraph_generic(
         if eff_force and cached.durable:
             reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
         if placeholder is not None:
-            await placeholder.edit_text(
+            await retry_on_rate_limit(
+                placeholder.edit_text,
                 reply, link_preview_options=_small_link_preview(cached.url),
             )
         else:
-            await update.message.reply_text(
+            await retry_on_rate_limit(
+                update.message.reply_text,
                 reply, link_preview_options=_small_link_preview(cached.url),
             )
         return
@@ -2974,7 +2981,8 @@ async def _send_via_telegraph_generic(
         fallback_reason=pub.fallback_reason,
     )
     suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
-    await placeholder.edit_text(
+    await retry_on_rate_limit(
+        placeholder.edit_text,
         pub.primary_url + suffix,
         link_preview_options=_small_link_preview(pub.primary_url),
         parse_mode=ParseMode.HTML if suffix else None,
@@ -3029,11 +3037,13 @@ async def _send_pixiv_illust_via_telegraph(
         if eff_force and cached.durable:
             reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
         if placeholder is not None:
-            await placeholder.edit_text(
+            await retry_on_rate_limit(
+                placeholder.edit_text,
                 reply, link_preview_options=_small_link_preview(cached.url),
             )
         else:
-            await update.message.reply_text(
+            await retry_on_rate_limit(
+                update.message.reply_text,
                 reply, link_preview_options=_small_link_preview(cached.url),
             )
         return
@@ -3093,7 +3103,8 @@ async def _send_pixiv_illust_via_telegraph(
         fallback_reason=pub.fallback_reason,
     )
     suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
-    await placeholder.edit_text(
+    await retry_on_rate_limit(
+        placeholder.edit_text,
         pub.primary_url + suffix,
         link_preview_options=_small_link_preview(pub.primary_url),
         parse_mode=ParseMode.HTML if suffix else None,
@@ -3129,11 +3140,13 @@ async def _send_pixiv_novel(
         if eff_force and cached.durable:
             reply = reply + "\n（已是 R2 durable 缓存，跳过重发）"
         if placeholder is not None:
-            await placeholder.edit_text(
+            await retry_on_rate_limit(
+                placeholder.edit_text,
                 reply, link_preview_options=_small_link_preview(cached.url),
             )
         else:
-            await update.message.reply_text(
+            await retry_on_rate_limit(
+                update.message.reply_text,
                 reply, link_preview_options=_small_link_preview(cached.url),
             )
         return
@@ -3179,7 +3192,8 @@ async def _send_pixiv_novel(
         fallback_reason=pub.fallback_reason,
     )
     suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
-    await placeholder.edit_text(
+    await retry_on_rate_limit(
+        placeholder.edit_text,
         pub.primary_url + suffix,
         link_preview_options=_small_link_preview(pub.primary_url),
         parse_mode=ParseMode.HTML if suffix else None,
@@ -3902,13 +3916,15 @@ async def _process_zip_to_telegraph(
         suffix = _r2_skipped_suffix(pub, r2_enabled=config.storage.r2.enabled)
         if suffix:
             # progress.finish 直接 edit_text 不支持 parse_mode / 预览选项；用 placeholder 兜底
-            await placeholder.edit_text(
+            await retry_on_rate_limit(
+                placeholder.edit_text,
                 pub.primary_url + suffix,
                 parse_mode=ParseMode.HTML,
                 link_preview_options=_small_link_preview(pub.primary_url),
             )
         else:
-            await placeholder.edit_text(
+            await retry_on_rate_limit(
+                placeholder.edit_text,
                 pub.primary_url,
                 link_preview_options=_small_link_preview(pub.primary_url),
             )
