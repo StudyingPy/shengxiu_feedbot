@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -37,6 +38,7 @@ from ._archive import (
     download_archive_with_timeout,
     extract_archive,
     fetch_archiver_token,
+    refresh_download_link,
     request_archive,
 )
 from ._modes import BASE_HEADERS, EHMode
@@ -574,10 +576,90 @@ class _EHFamilyProvider(Provider):
                 )
 
             zip_path = work_dir / "archive.zip"
-            await download_archive_with_timeout(
-                client, zip_url, zip_path, timeout,
-                on_progress=on_progress, on_status=on_status,
-            )
+
+            # H@H 临时节点偶发连接超时或返回 5xx。/archive 直出路径已经有
+            # H@H → 主站的备用下载，但链接详情卡也走这里，必须共享同一回退策略。
+            candidate_urls = [zip_url]
+            parsed = urlparse(zip_url)
+            if (
+                parsed.hostname
+                and parsed.hostname.lower().endswith(".hath.network")
+                and parsed.path.startswith("/archive/")
+            ):
+                local_url = f"https://{self.HOST}{parsed.path}"
+                if parsed.query:
+                    local_url += "?" + parsed.query
+                candidate_urls.append(local_url)
+                logger.info(
+                    f"[{self.HOST}/{gallery.gallery_id}] zip link is hath.network "
+                    f"({zip_url[:80]}...), main host fallback: {local_url[:80]}..."
+                )
+
+            last_error: Exception | None = None
+            download_done = False
+            for index, candidate_url in enumerate(candidate_urls):
+                try:
+                    if index:
+                        logger.warning(
+                            f"[{self.HOST}/{gallery.gallery_id}] archive candidate {index} "
+                            f"failed ({_describe_archive_exception(last_error)}); "
+                            f"trying {candidate_url[:120]}..."
+                        )
+                        if on_status is not None:
+                            await on_status(
+                                f"⏳ 切换到备用下载链接 ({index + 1}/{len(candidate_urls)})..."
+                            )
+                        partial = zip_path.with_suffix(zip_path.suffix + ".part")
+                        if partial.exists():
+                            try:
+                                partial.unlink()
+                            except OSError:
+                                pass
+                    await download_archive_with_timeout(
+                        client, candidate_url, zip_path, timeout,
+                        on_progress=on_progress, on_status=on_status,
+                    )
+                    download_done = True
+                    break
+                except ArchiveLockedError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        f"[{self.HOST}/{gallery.gallery_id}] archive candidate {index} "
+                        f"failed: {_describe_archive_exception(exc)}"
+                    )
+
+            if not download_done and last_error is not None:
+                # 节点尚未就绪时，重新 GET archiver 页面可能拿到已经准备好的新链接；
+                # 不重新 POST，避免重复申请并消耗 archive 配额。
+                error_text = str(last_error).lower()
+                if "not ready" in error_text or "http 404" in error_text:
+                    if on_status is not None:
+                        await on_status("⏳ 链接失效，刷新中...")
+                    refreshed_url = await refresh_download_link(
+                        client, self.HOST, gallery.gallery_id, gallery.token,
+                    )
+                    if refreshed_url and refreshed_url not in candidate_urls:
+                        logger.info(
+                            f"[{self.HOST}/{gallery.gallery_id}] retrying refreshed archive link"
+                        )
+                        try:
+                            await download_archive_with_timeout(
+                                client, refreshed_url, zip_path, timeout,
+                                on_progress=on_progress, on_status=on_status,
+                            )
+                            download_done = True
+                        except ArchiveLockedError:
+                            raise
+                        except Exception as exc:
+                            last_error = exc
+
+            if not download_done:
+                assert last_error is not None
+                raise ArchiveError(
+                    _describe_archive_exception(last_error)
+                ) from last_error
 
             extract = extract_archive(zip_path, work_dir)
             # 删 zip（节省空间，按你之前的选择）
@@ -597,14 +679,22 @@ class _EHFamilyProvider(Provider):
             ) from e
         except ArchiveError as e:
             raise EHArchiveError(
-                f"archive download failed: {e}",
+                f"archive download failed: {_describe_archive_exception(e)}",
                 gp_cost=gp_cost,
             ) from e
         except Exception as e:
             raise EHArchiveError(
-                f"archive pipeline failed: {e}",
+                f"archive pipeline failed: {_describe_archive_exception(e)}",
                 gp_cost=gp_cost,
             ) from e
+
+
+def _describe_archive_exception(exc: BaseException | None) -> str:
+    """为用户和日志生成不会为空的归档异常摘要。"""
+    if exc is None:
+        return "unknown error"
+    detail = str(exc).strip()
+    return detail or type(exc).__name__
 
 
 # ---------------------------------------------------------------------------

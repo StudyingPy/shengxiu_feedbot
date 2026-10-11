@@ -13,3 +13,4 @@
 - Docker 版 telegram-bot-api 常以容器 UID/GID 101 写宿主机文件；宿主机可能显示为 `sshd:crontab`，而 systemd feed bot 用 `pixivbot`。`local_mode` 直接读宿主路径时要按数字 UID/GID 或针对单个 token 目录的 ACL 修复，不能用全目录 `chmod o+rX`。
 - Docker 版 telegram-bot-api 若配置了 `--temp-dir=/tmp/telegram-bot-api`，归档可能先在 temp-dir 创建后再改名到 `--dir`；只给 `documents` 设置默认 ACL 仍会出现“文件已返回但 bot 无权读取”。必须同时给 temp-dir 和最终目录设置 `d:u:<feed-user>:r-x` 默认 ACL，并给已有文件补 `u:<feed-user>:r`。
 - `/zip2tph` 归档图片顺序使用 `natsort` 的 `INT|PATH|IGNORECASE|PRESORT` 组合：数字按整数、多级目录按路径、大小写折叠且结果稳定；不要回退到普通 `sorted(..., key=name)`，否则 `1/10/2` 会再次错序。
+- EH/ex 链接详情卡的公共 `_archive_pipeline` 也必须复用 H@H 临时链接 → 主站路径回退和刷新链接重试；这些逻辑若只写在 `/archive` 直出入口，详情卡仍会在 H@H 网络异常时失败。网络异常 `str(e)` 可能为空，用户错误摘要要回退到异常类型名。

@@ -101,6 +101,68 @@ def test_archive_pipeline_keeps_gp_when_download_fails(monkeypatch, tmp_path, fa
     assert exc_info.value.gp_cost == 41
 
 
+def test_archive_pipeline_falls_back_from_hath_node(monkeypatch, tmp_path) -> None:
+    provider = _provider(tmp_path)
+    image_path = tmp_path / "p0.jpg"
+    attempted: list[str] = []
+
+    async def fake_fetch_archiver_token(client, album_url):
+        return "https://e-hentai.org/archiver.php"
+
+    async def fake_request_archive(client, host, gid, token, archiver_token, mode):
+        return "https://node.hath.network/archive/123/token/1", 1024, 0
+
+    async def fake_download(client, url, path, timeout, **kwargs):
+        attempted.append(url)
+        if "hath.network" in url:
+            raise ArchiveError("H@H node unavailable")
+
+    monkeypatch.setattr(eh_module, "fetch_archiver_token", fake_fetch_archiver_token)
+    monkeypatch.setattr(eh_module, "request_archive", fake_request_archive)
+    monkeypatch.setattr(eh_module, "download_archive_with_timeout", fake_download)
+    monkeypatch.setattr(
+        eh_module,
+        "extract_archive",
+        lambda zip_path, work_dir: SimpleNamespace(image_paths=[image_path]),
+    )
+
+    paths, _ = asyncio.run(
+        provider._archive_pipeline(
+            object(), _gallery(), EHMode.ARCHIVE_RES, tmp_path,
+        )
+    )
+
+    assert paths == [image_path]
+    assert attempted == [
+        "https://node.hath.network/archive/123/token/1",
+        "https://e-hentai.org/archive/123/token/1",
+    ]
+
+
+def test_archive_pipeline_names_empty_network_exception(monkeypatch, tmp_path) -> None:
+    provider = _provider(tmp_path)
+
+    async def fake_fetch_archiver_token(client, album_url):
+        return "https://e-hentai.org/archiver.php"
+
+    async def fake_request_archive(client, host, gid, token, archiver_token, mode):
+        return "https://download.example/archive.zip", 1024, 0
+
+    async def fake_download(client, url, path, timeout, **kwargs):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(eh_module, "fetch_archiver_token", fake_fetch_archiver_token)
+    monkeypatch.setattr(eh_module, "request_archive", fake_request_archive)
+    monkeypatch.setattr(eh_module, "download_archive_with_timeout", fake_download)
+
+    with pytest.raises(EHArchiveError, match=r"ReadTimeout"):
+        asyncio.run(
+            provider._archive_pipeline(
+                object(), _gallery(), EHMode.ARCHIVE_ORG, tmp_path,
+            )
+        )
+
+
 def test_fetch_and_download_exposes_archive_gp(monkeypatch, tmp_path) -> None:
     provider = _provider(tmp_path)
     image_path = tmp_path / "eh_123_token_archive_original" / "p0.jpg"
