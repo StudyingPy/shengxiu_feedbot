@@ -120,7 +120,7 @@ Guest 会优先读取当前召唤消息中的链接，也支持从被回复的�
 | `/archive <链接>` | 将作品打包为 zip 发送（eh/ex 支持四种下载模式）|
 | `/ehsearch <关键词>` | 搜索 e-hentai / ExHentai 画廊，结果以按钮列出 |
 | `/jm <禁漫号>` | 查禁漫天堂作品标题，自动调 `/ehsearch` 搜对应 EH 画廊 |
-| `/zip2tph` | 将上传的图片 zip 包发布为 Telegra.ph 页面 |
+| `/zip2tph [标题]` | 回复图片归档或在文件说明里写 `/zip2tph 魔女之旅`，即以「魔女之旅」为标题发布 Telegra.ph 页面。省略标题时使用去掉扩展名的归档文件名。 |
 | `/wiki <词条>` | 查询中文维基百科 |
 | `/stats` | 用量统计（支持 `7d`、`user @x`、`chat <id>`、`system` 等子命令）|
 

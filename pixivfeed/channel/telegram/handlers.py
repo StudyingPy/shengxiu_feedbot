@@ -1321,7 +1321,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /pixiv_direct <链接>     强制 pixiv 直发图片\n"
         "  /archive <链接>          直接返回压缩包（eh/ex 仍弹模式按钮）\n"
         "  /ehsearch <关键词>       搜索 eh/ex 画廊（点结果即开）\n"
-        "  /zip2tph                 回复图片归档，发布为 Telegra.ph\n"
+        "  /zip2tph [标题]          回复图片归档，发布为 Telegra.ph\n"
         "  /wiki <词条>             查中文维基百科\n"
         "  /chatid                  查看当前 chat_id\n"
         "  /setting list            （仅 admin）查看运行时配置\n"
@@ -3497,30 +3497,26 @@ async def cmd_zip2tph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     可选 admin flag `--r2` 强制把图传 R2（绕过 max_upload_size_gb 护栏）。
     """
-    config, registry, publisher, _, allowlist = _ctx(context)
+    _, _, _, _, allowlist = _ctx(context)
     if not await is_authorized(update, allowlist):
         return
     await _track_user(update, context)
-
-    user_id = update.effective_user.id if update.effective_user else 0
-    raw_args = list(context.args or [])
-    _, force_r2 = _parse_r2_flag(raw_args, user_id, config.auth.admin_users)
 
     msg = update.effective_message
     target_msg = msg.reply_to_message if msg.reply_to_message else msg
     document = target_msg.document if target_msg else None
     if not _is_archive(document):
         await msg.reply_text(
-            "用法：把图片归档发给我并在 caption 里写 /zip2tph，"
-            "或对归档消息回复 /zip2tph（支持 zip、tar、tar.gz、tar.bz2、tar.xz、rar、7z）"
+            "请回复图片归档或在文件说明里写 /zip2tph [标题]。例如 /zip2tph 魔女之旅。\n"
+            "省略标题时使用归档文件名（支持 zip、tar、tar.gz、tar.bz2、tar.xz、rar、7z）。"
         )
         return
-    await _enqueue_zip_to_telegraph(update, context, target_msg, force_r2=force_r2)
+    await _enqueue_zip_to_telegraph(update, context, target_msg, context.args or [])
 
 
 async def handle_zip_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """监听 Document：caption 含 /zip2tph 时自动处理。"""
-    config, _, _, _, allowlist = _ctx(context)
+    _, _, _, _, allowlist = _ctx(context)
     if not await is_authorized(update, allowlist):
         return
     await _track_user(update, context)
@@ -3530,19 +3526,14 @@ async def handle_zip_document(update: Update, context: ContextTypes.DEFAULT_TYPE
     caption = (msg.caption or "").strip()
     if not caption.lower().startswith("/zip2tph"):
         return
-    # caption 形如 "/zip2tph --r2"；admin 才生效
-    user_id = update.effective_user.id if update.effective_user else 0
-    parts = caption.split()
-    _, force_r2 = _parse_r2_flag(parts[1:], user_id, config.auth.admin_users)
-    await _enqueue_zip_to_telegraph(update, context, msg, force_r2=force_r2)
+    await _enqueue_zip_to_telegraph(update, context, msg, caption.split()[1:])
 
 
 async def _enqueue_zip_to_telegraph(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     zip_msg,
-    *,
-    force_r2: bool = False,
+    args: list[str],
 ) -> None:
     """把 zip2tph 包成队列任务。"""
     document = zip_msg.document
@@ -3556,10 +3547,12 @@ async def _enqueue_zip_to_telegraph(
     if not await _gate_disk_space(context, placeholder, extra_required=extra_required):
         return
     user_id = update.effective_user.id if update.effective_user else 0
+    title_words, force_r2 = _parse_r2_flag(args, user_id, context.bot_data["config"].auth.admin_users)
+    custom_title = " ".join(title_words)
     work_label = f"接收 zip ({fmt_bytes(file_size)})..."
 
     async def _do() -> None:
-        await _process_zip_to_telegraph(update, context, zip_msg, placeholder, force_r2=force_r2)
+        await _process_zip_to_telegraph(update, context, zip_msg, placeholder, custom_title=custom_title, force_r2=force_r2)
 
     await _enqueue(
         context,
@@ -3577,6 +3570,7 @@ async def _process_zip_to_telegraph(
     zip_msg,
     placeholder=None,
     *,
+    custom_title: str = "",
     force_r2: bool = False,
 ) -> None:
     config, _, publisher, _, _ = _ctx(context)
@@ -3864,9 +3858,8 @@ async def _process_zip_to_telegraph(
             ))
             await ctr.tick()
 
-        # 标题：去掉扩展名
         raw_name = document.file_name or "archive.zip"
-        title = re.sub(
+        title = custom_title or re.sub(
             r"\.(?:tar\.gz|tar\.bz2|tar\.xz|zip|tar|tgz|tbz|tbz2|txz|rar|7z)$", "",
             raw_name, flags=re.IGNORECASE,
         ).strip() or "图片包"
@@ -3883,18 +3876,15 @@ async def _process_zip_to_telegraph(
             source_url="",         # zip2tph 没有外部原作链接
             title=title,
             images=gallery_images,
-            extra_vars={"page_count": len(gallery_images)},
+            extra_vars={"archive_name": _html_escape(raw_name)},
         )
         # zip2tph 没有自定义模板段（不像 illust/novel/gallery），用一个最小 header
-        header_template = (
-            f"<p>共 {len(gallery_images)} 张 · 来自上传 zip：{_html_escape(raw_name)}</p>"
-        )
+        header_template = "<p>共 {page_count} 张 · 来自上传归档：{archive_name}</p>"
 
         pub_hook = make_item_hook(progress, "发布 Telegra.ph 页面")
         try:
             pub = await publisher.publish_gallery(
                 work,
-                page_title_template=title,
                 page_header_template=header_template,
                 page_footer_template="",
                 on_progress=pub_hook,
