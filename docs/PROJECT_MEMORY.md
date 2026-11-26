@@ -16,3 +16,5 @@
 - `/zip2tph` 下载权限复发时，检查当前 bot 数据目录中与 `documents/` 同级的 `temp/`。它与 `--temp-dir` 是两个目录。已有 `temp/` 不会继承后来设在父目录上的默认 ACL，文件改名进入 `documents/` 也保留原 ACL。给实际创建目录补默认读取 ACL，并分别用服务身份验证故障原件和从该目录新建、改名的文件。
 - `/zip2tph` 归档图片顺序使用 `natsort` 的 `INT|PATH|IGNORECASE|PRESORT` 组合：数字按整数、多级目录按路径、大小写折叠且结果稳定；不要回退到普通 `sorted(..., key=name)`，否则 `1/10/2` 会再次错序。
 - EH/ex 链接详情卡的公共 `_archive_pipeline` 也必须复用 H@H 临时链接 → 主站路径回退和刷新链接重试；这些逻辑若只写在 `/archive` 直出入口，详情卡仍会在 H@H 网络异常时失败。网络异常 `str(e)` 可能为空，用户错误摘要要回退到异常类型名。
+- 新增运行时设置只改 `config.py` 的 `RUNTIME_SETTINGS`：白名单、范围、枚举、敏感字段和 `/setting` 面板都从这里生成；`sid` 会进入 callback_data，必须短且不复用。
+- 本地测试用 `tmp\test-venv\Scripts\python.exe -m pytest`；Windows 沙箱会阻止 asyncio 创建 socketpair，`asyncio.run` 测试会卡住，需要在沙箱外运行。

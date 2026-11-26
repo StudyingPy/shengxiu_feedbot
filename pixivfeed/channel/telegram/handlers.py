@@ -1999,7 +1999,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _handle_job_cancel(update, context)
         return
 
-    # stg: 前缀（/setting 切换按钮）格式 stg:<key>:<value>，key 含点不含冒号
+    # stg: 前缀（/setting 设置面板按钮）
     if query.data.startswith("stg:"):
         from .setting import handle_setting_callback
         await handle_setting_callback(update, context)

@@ -355,6 +355,29 @@ class RuntimeSettings:
             await self.db.conn.commit()
         self._cache[key] = value
 
+    async def set_many(self, values: dict[str, str], updated_by: int | None = None) -> None:
+        """在同一事务中写入多项设置，避免 Cookie 只替换一半。"""
+        now = int(time.time())
+        async with self.db.write_lock:
+            try:
+                for key, value in values.items():
+                    await self.db.conn.execute(
+                        """
+                        INSERT INTO runtime_settings(key, value, updated_at, updated_by)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value = excluded.value,
+                            updated_at = excluded.updated_at,
+                            updated_by = excluded.updated_by
+                        """,
+                        (key, value, now, updated_by),
+                    )
+                await self.db.conn.commit()
+            except Exception:
+                await self.db.conn.rollback()
+                raise
+        self._cache.update(values)
+
     async def unset(self, key: str) -> bool:
         """删除一个 runtime 设置，下次读时会 fallback 回 config.yaml。"""
         async with self.db.write_lock:

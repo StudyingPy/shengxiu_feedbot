@@ -51,7 +51,7 @@ from .handlers import (
 )
 from .inline import handle_inline
 from .jobqueue import JobQueueManager
-from .setting import cmd_setting
+from .setting import cmd_cancel, cmd_setting
 from .wiki import cmd_wiki
 
 # ---------------------------------------------------------------------------
@@ -83,7 +83,7 @@ ADMIN_COMMANDS: list[BotCommand] = [
     BotCommand("allow", "白名单：放行用户/群组"),
     BotCommand("deny", "白名单：移除用户/群组"),
     BotCommand("listallow", "白名单：列出当前所有放行项"),
-    BotCommand("setting", "运行时配置（仅私聊）"),
+    BotCommand("setting", "打开运行时设置面板（仅私聊）"),
     BotCommand("stats", "用量统计（仅 admin）"),
     BotCommand("cache", "telegraph 缓存管理（仅 admin）"),
 ]
@@ -196,6 +196,7 @@ def build_application(
     app.add_handler(CommandHandler("deny", cmd_deny))
     app.add_handler(CommandHandler("listallow", cmd_listallow))
     app.add_handler(CommandHandler("setting", cmd_setting))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("cache", cmd_cache))
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## 未发布
+
+### 新增
+
+- **`/setting` 按钮设置面板**：私聊发送 `/setting` 即可按分类查看和修改配置，开关、枚举直接点选，数字可快捷加减或输入，模板可编辑或清空；也支持 `/setting <关键词>` 搜索。旧式 `list/get/set/edit/unset` 命令保留。[设置面板](pixivfeed/channel/telegram/setting.py)
+- **粘贴整段 Cookie**：`/setting cookie ex` / `/setting cookie pixiv` 支持请求头 Cookie、扩展导出的 JSON 和开发者工具表格文本；ExHentai 三项在同一事务中保存，并尝试删除含 Cookie 的消息。
+- 新增 `/cancel` 取消设置输入；设置输入 10 分钟后自动失效。
+
+### 变更 / 修复
+
+- 运行时设置的白名单、数字范围、枚举、敏感字段与面板展示统一由 `RUNTIME_SETTINGS` 元数据生成。[设置元数据](pixivfeed/config.py)
+- `/setting unset` 与「恢复 yaml/默认值」按钮现在立即恢复启动时的 env/yaml/默认值，不再需要重启。
+
+### 改动文件
+
+- `pixivfeed/channel/telegram/setting.py`、`pixivfeed/channel/telegram/bot.py`、`pixivfeed/channel/telegram/handlers.py`
+- `pixivfeed/config.py`、`pixivfeed/storage/cache.py`
+- `tests/test_setting_panel.py`
+- `README.md`、`config.example.yaml`、`docs/PROJECT_MEMORY.md`
+
 ## v0.14.3 — 2026-11-26
 
 ### 新增

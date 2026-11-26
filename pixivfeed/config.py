@@ -11,7 +11,7 @@
     cfg.bind_runtime(runtime_settings)   # 把 db 里的 runtime 设置覆盖进 dataclass
     # 之后 /setting set 会同时写 db + 改 dataclass
 
-设计上的"运行时可改"字段必须在 RUNTIME_KEYS 里登记。没登记的（如 telegram.token）
+设计上的"运行时可改"字段必须在 RUNTIME_SETTINGS 里登记。没登记的（如 telegram.token）
 不能通过 /setting 改，只能改 yaml 重启。
 """
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -261,6 +262,7 @@ class Config:
 
     _source_path: Path | None = field(default=None, repr=False)
     _runtime: Any | None = field(default=None, repr=False)  # RuntimeSettings 实例（可空）
+    _runtime_baseline: dict[str, Any] = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------
     # 加载
@@ -470,6 +472,7 @@ class Config:
         之后 /setting set 命令会调 set_runtime() 同时改 db 和 dataclass。
         """
         self._runtime = runtime_settings
+        self._runtime_baseline = {key: deepcopy(self.get_field(key)) for key in RUNTIME_KEYS}
         logging_level_applied = False
         for key, value in runtime_settings.all().items():
             if key not in RUNTIME_KEYS:
@@ -499,12 +502,37 @@ class Config:
         if key == "logging.level":
             self._reconfigure_logging()
 
+    async def set_runtime_many(self, values: dict[str, str], updated_by: int | None = None) -> None:
+        """原子写入多项 runtime 覆盖；用于一次替换同一组 Cookie。"""
+        if self._runtime is None:
+            raise RuntimeError("Config.bind_runtime() must be called before set_runtime_many")
+        prepared = []
+        for key, value in values.items():
+            if key not in RUNTIME_KEYS:
+                raise KeyError(f"key {key!r} is not runtime-mutable; see /setting list")
+            prepared.append(self._prepare_field(key, value))
+        await self._runtime.set_many(values, updated_by=updated_by)
+        for obj, leaf, coerced in prepared:
+            setattr(obj, leaf, coerced)
+        if "logging.level" in values:
+            self._reconfigure_logging()
+
     async def unset_runtime(self, key: str) -> bool:
-        """删除 runtime 覆盖。dataclass 字段不会自动回到 yaml 值——需要重启进程。
-        但下次启动会读到正确的 yaml 值。这里告诉用户重启。"""
+        """删除 runtime 覆盖，并立即恢复启动时的 env/yaml/默认值。"""
         if self._runtime is None:
             raise RuntimeError("Config.bind_runtime() must be called before unset_runtime")
-        return await self._runtime.unset(key)
+        if key not in RUNTIME_KEYS:
+            raise KeyError(f"key {key!r} is not runtime-mutable; see /setting list")
+        removed = await self._runtime.unset(key)
+        if removed and key in self._runtime_baseline:
+            self._set_typed_field(key, deepcopy(self._runtime_baseline[key]))
+            if key == "logging.level":
+                self._reconfigure_logging()
+        return removed
+
+    def runtime_baseline(self, key: str) -> Any:
+        """返回 runtime 覆盖之下的 env/yaml/默认值。"""
+        return self._runtime_baseline.get(key, self.get_field(key))
 
     def _prepare_field(self, key: str, raw_value: str) -> tuple[Any, str, Any]:
         """定位字段并完成类型转换/运行时范围校验，但不修改配置。"""
@@ -618,27 +646,142 @@ def _coerce(raw: str, target_type: Any) -> Any:
     return raw
 
 
+# ---------------------------------------------------------------------------
+# 运行时设置元数据
+# ---------------------------------------------------------------------------
+#
+# 没在这里登记的字段不允许通过 /setting 改：
+# - telegram.token / storage.*（cache_days 除外）/ publish.base_url / auth.admin_users
+#   这些动了等于换基础设施，必须重启 + 改 yaml。
+# - publish.telegraph_token 是 createAccount 自动生成的，不该让人改。
+#
+# 白名单、数字范围、枚举、敏感字段和 Telegram 设置面板都从这份表生成。
+# sid 会进入 callback_data，必须短且稳定；新增项不要复用旧 sid。
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RuntimeSettingSpec:
+    sid: str
+    key: str
+    group: str
+    label: str
+    kind: str = "text"  # bool / enum / int / text / secret / template
+    description: str = ""
+    choices: tuple[tuple[str, str], ...] = ()
+    minimum: int | None = None
+    maximum: int | None = None
+
+
+RUNTIME_SETTING_GROUPS: tuple[tuple[str, str], ...] = (
+    ("pixiv", "Pixiv"),
+    ("eh", "E-Hentai"),
+    ("ex", "ExHentai"),
+    ("nh", "nhentai"),
+    ("jm", "JM 禁漫"),
+    ("net", "下载与网络"),
+    ("pub", "发布"),
+    ("pre", "大小预取"),
+    ("sys", "缓存与日志"),
+    ("tpl_il", "插画模板"),
+    ("tpl_nv", "小说模板"),
+    ("tpl_ga", "画廊模板"),
+)
+
+_ON_OFF = (("true", "✅ 启用"), ("false", "❌ 关闭"))
+_ARCHIVE_MODE_CHOICES = (
+    ("page_sample", "网页 · 显示图"),
+    ("page_original", "网页 · 原图"),
+    ("archive_resample", "归档 · 1280x"),
+    ("archive_original", "归档 · 原图"),
+)
+
+
+def _spec(sid: str, key: str, group: str, label: str, kind: str = "text", **kwargs: Any) -> RuntimeSettingSpec:
+    return RuntimeSettingSpec(sid=sid, key=key, group=group, label=label, kind=kind, **kwargs)
+
+
+def _num(sid: str, key: str, group: str, label: str, minimum: int, maximum: int, description: str = "") -> RuntimeSettingSpec:
+    return _spec(sid, key, group, label, "int", minimum=minimum, maximum=maximum, description=description)
+
+
+def _switch(sid: str, key: str, group: str, label: str, description: str = "") -> RuntimeSettingSpec:
+    return _spec(sid, key, group, label, "bool", choices=_ON_OFF, description=description)
+
+
+RUNTIME_SETTINGS: tuple[RuntimeSettingSpec, ...] = (
+    _spec("px_sess", "pixiv.phpsessid", "pixiv", "PHPSESSID Cookie", "secret",
+          description="Pixiv 登录 Cookie；R-18 与部分小说需要。可直接粘贴整段 Cookie。"),
+    _num("px_to", "pixiv.timeout", "pixiv", "请求超时（秒）", 1, 600),
+    _num("px_dl", "pixiv.download_concurrency", "pixiv", "下载并发", 1, 32),
+    _switch("eh_on", "collectors.ehentai.enabled", "eh", "启用 E-Hentai"),
+    _spec("eh_mode", "collectors.ehentai.default_mode", "eh", "默认下载模式", "enum",
+          choices=_ARCHIVE_MODE_CHOICES, description="群聊和未选择模式时使用。"),
+    _num("eh_at", "collectors.ehentai.archive_timeout", "eh", "归档下载超时（秒）", 1, 3600),
+    _switch("ex_on", "collectors.exhentai.enabled", "ex", "启用 ExHentai",
+            description="需要先配置 ExHentai Cookie。"),
+    _spec("ex_mode", "collectors.exhentai.default_mode", "ex", "默认下载模式", "enum",
+          choices=_ARCHIVE_MODE_CHOICES, description="群聊和未选择模式时使用。"),
+    _num("ex_at", "collectors.exhentai.archive_timeout", "ex", "归档下载超时（秒）", 1, 3600),
+    _spec("ex_mid", "collectors.exhentai.ipb_member_id", "ex", "ipb_member_id", "secret",
+          description="ExHentai 登录 Cookie 之一。建议使用“替换 ExHentai Cookie”一次粘贴。"),
+    _spec("ex_hash", "collectors.exhentai.ipb_pass_hash", "ex", "ipb_pass_hash", "secret",
+          description="ExHentai 登录 Cookie 之一。建议使用“替换 ExHentai Cookie”一次粘贴。"),
+    _spec("ex_ign", "collectors.exhentai.igneous", "ex", "igneous", "secret",
+          description="ExHentai 登录 Cookie 之一。建议使用“替换 ExHentai Cookie”一次粘贴。"),
+    _switch("nh_on", "collectors.nhentai.enabled", "nh", "启用 nhentai"),
+    _switch("jm_on", "collectors.jm.enabled", "jm", "启用 /jm 标题查询"),
+    _num("jm_to", "collectors.jm.timeout", "jm", "查询超时（秒）", 1, 300),
+    _num("col_to", "collectors.timeout", "net", "图集请求超时（秒）", 1, 600,
+         description="E-Hentai、ExHentai、nhentai 共用。"),
+    _num("col_dl", "collectors.download_concurrency", "net", "图集下载并发", 1, 32,
+         description="E-Hentai、ExHentai、nhentai 共用。"),
+    _num("pub_dt", "publish.direct_threshold", "pub", "Pixiv 直发图片上限", 0, 10,
+         description="单作品图片数不超过该值时直接发图，否则发布 Telegra.ph。"),
+    _num("pub_max", "publish.max_images_per_page", "pub", "Telegra.ph 每页图片数", 1, 300),
+    _spec("tg_short", "publish.telegraph_short_name", "pub", "Telegra.ph 短名称"),
+    _spec("tg_name", "publish.telegraph_author_name", "pub", "Telegra.ph 作者名"),
+    _spec("tg_url", "publish.telegraph_author_url", "pub", "Telegra.ph 作者链接"),
+    _switch("pf_on", "size_prefetch.enabled", "pre", "启用大小预取"),
+    _num("pf_n", "size_prefetch.sample_count", "pre", "采样图片数", 1, 20),
+    _num("pf_to", "size_prefetch.timeout", "pre", "单请求超时（秒）", 1, 60),
+    _switch("pf_eh", "size_prefetch.eh_archive", "pre", "EH/EX 归档预取"),
+    _switch("pf_px", "size_prefetch.pixiv", "pre", "Pixiv 预取"),
+    _switch("pf_nh", "size_prefetch.nhentai", "pre", "nhentai 预取"),
+    _num("cache_d", "storage.cache_days", "sys", "本地缓存保留天数", 1, 3650),
+    _spec("log_lv", "logging.level", "sys", "日志级别", "enum",
+          choices=(("DEBUG", "DEBUG"), ("INFO", "INFO"), ("WARNING", "WARNING"), ("ERROR", "ERROR"))),
+    _spec("il_title", "templates.illust.page_title", "tpl_il", "页面标题", "template"),
+    _spec("il_head", "templates.illust.page_header", "tpl_il", "页面开头", "template"),
+    _spec("il_foot", "templates.illust.page_footer", "tpl_il", "页面结尾", "template"),
+    _spec("il_dir", "templates.illust.direct_caption", "tpl_il", "直发说明", "template"),
+    _spec("il_in1", "templates.illust.inline_single_caption", "tpl_il", "Inline 单图说明", "template"),
+    _spec("il_inn", "templates.illust.inline_multi_caption", "tpl_il", "Inline 多图说明", "template"),
+    _spec("nv_title", "templates.novel.page_title", "tpl_nv", "页面标题", "template"),
+    _spec("nv_head", "templates.novel.page_header", "tpl_nv", "页面开头", "template"),
+    _spec("nv_foot", "templates.novel.page_footer", "tpl_nv", "页面结尾", "template"),
+    _spec("nv_iat", "templates.novel.inline_article_title", "tpl_nv", "Inline 标题", "template"),
+    _spec("nv_iad", "templates.novel.inline_article_description", "tpl_nv", "Inline 描述", "template"),
+    _spec("ga_title", "templates.gallery.page_title", "tpl_ga", "页面标题", "template"),
+    _spec("ga_head", "templates.gallery.page_header", "tpl_ga", "页面开头", "template"),
+    _spec("ga_foot", "templates.gallery.page_footer", "tpl_ga", "页面结尾", "template"),
+)
+
+RUNTIME_SETTINGS_BY_KEY: dict[str, RuntimeSettingSpec] = {spec.key: spec for spec in RUNTIME_SETTINGS}
+RUNTIME_SETTINGS_BY_SID: dict[str, RuntimeSettingSpec] = {spec.sid: spec for spec in RUNTIME_SETTINGS}
+RUNTIME_KEYS: set[str] = set(RUNTIME_SETTINGS_BY_KEY)
+
 # /setting 数字范围同时用于 YAML 启动校验与 SQLite runtime overlay。
 # 上限不是业务配额，而是防止手滑把超时/并发设成会长期卡死或压垮进程的数量级。
 _RUNTIME_NUMBER_RANGES: dict[str, tuple[int, int]] = {
-    "pixiv.timeout": (1, 600),
-    "pixiv.download_concurrency": (1, 32),
-    "collectors.timeout": (1, 600),
-    "collectors.download_concurrency": (1, 32),
-    "collectors.ehentai.archive_timeout": (1, 3600),
-    "collectors.exhentai.archive_timeout": (1, 3600),
-    "collectors.jm.timeout": (1, 300),
-    "publish.direct_threshold": (0, 10),
-    "publish.max_images_per_page": (1, 300),
-    "storage.cache_days": (1, 3650),
-    "size_prefetch.sample_count": (1, 20),
-    "size_prefetch.timeout": (1, 60),
+    spec.key: (spec.minimum, spec.maximum)
+    for spec in RUNTIME_SETTINGS
+    if spec.kind == "int" and spec.minimum is not None and spec.maximum is not None
 }
-
-_ARCHIVE_MODES = frozenset({"page_sample", "page_original", "archive_resample", "archive_original"})
 _RUNTIME_ENUM_VALUES: dict[str, frozenset[str]] = {
-    "collectors.ehentai.default_mode": _ARCHIVE_MODES,
-    "collectors.exhentai.default_mode": _ARCHIVE_MODES,
+    spec.key: frozenset(value for value, _ in spec.choices)
+    for spec in RUNTIME_SETTINGS
+    if spec.kind == "enum" and spec.key != "logging.level"
 }
 _LOG_LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"})
 _RUNTIME_CONSTRAINED_KEYS = frozenset({*_RUNTIME_NUMBER_RANGES, *_RUNTIME_ENUM_VALUES, "logging.level"})
@@ -670,84 +813,9 @@ def _validate_runtime_value(key: str, value: Any) -> Any:
     return value
 
 
-# ---------------------------------------------------------------------------
-# 运行时可改的 key 白名单
-# ---------------------------------------------------------------------------
-#
-# 没在这里登记的字段不允许通过 /setting 改：
-# - telegram.token / storage.* / publish.base_url / auth.admin_users
-#   这些动了等于换基础设施，必须重启 + 改 yaml。
-# - publish.telegraph_token 是 createAccount 自动生成的，不该让人改。
-#
-# 这个集合也是 /setting list 默认展示的内容。
-# ---------------------------------------------------------------------------
-
-RUNTIME_KEYS: set[str] = {
-    # pixiv
-    "pixiv.phpsessid",
-    "pixiv.timeout",
-    "pixiv.download_concurrency",
-    # collectors（共享）
-    "collectors.timeout",
-    "collectors.download_concurrency",
-    # ehentai
-    "collectors.ehentai.enabled",
-    "collectors.ehentai.default_mode",
-    "collectors.ehentai.archive_timeout",
-    # exhentai
-    "collectors.exhentai.enabled",
-    "collectors.exhentai.default_mode",
-    "collectors.exhentai.archive_timeout",
-    "collectors.exhentai.ipb_pass_hash",
-    "collectors.exhentai.ipb_member_id",
-    "collectors.exhentai.igneous",
-    # nhentai
-    "collectors.nhentai.enabled",
-    # jm（禁漫天堂；仅 /jm 命令查询标题用）
-    "collectors.jm.enabled",
-    "collectors.jm.timeout",
-    # publish
-    "publish.direct_threshold",
-    "publish.max_images_per_page",
-    "publish.telegraph_short_name",
-    "publish.telegraph_author_name",
-    "publish.telegraph_author_url",
-    # storage
-    "storage.cache_days",
-    # logging
-    "logging.level",
-    # templates: illust
-    "templates.illust.page_title",
-    "templates.illust.page_header",
-    "templates.illust.page_footer",
-    "templates.illust.direct_caption",
-    "templates.illust.inline_single_caption",
-    "templates.illust.inline_multi_caption",
-    # templates: novel
-    "templates.novel.page_title",
-    "templates.novel.page_header",
-    "templates.novel.page_footer",
-    "templates.novel.inline_article_title",
-    "templates.novel.inline_article_description",
-    # templates: gallery
-    "templates.gallery.page_title",
-    "templates.gallery.page_header",
-    "templates.gallery.page_footer",
-    # size_prefetch
-    "size_prefetch.enabled",
-    "size_prefetch.sample_count",
-    "size_prefetch.timeout",
-    "size_prefetch.eh_archive",
-    "size_prefetch.pixiv",
-    "size_prefetch.nhentai",
-}
-
-# 敏感字段（/setting list 显示时打码）
+# 敏感字段（/setting 面板显示时打码）。R2 字段不在运行时白名单，但保留给日志/展示复用。
 SENSITIVE_KEYS: set[str] = {
-    "pixiv.phpsessid",
-    "collectors.exhentai.ipb_pass_hash",
-    "collectors.exhentai.ipb_member_id",
-    "collectors.exhentai.igneous",
+    *(spec.key for spec in RUNTIME_SETTINGS if spec.kind == "secret"),
     "storage.r2.access_key_id",
     "storage.r2.secret_access_key",
 }

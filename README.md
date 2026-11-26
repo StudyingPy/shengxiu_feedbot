@@ -58,16 +58,9 @@ python -m pixivfeed
 | ExHentai | gallery | 必须（ipb_pass_hash / ipb_member_id / igneous）|
 | nhentai | gallery | 不需要 |
 
-e-hentai / ExHentai / nhentai 默认禁用，启动后通过私聊命令开启即可（无需重启）：
+e-hentai / ExHentai / nhentai 默认禁用。启动后私聊发送 `/setting`，在按钮面板中进入对应分类开启即可（无需重启）。
 
-```
-/setting set collectors.ehentai.enabled true
-/setting set collectors.nhentai.enabled true
-/setting edit collectors.exhentai.ipb_pass_hash
-/setting edit collectors.exhentai.ipb_member_id
-/setting edit collectors.exhentai.igneous
-/setting set collectors.exhentai.enabled true
-```
+ExHentai Cookie 可在面板中点「替换 ExHentai Cookie」，或发送 `/setting cookie ex`，然后直接粘贴浏览器 Cookie。支持请求头中的整段 Cookie、Cookie-Editor 等扩展导出的 JSON，以及开发者工具 Cookie 表格复制的内容；Bot 会自动识别三项、一次保存，并尝试删除含 Cookie 的消息。Pixiv 使用 `/setting cookie pixiv`。
 
 ## 用法
 
@@ -129,11 +122,11 @@ Guest 会优先读取当前召唤消息中的链接，也支持从被回复的�
 | 命令 | 说明 |
 | ---- | ---- |
 | `/allow` / `/deny` / `/listallow` | 白名单管理 |
-| `/setting list` | 查看所有可在运行时修改的配置项 |
-| `/setting get <key>` | 查看当前值 |
-| `/setting set <key> <value>` | 修改配置 |
-| `/setting edit <key>` | 多行编辑（适用于模板等长文本）|
-| `/setting unset <key>` | 恢复为默认值 |
+| `/setting` | 打开按钮设置面板：按分类查看、切换、调整、编辑和恢复默认 |
+| `/setting <关键词>` | 搜索设置项，例如 `/setting 超时` |
+| `/setting cookie ex` / `/setting cookie pixiv` | 粘贴整段 Cookie 并自动识别保存 |
+| `/setting list` / `get` / `set` / `edit` / `unset` | 旧式文字命令，仍可作为快捷方式；`unset` 会立即恢复 yaml/默认值 |
+| `/cancel` | 取消正在进行的设置输入 |
 | `/stats` | 用量统计（支持 `/stats 7d`、`/stats user @x`、`/stats chat <id>`、`/stats system`、`/stats r2_evict` 手动触发 R2 LRU 清理）|
 
 不可在运行时修改的字段：`telegram.token`、`storage.*`、`publish.base_url`、`auth.admin_users`、`publish.telegraph_token`。修改这些字段需编辑 `config.yaml` 后重启。
@@ -142,7 +135,7 @@ Guest 会优先读取当前召唤消息中的链接，也支持从被回复的�
 
 ## 模板自定义
 
-输出文案可通过 `/setting edit` 修改，详见 `config.example.yaml` 中 `templates` 段的注释：
+输出文案可在 `/setting` 面板的模板分类中编辑或清空，详见 `config.example.yaml` 中 `templates` 段的注释：
 
 - `templates.illust.*` — Pixiv 插画
 - `templates.novel.*` — Pixiv 小说
