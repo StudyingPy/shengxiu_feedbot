@@ -1,5 +1,7 @@
 # 项目记忆
 
+- EH/EX 排查要分开记录 EH 的 HTTP 状态、EX 最终落在哪个站点、是否有画廊标题或缩略图区。匿名 EH 的 404 和 EX 的 HTTP 200 缺少子页都不能证明账号看到的画廊已删除。检查 Bot 生效的 Cookie 时要计入 SQLite 运行时设置对 YAML 的覆盖，仅核对设置来源和是否已配置。
+
 - Guest Mode 的回调来自 inline 消息，`CallbackQuery.message` 可能为 `None`；必须保存召唤时的 `Update` 与 `GuestReply`，并通过 `inline_message_id` 编辑。
 - Guest API 只能编辑一条 inline 回复，不能像普通 Bot 一样上传本地 ZIP；但 EH/EX 归档模式仍可在后台下载并解包 archive，再把图片发布到同一条 Telegraph 回复。Pixiv 单图直发要使用缓存的公开 URL。
 - 标准 Bot API 没有用 `inline_message_id` 删除 Guest inline 消息的方法；取消时只能短暂延迟后尝试兼容实现，失败则移除按钮并编辑为“已取消”。

@@ -1552,11 +1552,11 @@ async def _try_fallback_to_exhentai(
         return ex_ref, gallery, ex_provider
     except EHGalleryUnavailable as e2:
         await placeholder.edit_text(
-            f"⚠️ 双站均不可用：\n  e-hentai: {eh_error_msg}\n  exhentai: {e2}"
+            f"⚠️ 两次画廊请求均失败：\n  e-hentai: {eh_error_msg}\n  exhentai: {e2}"
         )
         return None
     except EHError as e2:
-        await placeholder.edit_text(f"⚠️ ExHentai 解析失败：{e2}")
+        await placeholder.edit_text(f"⚠️ e-hentai: {eh_error_msg}\nExHentai 解析失败：{e2}")
         return None
     except Exception as e2:
         logger.exception("exhentai fallback fetch_work failed")

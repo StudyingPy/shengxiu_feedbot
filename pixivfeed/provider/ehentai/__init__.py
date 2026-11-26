@@ -118,10 +118,6 @@ _EH_UNAVAILABLE_RE = re.compile(
 )
 
 
-def _build_subpage_re(host: str) -> re.Pattern:
-    return re.compile(rf'<a href="(https://{re.escape(host)}/s/\w+/[\w-]+)">')
-
-
 def _next_page_marker(album_url: str, next_page: int) -> str:
     return f'<a href="{album_url}/?p={next_page}" onclick="return false">'
 
@@ -140,7 +136,7 @@ def _normalize_gallery_url(host: str, raw_url: str) -> tuple[str, str, str]:
     return f"https://{host}/g/{parts[1]}/{parts[2]}", parts[1], parts[2]
 
 
-def _parse_gallery_detail(first_page_html: str) -> tuple[str, list[str]]:
+def _parse_gallery_detail(soup: BeautifulSoup) -> tuple[str, list[str]]:
     """从画廊详情页第一页 HTML 抠出 category + 全部 tags。
 
     解析失败（HTML 结构变了）时不抛异常，返回 ("", [])，调用方按"没拿到详情"
@@ -152,12 +148,6 @@ def _parse_gallery_detail(first_page_html: str) -> tuple[str, list[str]]:
       第 2 个 td 里所有 ``div.gt | div.gtl | div.gtw`` 的 ``a`` 文本是 value。
       .gt/.gtl/.gtw 分别对应正常/低权重/警告 tag，列表里不区分。
     """
-    try:
-        soup = BeautifulSoup(first_page_html, "html.parser")
-    except Exception as e:
-        logger.warning(f"eh detail parse: BeautifulSoup failed: {e}")
-        return "", []
-
     category = ""
     cs = soup.select_one("#gdc .cs")
     if cs:
@@ -388,27 +378,35 @@ class _EHFamilyProvider(Provider):
         page_count_match = _EH_PAGE_COUNT_RE.search(first_page)
         page_count = int(page_count_match.group(1)) if page_count_match else 0
 
-        subpage_re = _build_subpage_re(self.HOST)
+        subpage_re = re.compile(
+            rf"(?:(?:https:)?//{re.escape(self.HOST)})?(/s/\w+/{re.escape(gid)}-\d+)"
+        )
+        first_soup = BeautifulSoup(first_page, "html.parser")
         subpages: list[str] = []
         seen: set[str] = set()
-        for html in pages_html:
-            for m in subpage_re.finditer(html):
-                u = m.group(1)
-                if u not in seen:
-                    seen.add(u)
-                    subpages.append(u)
+        for index, html in enumerate(pages_html):
+            soup = first_soup if index == 0 else BeautifulSoup(html, "html.parser")
+            thumbnails = soup.find(id="gdt") or soup
+            for anchor in thumbnails.find_all("a", href=True):
+                match = subpage_re.fullmatch(anchor["href"])
+                if match:
+                    subpage_url = f"https://{self.HOST}{match[1]}"
+                    if subpage_url not in seen:
+                        seen.add(subpage_url)
+                        subpages.append(subpage_url)
 
         if not subpages:
-            # 没匹到错误文案但也没子页：当成 unavailable 处理（可能是没识别到的新文案）
-            raise EHGalleryUnavailable(
-                f"{album_url}: no image subpages found (gallery may be deleted, "
-                "moved to exhentai, or require login)"
-            )
+            if first_soup.select_one("#gn, #gdt"):
+                reason = "已收到画廊详情页，未识别到图片子页链接"
+            else:
+                reason = "HTTP 200，但返回页面缺少画廊标题和缩略图区，请核对 Bot 的登录状态"
+            error_type = EHGalleryUnavailable if self.HOST == "e-hentai.org" else EHError
+            raise error_type(f"{self.HOST}: {reason}")
 
         if page_count == 0:
             page_count = len(subpages)
 
-        category, detail_tags = _parse_gallery_detail(first_page)
+        category, detail_tags = _parse_gallery_detail(first_soup)
 
         return EHGallery(
             host=self.HOST,
@@ -427,10 +425,16 @@ class _EHFamilyProvider(Provider):
         for page in range(0, 200):
             url = f"{album_url}/?p={page}"
             resp = await client.get(url)
+            if resp.url.host == "forums.e-hentai.org":
+                raise EHGalleryUnavailable("请求转到了 EH 论坛，请核对 Bot 的登录 Cookie")
             if resp.status_code == 404:
                 raise EHGalleryUnavailable(f"GET {url} returned HTTP 404")
             if resp.status_code != 200:
                 raise EHError(f"GET {url} returned HTTP {resp.status_code}")
+            if resp.url.host == "exhentai.org" and (
+                not resp.content.strip() or resp.headers.get("content-type", "").lower().startswith("image/")
+            ):
+                raise EHError("EX 返回了空响应或图片，请核对 Bot 的登录 Cookie 和服务器出口")
             html = resp.text
             pages.append(html)
             if _next_page_marker(album_url, page + 1) not in html:
