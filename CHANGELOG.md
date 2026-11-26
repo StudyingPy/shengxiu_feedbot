@@ -1,6 +1,6 @@
 # Changelog
 
-## 未发布
+## v0.15.0 — 2026-11-26
 
 ### 新增
 
@@ -18,7 +18,7 @@
 - `pixivfeed/channel/telegram/setting.py`、`pixivfeed/channel/telegram/bot.py`、`pixivfeed/channel/telegram/handlers.py`
 - `pixivfeed/config.py`、`pixivfeed/storage/cache.py`
 - `tests/test_setting_panel.py`
-- `README.md`、`config.example.yaml`、`docs/PROJECT_MEMORY.md`
+- `README.md`、`config.example.yaml`、`docs/PROJECT_MEMORY.md`、`pyproject.toml`
 
 ## v0.14.3 — 2026-11-26
 
