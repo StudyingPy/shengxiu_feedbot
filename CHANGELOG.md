@@ -1,12 +1,24 @@
 # Changelog
 
-## 未发布 — 2026-10-05
+## v0.14.3 — 2026-11-26
+
+### 新增
+
+- 回复图片归档或在文件说明里写 `/zip2tph 魔女之旅`，即可把 Telegra.ph 页面命名为「魔女之旅」。省略标题时沿用去掉归档扩展名的文件名，管理员可搭配 `--r2` 使用。[标题处理](pixivfeed/channel/telegram/handlers.py#L3862)
 
 ### 修复
+
+- 修复部分有效 RAR 在第一张图片处解压失败的问题。优先通过 `bsdtar` 流式读取图片，遇到解压后端异常时结束进度提示并记录失败。[RAR 解压](pixivfeed/channel/telegram/handlers.py#L4138)
+- 本地 Bot API 部署脚本新增 `--configure-local-acl`，可一次配置当前 bot 暂存目录和文档目录的读取权限，并修复已有归档。更换数据卷后可重新执行。[部署指南](docs/DEPLOY.md#4-文件读权限)
+- EH/EX 详情卡下载归档时，H@H 临时链接失效或连接异常会尝试主站回退和刷新链接。[归档下载](pixivfeed/provider/ehentai/__init__.py#L579)
 - **最终 Telegram 回复遇到限频后自动重试**：最终链接发送/编辑和 `Progress.finish` 遇到 `RetryAfter` 时，按服务端等待时间加 1 秒重试，最多重试 10 次。覆盖 EH/EX（含回退缓存）、nhentai、Pixiv 插画/小说、`/zip2tph`、缓存回复和 Guest inline 编辑；只重发消息，不重复下载或发布页面，保留预览、格式和按钮。
 - 重试耗尽、终态消息不存在或其它交付错误向上传播，避免把未交付结果静默当作成功；等待可被任务取消或服务关闭中断。
 
 ### 改动文件
+
+- `README.md`、`pyproject.toml`
+- `deploy/feed-bot-deploy.sh`、`docs/DEPLOY.md`、`docs/PROJECT_MEMORY.md`
+- `pixivfeed/provider/ehentai/__init__.py`、`tests/test_eh_archive_gp.py`、`tests/test_zip2tph_archives.py`
 - `pixivfeed/channel/telegram/retry.py`
 - `pixivfeed/channel/telegram/handlers.py`
 - `pixivfeed/channel/telegram/progress.py`
