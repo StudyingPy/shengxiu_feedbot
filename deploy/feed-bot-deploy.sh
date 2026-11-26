@@ -27,6 +27,43 @@
 
 set -uo pipefail
 
+if (( $# )); then
+    if [[ $# != 1 || $1 != --configure-local-acl ]]; then
+        echo 'Usage: feed-bot-deploy.sh [--configure-local-acl]' >&2
+        exit 2
+    fi
+    set -e
+    unset CDPATH
+    api_root=${API_ROOT:-/var/lib/telegram-bot-api}
+    feed_uid=$(id -u -- "${FEED_USER:-pixivbot}")
+    command -v setfacl >/dev/null || { echo '请先安装 acl 软件包。' >&2; exit 1; }
+    if [[ -t 0 ]]; then printf '当前 bot 的数据子目录名（输入隐藏）：' >&2; fi
+    IFS= read -rs bot_dir
+    if [[ -t 0 ]]; then printf '\n' >&2; fi
+    cd -- "$api_root"
+    if [[ ! $bot_dir =~ ^[0-9]+:[a-zA-Z0-9_-]+$ || -L $bot_dir ]] || ! cd -- "$bot_dir" 2>/dev/null; then
+        echo '未找到当前 bot 的数据目录，请检查 API_ROOT 和输入的目录名。' >&2
+        exit 1
+    fi
+    for dir in temp documents; do
+        if [[ -L $dir || ( -e $dir && ! -d $dir ) ]]; then
+            echo "$dir 必须是普通目录。" >&2
+            exit 1
+        fi
+    done
+    for dir in temp documents; do
+        if [[ ! -d $dir ]]; then
+            install -d -m 0700 -o "$(stat -c %u .)" -g "$(stat -c %g .)" "$dir"
+        fi
+    done
+    setfacl -m "u:$feed_uid:x" .. .
+    setfacl -m "d:u:$feed_uid:rx,d:o::---" temp
+    find documents -type d -exec setfacl -P -m "u:$feed_uid:rx,d:u:$feed_uid:rx,d:o::---" {} +
+    find documents -type f -exec setfacl -P -m "u:$feed_uid:r" {} +
+    echo '已配置当前 bot 的归档读取权限。'
+    exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # 加载环境
 # ---------------------------------------------------------------------------

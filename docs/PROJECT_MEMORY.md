@@ -11,6 +11,6 @@
 - `/zip2tph` 的本地 Bot API `local_mode` 不是“已配置即可”：PTB 会把 `getFile` 返回的绝对路径直接读入 bot 进程；telegram-bot-api 与 feed bot 分容器/分用户时，路径可见性和读权限必须单独验证。下载异常不能把 `str(e)` 原样回显（路径可能含敏感凭据），应按权限/路径不可见、Bot API 未配置、网络超时、损坏文件分别提示并对路径脱敏。
 - `/zip2tph` 的空间峰值不是压缩包大小的 2 倍：至少要估算 `输入 zip + 解压目录 + cache_dir 公共副本`，并分别检查临时目录和 cache 所在挂载点；解压需限制条目数、解压后总字节、单文件大小并拒绝符号链接/重名覆盖，重型 copy/hash 不能阻塞 event loop。失败或取消时要回收已创建的 `cache_dir/zip_*`，并为下载、解压、发布失败补齐 `usage_log status=failed` 和测试覆盖。
 - Docker 版 telegram-bot-api 常以容器 UID/GID 101 写宿主机文件；宿主机可能显示为 `sshd:crontab`，而 systemd feed bot 用 `pixivbot`。`local_mode` 直接读宿主路径时要按数字 UID/GID 或针对单个 token 目录的 ACL 修复，不能用全目录 `chmod o+rX`。
-- Docker 版 telegram-bot-api 若配置了 `--temp-dir=/tmp/telegram-bot-api`，归档可能先在 temp-dir 创建后再改名到 `--dir`；只给 `documents` 设置默认 ACL 仍会出现“文件已返回但 bot 无权读取”。必须同时给 temp-dir 和最终目录设置 `d:u:<feed-user>:r-x` 默认 ACL，并给已有文件补 `u:<feed-user>:r`。
+- `/zip2tph` 下载权限复发时，检查当前 bot 数据目录中与 `documents/` 同级的 `temp/`。它与 `--temp-dir` 是两个目录。已有 `temp/` 不会继承后来设在父目录上的默认 ACL，文件改名进入 `documents/` 也保留原 ACL。给实际创建目录补默认读取 ACL，并分别用服务身份验证故障原件和从该目录新建、改名的文件。
 - `/zip2tph` 归档图片顺序使用 `natsort` 的 `INT|PATH|IGNORECASE|PRESORT` 组合：数字按整数、多级目录按路径、大小写折叠且结果稳定；不要回退到普通 `sorted(..., key=name)`，否则 `1/10/2` 会再次错序。
 - EH/ex 链接详情卡的公共 `_archive_pipeline` 也必须复用 H@H 临时链接 → 主站路径回退和刷新链接重试；这些逻辑若只写在 `/archive` 直出入口，详情卡仍会在 H@H 网络异常时失败。网络异常 `str(e)` 可能为空，用户错误摘要要回退到异常类型名。

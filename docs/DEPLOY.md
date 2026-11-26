@@ -508,29 +508,22 @@ telegram:
 
 `--local` 模式下 telegram-bot-api 将上传的文件写入 `--dir` 目录（默认 `/var/lib/telegram-bot-api/<token>/...`）。`local_mode=true` 并不等于 feed bot 自动获得这些文件的权限：PTB 会在 feed bot 进程内直接打开该路径，因此两个服务必须共享同一目录，并且 feed bot 运行用户必须能穿过父目录、读取 `documents` 下的新文件。
 
-不要对整个目录执行 `chmod -R o+rX`——路径中包含敏感凭据。优先让两个服务使用同一个专用用户/组；如果暂时不能重建容器，可只对当前 bot 的 token 目录授予最小 ACL（以下命令中的 `<feed-user>`、`<token>` 替换为实际值）：
+当 Bot API 与 feed bot 使用不同账号时，可在宿主机上用部署脚本配置 ACL。先启动 Bot API 并让 feed bot 登录一次，以生成当前 bot 的数据目录。Debian/Ubuntu 需要安装 `acl` 软件包。在仓库根目录执行以下命令，按提示输入该 bot 的数据子目录名（输入隐藏）：
 
 ```bash
-API_ROOT=/var/lib/telegram-bot-api
-TMP_ROOT=/tmp/telegram-bot-api
-# local Bot API 可能先在 temp-dir 写文件，再改名到 --dir；两个目录都要设置默认 ACL。
-for dir in "$TMP_ROOT" "$API_ROOT"; do
-  setfacl -m u:<feed-user>:x "$dir"
-  setfacl -m d:u:<feed-user>:r-x,d:m::r-x "$dir"
-done
-setfacl -m u:<feed-user>:x "$API_ROOT/<token>"
-find "$API_ROOT/<token>/documents" -type d -exec setfacl -m u:<feed-user>:rx,d:u:<feed-user>:r-x,d:m::r-x {} +
-find "$API_ROOT/<token>/documents" -type f -exec setfacl -m u:<feed-user>:r {} +
-sudo -u <feed-user> test -r /var/lib/telegram-bot-api/<token>/documents/<file>
+sudo install -o root -g root -m 0755 deploy/feed-bot-deploy.sh /usr/local/bin/feed-bot-deploy.sh
+sudo /usr/local/bin/feed-bot-deploy.sh --configure-local-acl
 ```
 
-最后一条测试必须成功；否则 `/zip2tph` 会收到 `Permission denied`。如果 telegram-bot-api 在独立容器中，宿主机目录还必须以相同路径（或明确的路径映射）挂载到 feed bot 容器；只在 Bot API 容器里存在的路径对 `local_mode` 不可用。
+默认宿主机数据目录为 `/var/lib/telegram-bot-api`，服务用户为 `pixivbot`。自定义部署可用 `sudo API_ROOT=/实际挂载点 FEED_USER=服务用户名 /usr/local/bin/feed-bot-deploy.sh --configure-local-acl`。这个入口可以重复执行；更换数据卷或重新生成 bot 数据目录后需再执行一次。普通 webhook 更新沿用已有 ACL。
+
+下载可能先写入当前 bot 的 `temp/`，再改名到 `documents/`。同一文件系统内改名会保留创建时的 ACL，已有子目录也不会补继承父目录后加的默认 ACL。脚本为这两个目录配置继承，并给现有文档补读取权限。验证时用 `/zip2tph` 处理一份新上传的文件。若部署还使用独立的 `--temp-dir` 暂存下载，也要核对该创建目录的默认 ACL。如果 feed bot 在独立容器中，应在其挂载命名空间内验证读取。
 
 Docker 还要注意 UID/GID 映射：容器内的 `telegram-bot-api` 用户（常见为 UID/GID 101）会以宿主机上的对应数字用户写文件；宿主机用户名可能显示为 `sshd`，这不代表 feed bot 可以读取。应按数字 UID/GID 或 ACL 配置权限，而不要按用户名猜测：
 
 ```bash
 docker exec telegram-bot-api id telegram-bot-api
-stat -Lc '%u:%g %A %n' /var/lib/telegram-bot-api/<token>/documents/<file>
+stat -Lc '%u:%g %A' "$BOT_DIR/documents/$FILE_NAME"  # BOT_DIR 和 FILE_NAME 指向待查样本
 id <feed-user>
 ```
 
